@@ -67,12 +67,25 @@ class FrankaRobot(Hardware):
             franka_infos = []
 
             for config in robot_configs:
-                camera_type = getattr(config, "camera_type", "realsense")
-                cameras = cls.enumerate_cameras(camera_type)
+                camera_serials_by_type = cls._camera_serials_by_type(config)
+                if camera_serials_by_type:
+                    cameras_by_type = {
+                        camera_type: cls.enumerate_cameras(camera_type)
+                        for camera_type in camera_serials_by_type
+                    }
+                    if config.camera_serials is None:
+                        config.camera_serials = [
+                            serial
+                            for serials in camera_serials_by_type.values()
+                            for serial in serials
+                        ]
+                else:
+                    camera_type = getattr(config, "camera_type", "realsense")
+                    cameras = cls.enumerate_cameras(camera_type)
 
-                # Use auto-detected cameras when not explicitly specified
-                if config.camera_serials is None:
-                    config.camera_serials = list(cameras)
+                    # Use auto-detected cameras when not explicitly specified
+                    if config.camera_serials is None:
+                        config.camera_serials = list(cameras)
 
                 franka_infos.append(
                     FrankaHWInfo(
@@ -115,18 +128,34 @@ class FrankaRobot(Hardware):
                     )
 
                 # Validate camera SDK and serials
-                cls._validate_camera_sdk(camera_type, node_rank)
-                if not cameras:
-                    raise ValueError(
-                        f"No {camera_type} cameras are connected to node rank {node_rank} "
-                        f"while Franka robot requires at least one camera."
-                    )
-                for serial in config.camera_serials:
-                    if serial not in cameras:
+                if camera_serials_by_type:
+                    for camera_type, serials in camera_serials_by_type.items():
+                        cameras = cameras_by_type[camera_type]
+                        cls._validate_camera_sdk(camera_type, node_rank)
+                        if not cameras:
+                            raise ValueError(
+                                f"No {camera_type} cameras are connected to node rank {node_rank} "
+                                "while Franka robot requires at least one camera."
+                            )
+                        for serial in serials:
+                            if serial not in cameras:
+                                raise ValueError(
+                                    f"Camera with serial {serial} is not connected to node rank {node_rank}. "
+                                    f"Available {camera_type} cameras: {cameras}."
+                                )
+                else:
+                    cls._validate_camera_sdk(camera_type, node_rank)
+                    if not cameras:
                         raise ValueError(
-                            f"Camera with serial {serial} is not connected to node rank {node_rank}. "
-                            f"Available {camera_type} cameras: {cameras}."
+                            f"No {camera_type} cameras are connected to node rank {node_rank} "
+                            f"while Franka robot requires at least one camera."
                         )
+                    for serial in config.camera_serials:
+                        if serial not in cameras:
+                            raise ValueError(
+                                f"Camera with serial {serial} is not connected to node rank {node_rank}. "
+                                f"Available {camera_type} cameras: {cameras}."
+                            )
 
             return HardwareResource(type=cls.HW_TYPE, infos=franka_infos)
         return None
@@ -188,6 +217,24 @@ class FrankaRobot(Hardware):
                     f"but it is not installed on node rank {node_rank}."
                 )
 
+    @staticmethod
+    def _camera_serials_by_type(config: "FrankaConfig") -> dict[str, list[str]]:
+        if not config.camera_infos:
+            return {}
+        serials_by_type: dict[str, list[str]] = {}
+        for camera_info in config.camera_infos:
+            camera_type = str(
+                camera_info.get("camera_type", config.camera_type)
+            ).lower()
+            serial = camera_info.get("serial_number", camera_info.get("serial", None))
+            if serial is None:
+                raise ValueError(
+                    "Each Franka camera_infos item must define 'serial_number' "
+                    "or 'serial'."
+                )
+            serials_by_type.setdefault(camera_type, []).append(str(serial))
+        return serials_by_type
+
 
 @NodeHardwareConfig.register_hardware_config(FrankaRobot.HW_TYPE)
 @dataclass
@@ -199,6 +246,9 @@ class FrankaConfig(HardwareConfig):
 
     camera_serials: Optional[list[str]] = None
     """List of camera serial numbers associated with the robot."""
+
+    camera_infos: Optional[list[dict]] = None
+    """Optional per-camera specs with name, serial_number, and camera_type."""
 
     camera_type: str = "realsense"
     """Camera backend: ``"realsense"``, ``"zed"``, or ``"lumos"``."""
@@ -234,3 +284,5 @@ class FrankaConfig(HardwareConfig):
 
         if self.camera_serials:
             self.camera_serials = list(self.camera_serials)
+        if self.camera_infos:
+            self.camera_infos = [dict(camera_info) for camera_info in self.camera_infos]

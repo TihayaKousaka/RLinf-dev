@@ -19,7 +19,8 @@ gello_action_mode: joint_target
 use_relative_frame: False
 use_quat_tcp_pose: True
 use_rlt_joint_obs: True
-main_image_key: "${oc.env:RLT_REALWORLD_MAIN_IMAGE_KEY,camera_0}"
+main_image_key: "${oc.env:RLT_REALWORLD_MAIN_IMAGE_KEY,main_camera}"
+wrist_image_key: "${oc.env:RLT_REALWORLD_WRIST_IMAGE_KEY,wrist_camera}"
 default_prompt: "insert the peg in the hole"
 keyboard_reward_wrapper: null
 task_mode: critical_phase
@@ -66,12 +67,11 @@ override_cfg:
     - panda_joint5
     - panda_joint6
     - panda_joint7
-  # Replace these with the calibrated real setup before running hardware.
-  target_ee_pose: [0.5, 0.0, 0.1, -3.14, 0.0, 0.0]
-  reset_ee_pose: [0.5, 0.0, 0.2, -3.14, 0.0, 0.0]
-  reset_joint_qpos: [0.0, -0.785, 0.0, -2.35, 0.0, 1.57, 0.785]
-  critical_phase_reset_joint_qpos: null
-  full_task_reset_joint_qpos: null
+  # Replace placeholders with calibrated realworld joint-task values before running hardware.
+  target_pos: TARGET_POS
+  reset_joint_qpos: RESET_JOINT_QPOS
+  critical_phase_reset_joint_qpos: CRITICAL_PHASE_RESET_JOINT_QPOS
+  full_task_reset_joint_qpos: FULL_TASK_RESET_JOINT_QPOS
   joint_reset_qpos: [0.0, 0.0, 0.0, -1.9, 0.0, 2.0, 0.0]
   joint_limit_low: [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
   joint_limit_high: [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]

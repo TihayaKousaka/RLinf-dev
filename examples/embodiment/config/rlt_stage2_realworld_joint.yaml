@@ -34,6 +34,13 @@ cluster:
         type: Franka
         configs:
           - robot_ip: "${oc.env:RLT_REALWORLD_ROBOT_IP,ROBOT_IP}"
+            camera_infos:
+              - name: main_camera
+                serial_number: "${oc.env:RLT_REALWORLD_MAIN_CAMERA_SERIAL,MAIN_CAMERA_SERIAL}"
+                camera_type: "${oc.env:RLT_REALWORLD_MAIN_CAMERA_TYPE,realsense}"
+              - name: wrist_camera
+                serial_number: "${oc.env:RLT_REALWORLD_WRIST_CAMERA_SERIAL,WRIST_CAMERA_SERIAL}"
+                camera_type: "${oc.env:RLT_REALWORLD_WRIST_CAMERA_TYPE,lumos}"
             node_rank: 1
 
 runner:
@@ -105,8 +112,15 @@ env:
     auto_reset: True
     ignore_terminations: False
     reward_mode: raw
+    keyboard_reward_wrapper: single_stage
     max_episode_steps: 100
     max_steps_per_rollout_epoch: 100
+    # Teleoperation backend for human_override intervention.
+    # Current realworld Franka wrappers support SpaceMouse and GELLO.
+    use_spacemouse: False
+    use_gello: True
+    gello_port: "${oc.env:RLT_REALWORLD_GELLO_PORT,/dev/ttyUSB0}"
+    gello_action_mode: joint_target
     video_cfg:
       save_video: True
       fps: 10
@@ -118,10 +132,16 @@ env:
     auto_reset: True
     ignore_terminations: False
     reward_mode: raw
+    keyboard_reward_wrapper: single_stage
     max_episode_steps: 100
     max_steps_per_rollout_epoch: 100
     policy_mode: eval
     action_exec_chunks: 10
+    # Teleoperation backend for optional eval-time intervention/debugging.
+    use_spacemouse: False
+    use_gello: True
+    gello_port: "${oc.env:RLT_REALWORLD_GELLO_PORT,/dev/ttyUSB0}"
+    gello_action_mode: joint_target
     video_cfg:
       save_video: True
       fps: 10
@@ -159,7 +179,7 @@ actor:
     num_steps: 5
     rlt_stage2:
       config_name: "pi05_rlt_realworld_joint"
-      norm_stats_path: "${oc.env:RLT_REALWORLD_NORM_STATS_PATH,data/rlt_id3_id4_dataset/collected_data_id3_id4/rank_0/id_3/norm_stats.json}"
+      norm_stats_path: "${oc.env:RLT_REALWORLD_NORM_STATS_PATH,data/rlt_id3_id4_dataset/collected_data_id3_id4/rank_0/id_4/norm_stats.json}"
       rl_token_path: "${oc.env:RLT_REALWORLD_STAGE1_RL_TOKEN_PATH,/path/to/rlt_stage1_realworld_joint/checkpoints/global_step_xxx/actor/rl_token/rl_token_model.pt}"
       num_images_in_input: 2
       proprio_mode: joint_pos_gripper
@@ -176,8 +196,8 @@ actor:
       bc_regularizer_beta: 3.0
       warmup_bc_weight: 7.0
       warmup_q_weight: 0.05
-      online_bc_weight: 2.7
-      online_q_weight: 0.13
+      online_bc_weight: 2.8
+      online_q_weight: 0.15
       delta_weight: 0.1
       critic_updates_per_actor: 2
       replay_subsample_stride: 0

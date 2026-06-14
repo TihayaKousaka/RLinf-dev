@@ -54,6 +54,7 @@ class RealWorldEnv(gym.Env):
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
         self.main_image_key = cfg.main_image_key
+        self.wrist_image_key = cfg.get("wrist_image_key", None)
         self.default_prompt = cfg.get("default_prompt", None)
         self.state_key_order = cfg.get("state_key_order", None)
         self.manual_episode_control_only = bool(
@@ -241,11 +242,21 @@ class RealWorldEnv(gym.Env):
                 f"main_image_key {self.main_image_key!r} not in {list(frames)}"
             )
         obs["main_images"] = frames[self.main_image_key]
+        if self.wrist_image_key is not None:
+            if self.wrist_image_key not in frames:
+                raise KeyError(
+                    f"wrist_image_key {self.wrist_image_key!r} not in {list(frames)}"
+                )
+            obs["wrist_images"] = frames[self.wrist_image_key]
         raw_images = OrderedDict(sorted(frames.items()))
         raw_images.pop(self.main_image_key)
+        if self.wrist_image_key is not None:
+            raw_images.pop(self.wrist_image_key, None)
 
         if raw_images:
             obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)
+        elif self.wrist_image_key is not None:
+            obs["extra_view_images"] = None
 
         obs = to_tensor(obs)
         if self.default_prompt is not None:

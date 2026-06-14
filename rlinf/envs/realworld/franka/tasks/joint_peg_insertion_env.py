@@ -57,6 +57,7 @@ class FrankaJointPegInsertionConfig(FrankaRobotConfig):
     reset_ee_pose: np.ndarray = field(
         default_factory=lambda: np.array([0.5, 0.0, 0.2, -3.14, 0.0, 0.0])
     )
+    target_pos: list[float] | np.ndarray | None = None
     reward_threshold: np.ndarray = field(
         default_factory=lambda: np.array([0.015, 0.015, 0.03, 0.2, 0.2, 0.2])
     )
@@ -69,6 +70,8 @@ class FrankaJointPegInsertionConfig(FrankaRobotConfig):
     reset_joint_qpos: list[float] = field(
         default_factory=lambda: [0.0, -0.785, 0.0, -2.35, 0.0, 1.57, 0.785]
     )
+    critical_phase_reset_joint_qpos: list[float] | None = None
+    full_task_reset_joint_qpos: list[float] | None = None
     max_joint_delta: float | list[float] = 0.08
     joint_move_timeout: float = 1.5
     reset_gripper_action: float = -1.0
@@ -81,6 +84,11 @@ class FrankaJointPegInsertionConfig(FrankaRobotConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        self.target_pos = self._normalize_optional_vector(
+            self.target_pos,
+            field_name="target_pos",
+            length=3,
+        )
         self.joint_limit_low = np.asarray(self.joint_limit_low, dtype=np.float64)
         self.joint_limit_high = np.asarray(self.joint_limit_high, dtype=np.float64)
         if self.joint_limit_low.shape != (7,) or self.joint_limit_high.shape != (7,):
@@ -88,14 +96,79 @@ class FrankaJointPegInsertionConfig(FrankaRobotConfig):
                 "Franka joint limits must both be 7D, got "
                 f"{self.joint_limit_low.shape=} and {self.joint_limit_high.shape=}."
             )
-        self.reset_joint_qpos = [
-            float(value) for value in np.asarray(self.reset_joint_qpos).reshape(-1)
-        ]
-        if len(self.reset_joint_qpos) != 7:
+        self.reset_joint_qpos = self._normalize_joint_qpos(
+            self.reset_joint_qpos,
+            field_name="reset_joint_qpos",
+        )
+        self.critical_phase_reset_joint_qpos = self._normalize_optional_joint_qpos(
+            self.critical_phase_reset_joint_qpos,
+            field_name="critical_phase_reset_joint_qpos",
+        )
+        self.full_task_reset_joint_qpos = self._normalize_optional_joint_qpos(
+            self.full_task_reset_joint_qpos,
+            field_name="full_task_reset_joint_qpos",
+        )
+
+    @staticmethod
+    def _normalize_optional_vector(
+        value: list[float] | np.ndarray | None,
+        *,
+        field_name: str,
+        length: int,
+    ) -> np.ndarray | None:
+        if value is None:
+            return None
+        try:
+            vector = np.asarray(value, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError) as exc:
             raise ValueError(
-                "reset_joint_qpos must be 7D for Franka joint control, got "
-                f"{len(self.reset_joint_qpos)}."
+                f"{field_name} must be a {length}D numeric list; "
+                f"replace any placeholder with calibrated realworld values."
+            ) from exc
+        if vector.shape != (length,):
+            raise ValueError(
+                f"{field_name} must be {length}D, got {len(vector)}; "
+                f"replace any placeholder with calibrated realworld values."
             )
+        return vector
+
+    @classmethod
+    def _normalize_joint_qpos(
+        cls,
+        qpos: list[float] | np.ndarray | None,
+        *,
+        field_name: str,
+    ) -> list[float]:
+        if qpos is None:
+            raise ValueError(
+                f"{field_name} must be provided as 7 Franka joint positions "
+                "in radians."
+            )
+        try:
+            values = [float(value) for value in np.asarray(qpos).reshape(-1)]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{field_name} must be a 7D numeric list of Franka joint "
+                "positions in radians; replace any placeholder before running "
+                "real hardware."
+            ) from exc
+        if len(values) != 7:
+            raise ValueError(
+                f"{field_name} must be 7D for Franka joint control, got "
+                f"{len(values)}."
+            )
+        return values
+
+    @classmethod
+    def _normalize_optional_joint_qpos(
+        cls,
+        qpos: list[float] | np.ndarray | None,
+        *,
+        field_name: str,
+    ) -> list[float] | None:
+        if qpos is None:
+            return None
+        return cls._normalize_joint_qpos(qpos, field_name=field_name)
 
 
 class FrankaJointPegInsertionEnv(FrankaEnv):
@@ -310,8 +383,14 @@ class FrankaJointPegInsertionEnv(FrankaEnv):
         euler_angles = np.abs(
             R.from_quat(self._franka_state.tcp_pose[3:].copy()).as_euler("xyz")
         )
+        target_pos = (
+            self.config.target_pos
+            if self.config.target_pos is not None
+            else self.config.target_ee_pose[:3]
+        )
         position = np.hstack([self._franka_state.tcp_pose[:3], euler_angles])
-        target_delta = np.abs(position - self.config.target_ee_pose)
+        target_pose = np.hstack([target_pos, self.config.target_ee_pose[3:]])
+        target_delta = np.abs(position - target_pose)
         success_mask = target_delta <= self.config.reward_threshold
         is_success = bool(
             success_mask.all()

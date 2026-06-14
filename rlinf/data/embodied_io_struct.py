@@ -790,9 +790,6 @@ class EmbodiedRolloutResult:
                             device=source_chunk.device,
                         ),
                     ).cpu().contiguous()
-                last_fi["intervention_flag"] = (
-                    intervene_flags.any(dim=1, keepdim=True).cpu().contiguous()
-                )
                 if "intervention_flags" in last_fi:
                     last_fi["intervention_flags"] = (
                         intervene_flags.cpu().contiguous()
