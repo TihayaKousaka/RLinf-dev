@@ -16,15 +16,18 @@ realworld joint LeRobot data
 
 ## 1. 机器分工
 
-典型是两台机器：
+典型是两台机器。这里保留 `master` / `slave` 的现场叫法，但它们只是机器角色，不是算法概念，也不是机器人主从控制：
+
+- **master / GPU head 节点**：Ray head，通常 `RLINF_NODE_RANK=0`，负责训练和提交入口脚本。
+- **slave / robot control 节点**：Ray worker，通常 `RLINF_NODE_RANK=1`，负责连接真机硬件并运行 env/controller。
 
 ```text
-master / GPU head，RLINF_NODE_RANK=0
+master / GPU head 节点，RLINF_NODE_RANK=0
   - 跑 actor
   - 跑 rollout
   - 提交训练入口
 
-slave / robot control，RLINF_NODE_RANK=1
+slave / robot control 节点，RLINF_NODE_RANK=1
   - 和 Franka、相机、GELLO、键盘相连
   - 跑 env worker
   - 跑 Franka controller
@@ -50,23 +53,114 @@ action[7]   = gripper command
 
 ## 2. Master/Slave 环境配置
 
-Ray 会在 `ray start` 时捕获环境变量。所有机器人、相机、GELLO、键盘相关变量都要在 `ray start` 前设置。
+这一节包括两部分：先在 master 和 slave 分别装好依赖，再启动 Ray。Ray 会在 `ray start` 时捕获 Python 解释器和环境变量，所以依赖、ROS workspace、相机/GELLO/键盘变量都必须在 `ray start` 前准备好。
 
-master / GPU head：
+Stage2 真机环境全部来自 RLinf：`rlinf/envs/realworld`、`rlinf/models/embodiment/rlt_stage2`、`rlinf/workers/*` 和 `examples/embodiment/config/rlt_stage2_realworld_joint.yaml`。文档里提到 OpenPI 时，只表示 RLinf 内置支持的 OpenPI 模型依赖，不表示依赖其他在线训练框架。
+
+### 2.1 依赖安装
+
+master / GPU head 节点负责 SFT、Stage1、Stage2 actor/rollout 训练，需要 RLinf + OpenPI 模型训练环境：
 
 ```bash
 cd /path/to/RLinf
+
+# 如果已有可跑 SFT/Stage1 的 RLinf OpenPI 环境，直接激活同一个环境即可。
+source <your_rlinf_openpi_venv>/bin/activate
+```
+
+注意：当前安装脚本没有单独的 `--model rlt_stage2 --env franka` 入口。Stage2 真机这条链路建议复用你已经验证过 SFT/Stage1 的 RLinf OpenPI Python 环境，确保 master 上能正常 import `openpi`、`torch`、`transformers`、`rlinf`，并能读取 SFT actor、Stage1 `rl_token_model.pt` 和 `norm_stats.json`。
+
+在 master 上确认 RLinf 和 OpenPI 模型依赖能被找到：
+
+```bash
+python - <<'PY'
+import rlinf
+print("rlinf ok:", rlinf.__file__)
+try:
+    import openpi
+    print("openpi ok:", openpi.__file__)
+except Exception as exc:
+    print("openpi import failed:", exc)
+PY
+```
+
+slave / robot control 节点负责 Franka、相机、GELLO、键盘输入，需要 Franka/ROS/真机依赖：
+
+```bash
+cd /path/to/RLinf
+
+# 推荐 Ubuntu 20.04 + ROS Noetic。该命令会安装 franka extra、
+# ROS/libfranka/franka_ros/serl_franka_controllers 等真机控制依赖。
+bash requirements/install.sh embodied --env franka --venv franka-venv
+source franka-venv/bin/activate
+```
+
+Franka 固件版本建议先按机器人 Desk 页面确认。`requirements/install.sh` 默认使用 `LIBFRANKA_VERSION=0.15.0` 和 `FRANKA_ROS_VERSION=0.10.0`；如果你的固件需要其他版本，请在安装前显式设置：
+
+```bash
+export LIBFRANKA_VERSION=<compatible-libfranka-version>
+export FRANKA_ROS_VERSION=<compatible-franka-ros-version>
+bash requirements/install.sh embodied --env franka --venv franka-venv
+```
+
+如果 slave 已经手动安装好 ROS Noetic、libfranka、franka_ros 和 serl_franka_controllers，可以跳过 ROS 相关自动安装：
+
+```bash
+export SKIP_ROS=1
+bash requirements/install.sh embodied --env franka --venv franka-venv
+source franka-venv/bin/activate
+source /opt/ros/noetic/setup.bash
+source <your_catkin_ws>/devel/setup.bash
+```
+
+无论采用哪种安装方式，启动 Ray 前都要确认 slave 当前 shell 能找到真机依赖：
+
+```bash
+python - <<'PY'
+import evdev
+import pyrealsense2
+import serial
+import rlinf
+print("realworld deps ok")
+PY
+```
+
+### 2.2 Ray 启动前环境变量
+
+`ray_utils/realworld/setup_before_ray.sh` 是模板脚本。第一次使用前，分别在 master 和 slave 上打开它，至少改两处：
+
+```bash
+# 按本机网卡修改，例如 eth0、eno1、enp134s0f0 等
+export RLINF_COMM_NET_DEVICES="eth0"
+
+# 按本机实际 venv 修改。master 指向 RLinf OpenPI 训练 venv，
+# slave 指向 Franka/ROS venv。
+source <your_venv_path>/bin/activate
+```
+
+如果你不想改脚本，也可以把脚本里的 `source <your_venv_path>/bin/activate` 注释掉，然后在 source 该脚本前手动激活 venv。不要保留这个占位符原样。
+
+master / GPU head 节点：
+
+```bash
+cd /path/to/RLinf
+source <your_rlinf_openpi_venv>/bin/activate
 source ray_utils/realworld/setup_before_ray.sh
 export RLINF_NODE_RANK=0
 ray start --head --port=6379 --node-ip-address=<head_ip>
 ```
 
-slave / robot control：
+slave / robot control 节点：
 
 ```bash
 cd /path/to/RLinf
+source franka-venv/bin/activate
 source ray_utils/realworld/setup_before_ray.sh
-source <your_catkin_ws>/devel/setup.bash
+
+# 如果没有通过 franka-venv/bin/activate 自动 source ROS/catkin，
+# 或者你使用的是手动安装的 ROS workspace，则需要显式 source：
+# source /opt/ros/noetic/setup.bash
+# source <your_catkin_ws>/devel/setup.bash
 
 export RLINF_NODE_RANK=1
 export RLT_REALWORLD_ROBOT_IP=<Franka IP>
@@ -79,6 +173,8 @@ export RLINF_KEYBOARD_DEVICE=/dev/input/eventX
 
 ray start --address=<head_ip>:6379
 ```
+
+不要在 `ray start` 之后才换 venv、source ROS workspace 或修改相机/GELLO/键盘变量；Ray worker 不一定能看到这些变化。改完环境后需要 `ray stop` 再重新 `ray start`。
 
 找键盘 event：
 

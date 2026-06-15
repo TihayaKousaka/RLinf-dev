@@ -298,7 +298,7 @@
          支持 OpenPI 全量 SFT 与 LoRA 微调，作为强化学习前置阶段
        </p>
      </div>
-   
+
    </div>
 
    <div style="display: flex; justify-content: center; gap: 20px; align-items: flex-start; flex-wrap: wrap;">
@@ -364,6 +364,17 @@
            <b>Franka真机强化学习</b>
          </a><br>
          RLinf worker无缝对接Franka机械臂
+       </p>
+     </div>
+
+     <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
+       <img src="https://github.com/RLinf/misc/raw/main/pic/franka_arm_small.jpg"
+            style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" />
+       <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
+         <a href="realworld_rlt_joint.html" style="text-decoration: underline; color: blue;">
+           <b>Franka 真机 Joint-Control RLT</b>
+         </a><br>
+         OpenPI SFT + RL-token Stage1 + Stage2 在线 RLT 的 Franka joint-control 流程
        </p>
      </div>
 
@@ -533,6 +544,7 @@
    recap
    co_training
    franka
+   realworld_rlt_joint
    franka_reward_model
    franka_zed_robotiq
    franka_gello
