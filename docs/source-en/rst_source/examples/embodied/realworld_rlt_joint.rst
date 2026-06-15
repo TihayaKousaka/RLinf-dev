@@ -103,9 +103,42 @@ Master / GPU head
 ~~~~~~~~~~~~~~~~~
 
 The master needs the RLinf OpenPI training environment used by SFT and Stage1.
-If you already completed SFT/Stage1, reuse the same virtual environment:
+It is recommended to follow the same OpenPI installation style as :doc:`pi0`,
+because the validated real-world pipeline currently reuses that environment.
+If you already completed SFT/Stage1, reuse the same environment directly;
+otherwise prepare it with one of the following options.
 
-.. code-block:: bash
+**Option 1: Docker Image**
+
+.. code:: bash
+
+   docker run -it --rm --gpus all \
+      --shm-size 20g \
+      --network host \
+      --name rlinf \
+      -v .:/workspace/RLinf \
+      rlinf/rlinf:agentic-rlinf0.2-maniskill_libero
+      # For mainland China users, you can use the following for better download speed:
+      # docker.1ms.run/rlinf/rlinf:agentic-rlinf0.2-maniskill_libero
+
+Switch to the OpenPI virtual environment via the built-in ``switch_env`` tool:
+
+.. code:: bash
+
+   source switch_env openpi
+
+**Option 2: Custom Environment**
+
+.. code:: bash
+
+   cd /path/to/RLinf
+   # For mainland China users, you can add `--use-mirror` to install.sh for better download speed.
+   bash requirements/install.sh embodied --model openpi --env maniskill_libero
+   source .venv/bin/activate
+
+If SFT/Stage1 is already done, you can also simply reactivate the original environment, for example:
+
+.. code:: bash
 
    cd /path/to/RLinf
    source <your_rlinf_openpi_venv>/bin/activate
@@ -125,8 +158,9 @@ Check that the master can import the model and RLinf stack:
    PY
 
 Stage2 real-world RLT currently reuses the validated RLinf OpenPI environment
-from SFT/Stage1; there is no separate ``--model rlt_stage2 --env franka``
-installer target.
+above; there is no separate ``--model rlt_stage2 --env franka`` installer
+target. Note that this OpenPI environment is only for the master side; the
+slave still needs its own Franka/ROS real-world dependencies.
 
 Slave / robot control
 ~~~~~~~~~~~~~~~~~~~~~
@@ -229,6 +263,13 @@ Slave:
 
    ray start --address=<head_ip>:6379
 
+Except for ``RLINF_NODE_RANK``, the hardware-facing fields above can also be
+written directly in YAML or passed through
+``cluster.node_groups[].env_configs[].env_vars``. Keeping them as shell
+environment variables is mainly for faster on-site switching. ``RLINF_NODE_RANK``
+itself still has to be set as a machine environment variable before
+``ray start``.
+
 Find and grant access to the keyboard event device on the slave:
 
 .. code-block:: bash
@@ -256,7 +297,12 @@ Before any real robot run, check the following on site:
 3. ``reset_joint_qpos`` is a safe reset joint posture.
 4. ``critical_phase_reset_joint_qpos`` is a safe start posture for ``critical_phase``.
 5. ``full_task_reset_joint_qpos`` is a safe task start posture for ``full_task``.
-6. ``target_pos`` is the 3D xyz target for the hole or success condition.
+6. ``target_pos`` is the 3D xyz target used by the base env for automatic
+   success checking. In the current Stage2 setup, both train and eval enable
+   ``keyboard_reward_wrapper: single_stage``, so final success/failure is still
+   usually decided by keyboard reward; however, ``target_pos`` should still be
+   filled with calibrated values for automatic success checks, debugging, and
+   pure automatic evaluation.
 7. For the first smoke test, reduce ``max_joint_delta`` to a small value such as ``0.03``.
 8. A human operator must watch the robot, logs, keyboard reward, and emergency stop throughout online training.
 
@@ -400,6 +446,18 @@ Important task fields live in
 For the first hardware smoke test, use a smaller ``max_joint_delta`` such as
 ``0.03``. Keep ``keyboard_reward_wrapper: single_stage`` enabled while
 calibrating ``target_pos`` and success thresholds.
+
+These four placeholders are all real-world calibration values:
+
+- ``target_pos``: the spatial target used by the base env for automatic success
+  checking. Current Stage2 runs still primarily use keyboard reward for final
+  success/failure.
+- ``reset_joint_qpos``: the final 7D reset joint target that is actually used,
+  in radians.
+- ``critical_phase_reset_joint_qpos``: the reset joint target used in
+  ``task_mode: critical_phase``.
+- ``full_task_reset_joint_qpos``: the reset joint target used in
+  ``task_mode: full_task``.
 
 Camera and state semantics must match the training dataset:
 
@@ -659,8 +717,11 @@ Early hardware runs should keep keyboard reward enabled:
        keyboard_reward_wrapper: single_stage
 
 If ``target_pos`` is not calibrated yet, manual keyboard reward is usually more
-reliable than automatic success. Once the automatic success threshold is
-calibrated, consider disabling keyboard reward for evaluation.
+reliable than automatic success. This is also the current default Stage2 path:
+both train and eval keep ``keyboard_reward_wrapper: single_stage`` enabled, and
+the operator provides the final reward via ``a/b/c``. Once the automatic
+success threshold is calibrated, consider disabling keyboard reward for
+evaluation.
 
 Run SOP
 -------
@@ -669,9 +730,11 @@ Before each run:
 
 1. Franka Desk has no error.
 2. The slave has sourced the ROS workspace.
-3. ``RLINF_NODE_RANK``, ``RLT_REALWORLD_ROBOT_IP``, camera serials,
-   ``RLT_REALWORLD_GELLO_PORT``, and ``RLINF_KEYBOARD_DEVICE`` were set before
-   ``ray start``.
+3. ``RLINF_NODE_RANK`` was set before ``ray start``. Hardware-facing fields
+   such as ``RLT_REALWORLD_ROBOT_IP``, camera serials,
+   ``RLT_REALWORLD_GELLO_PORT``, and ``RLINF_KEYBOARD_DEVICE`` must also be
+   visible before env workers start; they can be provided either via shell
+   ``export`` before ``ray start`` or via YAML / ``env_vars``.
 4. ``ray status`` shows both nodes.
 5. ``RLT_REALWORLD_STAGE2_BASE_PATH`` points to the SFT ``actor/`` directory.
 6. ``RLT_REALWORLD_STAGE1_RL_TOKEN_PATH`` points to Stage1 ``rl_token_model.pt``.
@@ -702,7 +765,10 @@ Troubleshooting
 
 - ``RLT_REALWORLD_STAGE2_BASE_PATH`` should point to the SFT ``actor/`` directory, not ``rl_token_model.pt``.
 - ``RLT_REALWORLD_STAGE1_RL_TOKEN_PATH`` is the Stage1 ``rl_token_model.pt`` path.
-- ``RLINF_NODE_RANK``, ROS workspace, ``RLINF_KEYBOARD_DEVICE``, GELLO port, and camera serials must be set before ``ray start``.
+- ``RLINF_NODE_RANK`` and the ROS workspace must be set before ``ray start``.
+  Hardware-facing fields such as ``RLINF_KEYBOARD_DEVICE``, GELLO port, and
+  camera serials must also be visible before env workers start; they can come
+  from shell ``export`` or from YAML / ``env_vars``.
 - ``use_gello: True`` requires a valid ``gello_port``.
 - For joint RLT, prefer GELLO. Do not treat SpaceMouse as a joint-target intervention device.
 - If reward stays at 0, check ``target_pos``, ``reward_threshold``, ``check_orientation_success``, or temporarily keep ``keyboard_reward_wrapper: single_stage``.

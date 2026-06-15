@@ -97,10 +97,41 @@ rollout。
 Master / GPU head
 ~~~~~~~~~~~~~~~~~
 
-master 需要 SFT 和 Stage1 使用的 RLinf OpenPI 训练环境。如果你已经完成 SFT/Stage1，
-直接复用同一个虚拟环境：
+master 需要 SFT 和 Stage1 使用的 RLinf OpenPI 训练环境。这里建议直接沿用
+:doc:`pi0` 中的 OpenPI 安装方式，因为当前验证通过的真机链路就是基于这套环境。
+如果你已经完成 SFT/Stage1，直接复用同一个虚拟环境即可；如果需要重新搭建，可按下面两种方式之一准备。
 
-.. code-block:: bash
+**选项 1：Docker 镜像**
+
+.. code:: bash
+
+   docker run -it --rm --gpus all \
+      --shm-size 20g \
+      --network host \
+      --name rlinf \
+      -v .:/workspace/RLinf \
+      rlinf/rlinf:agentic-rlinf0.2-maniskill_libero
+      # 如果需要国内加速下载镜像，可以使用：
+      # docker.1ms.run/rlinf/rlinf:agentic-rlinf0.2-maniskill_libero
+
+请通过镜像内置的 ``switch_env`` 工具切换到 OpenPI 虚拟环境：
+
+.. code:: bash
+
+   source switch_env openpi
+
+**选项 2：自定义环境**
+
+.. code:: bash
+
+   cd /path/to/RLinf
+   # 为提高国内依赖安装速度，可以添加 --use-mirror 到 install.sh 命令
+   bash requirements/install.sh embodied --model openpi --env maniskill_libero
+   source .venv/bin/activate
+
+如果你已经完成 SFT/Stage1，也可以直接激活原来的环境，例如：
+
+.. code:: bash
 
    cd /path/to/RLinf
    source <your_rlinf_openpi_venv>/bin/activate
@@ -119,8 +150,9 @@ master 需要 SFT 和 Stage1 使用的 RLinf OpenPI 训练环境。如果你已�
        print("openpi import failed:", exc)
    PY
 
-Stage2 真机 RLT 当前复用经过 SFT/Stage1 验证的 RLinf OpenPI 环境；没有单独的
-``--model rlt_stage2 --env franka`` 安装入口。
+Stage2 真机 RLT 当前复用上面这套经过 SFT/Stage1 验证的 RLinf OpenPI 环境；
+没有单独的 ``--model rlt_stage2 --env franka`` 安装入口。注意这套 OpenPI
+环境只用于 master；slave 仍然需要单独安装 Franka/ROS 真机依赖。
 
 Slave / robot control
 ~~~~~~~~~~~~~~~~~~~~~
@@ -219,6 +251,11 @@ slave：
 
    ray start --address=<head_ip>:6379
 
+除 ``RLINF_NODE_RANK`` 以外，上述硬件相关字段都可以直接写进 YAML，或者通过
+``cluster.node_groups[].env_configs[].env_vars`` 这类配置下发。保留成 shell
+环境变量只是为了现场切换更快。``RLINF_NODE_RANK`` 本身仍然必须在 ``ray start``
+之前作为机器环境变量设置。
+
 在 slave 上查找键盘 event 设备并授予读权限：
 
 .. code-block:: bash
@@ -244,7 +281,10 @@ slave：
 3. ``reset_joint_qpos`` 是安全复位关节位姿。
 4. ``critical_phase_reset_joint_qpos`` 是 ``critical_phase`` 模式下的安全起始关节位姿。
 5. ``full_task_reset_joint_qpos`` 是 ``full_task`` 模式下的安全任务起始关节位姿。
-6. ``target_pos`` 是孔位或成功判定目标位置，3D xyz。
+6. ``target_pos`` 是底层 env 自动成功判定参考的 3D xyz 目标位置。在当前
+   Stage2 配置里，train/eval 默认都开启了 ``keyboard_reward_wrapper: single_stage``，
+   所以最终成功/失败通常仍由键盘奖励主导；但 ``target_pos`` 仍应填写真实标定值，
+   便于自动成功判定、排障和纯自动 eval。
 7. 第一次 smoke 把 ``max_joint_delta`` 调小，例如 ``0.03``。
 8. 真机在线训练必须有人盯机器人、日志、键盘奖励和急停。
 
@@ -383,6 +423,14 @@ Stage2 早期训练建议保留键盘奖励。
 
 第一次真机 smoke 建议把 ``max_joint_delta`` 改小，例如 ``0.03``。在校准
 ``target_pos`` 和 success threshold 时，建议保留 ``keyboard_reward_wrapper: single_stage``。
+
+这四个占位字段本质上都是真机标定值：
+
+- ``target_pos``：底层 env 自动成功判定参考的空间目标点。当前 Stage2 默认主要由
+  键盘奖励判成功，但这个字段仍建议认真标定。
+- ``reset_joint_qpos``：最终真正执行的 7D reset 关节角，单位 rad。
+- ``critical_phase_reset_joint_qpos``：``task_mode: critical_phase`` 时使用的 reset 关节角。
+- ``full_task_reset_joint_qpos``：``task_mode: full_task`` 时使用的 reset 关节角。
 
 相机和状态语义必须与训练数据集一致：
 
@@ -633,8 +681,10 @@ GELLO 当前姿态。
      eval:
        keyboard_reward_wrapper: single_stage
 
-如果 ``target_pos`` 还没完全校准，人工键盘奖励通常比自动 reward 更稳。等自动 success
-threshold 校准后，再考虑关闭 eval 的键盘奖励。
+如果 ``target_pos`` 还没完全校准，人工键盘奖励通常比自动 reward 更稳。当前
+Stage2 默认就是这一路径：train/eval 都保留 ``keyboard_reward_wrapper: single_stage``，
+由操作员按 ``a/b/c`` 给出最终奖励。等自动 success threshold 校准后，再考虑关闭
+eval 的键盘奖励。
 
 运行 SOP
 --------
@@ -643,8 +693,10 @@ threshold 校准后，再考虑关闭 eval 的键盘奖励。
 
 1. Franka Desk 无 error。
 2. slave 已 source ROS workspace。
-3. ``RLINF_NODE_RANK``、``RLT_REALWORLD_ROBOT_IP``、相机 serial、
-   ``RLT_REALWORLD_GELLO_PORT``、``RLINF_KEYBOARD_DEVICE`` 都在 ``ray start`` 前设置。
+3. ``RLINF_NODE_RANK`` 必须在 ``ray start`` 前设置。``RLT_REALWORLD_ROBOT_IP``、
+   相机 serial、``RLT_REALWORLD_GELLO_PORT``、``RLINF_KEYBOARD_DEVICE`` 等硬件项
+   也必须在 env worker 进程启动前可见；它们可以在 ``ray start`` 前通过 shell
+   ``export``，也可以直接写进 YAML / ``env_vars``。
 4. ``ray status`` 看到两个节点。
 5. ``RLT_REALWORLD_STAGE2_BASE_PATH`` 指向 SFT ``actor/`` 目录。
 6. ``RLT_REALWORLD_STAGE1_RL_TOKEN_PATH`` 指向 Stage1 ``rl_token_model.pt``。
@@ -674,7 +726,9 @@ threshold 校准后，再考虑关闭 eval 的键盘奖励。
 
 - ``RLT_REALWORLD_STAGE2_BASE_PATH`` 应该指向 SFT 的 ``actor/`` 目录，不是 ``rl_token_model.pt``。
 - ``RLT_REALWORLD_STAGE1_RL_TOKEN_PATH`` 才是 Stage1 的 ``rl_token_model.pt``。
-- ``RLINF_NODE_RANK``、ROS workspace、``RLINF_KEYBOARD_DEVICE``、GELLO 串口、相机 serial 都要在 ``ray start`` 前设置。
+- ``RLINF_NODE_RANK``、ROS workspace 必须在 ``ray start`` 前设置。``RLINF_KEYBOARD_DEVICE``、
+  GELLO 串口、相机 serial 等硬件项也必须在 env worker 启动前可见；它们既可以在
+  ``ray start`` 前 ``export``，也可以写进 YAML / ``env_vars``。
 - ``use_gello: True`` 时必须设置有效 ``gello_port``。
 - joint RLT 优先用 GELLO，不要直接把 SpaceMouse 当 joint-target 接管设备。
 - 如果 reward 一直是 0，先查 ``target_pos``、``reward_threshold``、``check_orientation_success``，或临时保留 ``keyboard_reward_wrapper: single_stage``。
