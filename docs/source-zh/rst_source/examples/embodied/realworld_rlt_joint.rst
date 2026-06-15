@@ -179,8 +179,12 @@ venv、在 slave 上 source ROS，并设置所有相机/GELLO/键盘变量。
 
 .. code-block:: bash
 
-   export RLINF_COMM_NET_DEVICES="eth0"
+   # 可选：只有需要固定通信网卡时才设置。
+   # 网卡名示例：eth0、eno1、enp134s0f0。
+   export RLINF_COMM_NET_DEVICES="<nic_name>"
    source <your_venv_path>/bin/activate
+
+如果机器只有一块可用网卡，通常可以不设置 ``RLINF_COMM_NET_DEVICES``。
 
 master：
 

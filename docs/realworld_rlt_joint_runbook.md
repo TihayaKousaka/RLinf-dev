@@ -130,8 +130,8 @@ PY
 `ray_utils/realworld/setup_before_ray.sh` 是模板脚本。第一次使用前，分别在 master 和 slave 上打开它，至少改两处：
 
 ```bash
-# 按本机网卡修改，例如 eth0、eno1、enp134s0f0 等
-export RLINF_COMM_NET_DEVICES="eth0"
+# 可选：只有需要固定通信网卡时才设置，例如 eth0、eno1、enp134s0f0 等
+export RLINF_COMM_NET_DEVICES="<nic_name>"
 
 # 按本机实际 venv 修改。master 指向 RLinf OpenPI 训练 venv，
 # slave 指向 Franka/ROS venv。

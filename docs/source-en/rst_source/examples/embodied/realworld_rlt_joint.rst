@@ -188,8 +188,13 @@ edit the network interface and venv activation line on each machine:
 
 .. code-block:: bash
 
-   export RLINF_COMM_NET_DEVICES="eth0"
+   # Optional: set this only when you need to pin communication to a specific NIC.
+   # Example NIC names: eth0, eno1, enp134s0f0.
+   export RLINF_COMM_NET_DEVICES="<nic_name>"
    source <your_venv_path>/bin/activate
+
+If the machine has only one usable NIC, you can usually leave
+``RLINF_COMM_NET_DEVICES`` unset.
 
 Master:
 
