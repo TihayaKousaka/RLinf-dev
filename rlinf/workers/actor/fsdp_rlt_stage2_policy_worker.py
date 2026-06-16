@@ -80,6 +80,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         self.total_transitions_added = 0
         self.total_episodes_added = 0
         self._last_logged_status_phase: str | None = None
+        self._last_replay_autosave_transitions = 0
+        self._last_replay_autosave_episodes = 0
 
         weight_syncer_cfg = cfg.get("weight_syncer", None)
         assert weight_syncer_cfg is not None, (
@@ -255,6 +257,67 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             raise RuntimeError("RLT Stage2 trajectory adapter is not initialized.")
         return self.trajectory_adapter.add_trajectory(traj)
 
+    def _maybe_autosave_replay(
+        self,
+        *,
+        added: int,
+        completed_episodes: int,
+    ) -> None:
+        if added <= 0 or self.replay_buffer is None:
+            return
+        replay_cfg = self.cfg.algorithm.get("replay_buffer", {})
+        if not bool(replay_cfg.get("auto_save", False)):
+            return
+
+        every_transitions = int(replay_cfg.get("auto_save_every_transitions", 0))
+        every_episodes = int(replay_cfg.get("auto_save_every_episodes", 1))
+        transitions_delta = (
+            self.total_transitions_added - self._last_replay_autosave_transitions
+        )
+        episodes_delta = self.total_episodes_added - self._last_replay_autosave_episodes
+        should_save = (
+            every_transitions > 0 and transitions_delta >= every_transitions
+        ) or (every_episodes > 0 and episodes_delta >= every_episodes)
+        if not should_save:
+            return
+
+        base_dir = replay_cfg.get("auto_save_dir", None)
+        if base_dir is None:
+            base_dir = os.path.join(
+                self.cfg.runner.logger.log_path,
+                "debug",
+                "rlt_replay",
+            )
+        save_dir = os.path.join(str(base_dir), f"rank_{self._rank}")
+        self.replay_buffer.save_checkpoint(save_dir)
+        write_status_json(
+            os.path.join(save_dir, "metadata.json"),
+            {
+                "timestamp": utc_timestamp(),
+                "component": "actor",
+                "rank": self._rank,
+                "update_step": int(self.update_step),
+                "replay_size": int(len(self.replay_buffer)),
+                "replay_capacity": int(self.replay_buffer.capacity),
+                "total_transitions_added": int(self.total_transitions_added),
+                "total_episodes_added": int(self.total_episodes_added),
+                "transitions_since_last_save": int(transitions_delta),
+                "episodes_since_last_save": int(episodes_delta),
+                "added_transitions": int(added),
+                "completed_episodes": int(completed_episodes),
+                "auto_save_every_transitions": int(every_transitions),
+                "auto_save_every_episodes": int(every_episodes),
+            },
+        )
+        self._last_replay_autosave_transitions = int(self.total_transitions_added)
+        self._last_replay_autosave_episodes = int(self.total_episodes_added)
+        self.log_info(
+            "[RLT_REPLAY_AUTOSAVE] "
+            f"path={save_dir} size={len(self.replay_buffer)} "
+            f"transitions={self.total_transitions_added} "
+            f"episodes={self.total_episodes_added}"
+        )
+
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
         clear_memory(sync=False)
 
@@ -271,6 +334,10 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             self.episodes_since_train += completed_episodes
             self.total_transitions_added += added
             self.total_episodes_added += completed_episodes
+            self._maybe_autosave_replay(
+                added=added,
+                completed_episodes=completed_episodes,
+            )
 
     def _global_rollout_counters(self) -> dict[str, float]:
         return all_reduce_dict(

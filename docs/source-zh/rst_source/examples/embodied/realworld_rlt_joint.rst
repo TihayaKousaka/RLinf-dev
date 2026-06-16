@@ -757,6 +757,37 @@ eval 的键盘奖励。
 4. 检查 intervention 是否被记录。
 5. smoke 有问题时不要扩大训练步数。
 
+可选 replay debug 快照
+~~~~~~~~~~~~~~~~~~~~~~
+
+正常主线不建议默认 dump 原始 replay；这属于现场排障工具。怀疑采集错了时再打开：
+
+.. code-block:: yaml
+
+   algorithm:
+     replay_buffer:
+       auto_save: true
+       auto_save_every_episodes: 1
+       auto_save_every_transitions: 0
+       auto_save_dir: ${runner.logger.log_path}/debug/rlt_replay
+
+打开后 actor 会覆盖式保存：
+
+.. code-block:: text
+
+   ${runner.logger.log_path}/debug/rlt_replay/rank_0/buffer.pt
+   ${runner.logger.log_path}/debug/rlt_replay/rank_0/metadata.json
+
+检查 replay 内容：
+
+.. code-block:: bash
+
+   python -m toolkits.rlt.inspect_rlt_replay ../results/debug/rlt_replay/rank_0
+
+重点看 ``size`` 是否增长、reward 是否长期全 0、``source_chunk`` 里是否真的有
+``HUMAN/MIXED``、``collection_phase`` 是否符合 warmup/online 预期，以及
+``intervention_flag_rate`` 是否和现场 GELLO 接管大致一致。
+
 常见坑
 ------
 

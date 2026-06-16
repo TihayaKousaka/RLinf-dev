@@ -797,6 +797,39 @@ After the run:
 4. Check intervention logging.
 5. If smoke testing fails, do not increase training steps.
 
+Optional Replay Debug Snapshot
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Do not dump raw replay by default in the main training path. This is an on-site
+debugging tool; enable it only when you suspect collection is wrong:
+
+.. code-block:: yaml
+
+   algorithm:
+     replay_buffer:
+       auto_save: true
+       auto_save_every_episodes: 1
+       auto_save_every_transitions: 0
+       auto_save_dir: ${runner.logger.log_path}/debug/rlt_replay
+
+When enabled, the actor overwrites a debug snapshot:
+
+.. code-block:: text
+
+   ${runner.logger.log_path}/debug/rlt_replay/rank_0/buffer.pt
+   ${runner.logger.log_path}/debug/rlt_replay/rank_0/metadata.json
+
+Inspect the replay content with:
+
+.. code-block:: bash
+
+   python -m toolkits.rlt.inspect_rlt_replay ../results/debug/rlt_replay/rank_0
+
+Check whether ``size`` grows, reward is not stuck at all zeros,
+``source_chunk`` contains expected ``HUMAN/MIXED`` chunks, ``collection_phase``
+matches warmup/online expectations, and ``intervention_flag_rate`` roughly
+matches on-site GELLO takeover.
+
 Troubleshooting
 ---------------
 

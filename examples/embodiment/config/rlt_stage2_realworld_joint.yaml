@@ -91,7 +91,12 @@ algorithm:
     cache_size: 10000
     sample_window_size: 10000
     min_buffer_size: 100
+    # Debug-only replay snapshot. Keep disabled in normal runs; enable when
+    # inspecting whether realworld collection wrote reward/source/phase fields correctly.
     auto_save: False
+    auto_save_every_episodes: 1
+    auto_save_every_transitions: 0
+    auto_save_dir: ${runner.logger.log_path}/debug/rlt_replay
   sampling_params:
     do_sample: True
     temperature_train: 1.0

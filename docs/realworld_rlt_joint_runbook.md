@@ -708,6 +708,40 @@ train/eval 都保留 `keyboard_reward_wrapper: single_stage`，由操作员按 `
 4. 看 intervention 是否被记录。
 5. smoke 有问题时不要扩大训练步数。
 
+### 可选：replay debug 快照
+
+正常主线不建议默认 dump 原始 replay；这属于现场排障工具。怀疑采集错了时再打开：
+
+```yaml
+algorithm:
+  replay_buffer:
+    auto_save: true
+    auto_save_every_episodes: 1
+    auto_save_every_transitions: 0
+    auto_save_dir: ${runner.logger.log_path}/debug/rlt_replay
+```
+
+打开后 actor 会覆盖式保存：
+
+```text
+${runner.logger.log_path}/debug/rlt_replay/rank_0/buffer.pt
+${runner.logger.log_path}/debug/rlt_replay/rank_0/metadata.json
+```
+
+检查 replay 内容：
+
+```bash
+python -m toolkits.rlt.inspect_rlt_replay ../results/debug/rlt_replay/rank_0
+```
+
+重点看：
+
+- `size` 是否增长。
+- reward 是否长期全 0。
+- `source_chunk` 里是否真的有 `HUMAN/MIXED`。
+- `collection_phase` 是否符合 warmup/online 预期。
+- `intervention_flag_rate` 是否和现场 GELLO 接管大致一致。
+
 ## 13. 常见坑
 
 - `RLT_REALWORLD_STAGE2_BASE_PATH` 应该指向 SFT 的 `actor/` 目录，不是 `rl_token_model.pt`。
