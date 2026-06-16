@@ -324,6 +324,14 @@ def test_trajectory_adapter_emits_standard_replay_trajectories():
     assert bool(second_inputs["intervention_flag"].item()) is True
     assert second_inputs["collection_phase_id"].item() == COLLECTION_PHASE_ONLINE
     assert second_inputs["source"].item() == TransitionSource.MIXED
+    torch.testing.assert_close(
+        second_inputs["action_chunk"].reshape(-1),
+        torch.tensor([5.0, 6.0, 7.0, 8.0], dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        second_inputs["a_tilde"].reshape(-1),
+        torch.tensor([0.1, 0.1, 0.1, 0.1], dtype=torch.float32),
+    )
 
 
 def test_trajectory_adapter_builds_sparse_stride_transitions_from_step_trace():
@@ -338,6 +346,7 @@ def test_trajectory_adapter_builds_sparse_stride_transitions_from_step_trace():
     assert completed_episodes == 1
     assert len(replay_trajectories) == 4
     first_inputs = replay_trajectories[0].forward_inputs
+    second_inputs = replay_trajectories[1].forward_inputs
     terminal_inputs = replay_trajectories[-1].forward_inputs
 
     torch.testing.assert_close(
@@ -346,11 +355,21 @@ def test_trajectory_adapter_builds_sparse_stride_transitions_from_step_trace():
     )
     torch.testing.assert_close(
         first_inputs["next_x"].reshape(-1),
-        torch.tensor([1.0, 1.1, 1.2], dtype=torch.float32),
+        torch.tensor([10.0, 10.1, 10.2], dtype=torch.float32),
     )
     assert first_inputs["source"].item() == TransitionSource.RL
     assert first_inputs["dones"].item() == 0.0
     assert first_inputs["step_id"].item() == 0
+
+    torch.testing.assert_close(
+        second_inputs["x"].reshape(-1),
+        torch.tensor([1.0, 1.1, 1.2], dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        second_inputs["next_x"].reshape(-1),
+        torch.tensor([11.0, 11.1, 11.2], dtype=torch.float32),
+    )
+    assert second_inputs["step_id"].item() == 1
 
     assert terminal_inputs["source"].item() == TransitionSource.MIXED
     assert bool(terminal_inputs["intervention_flag"].item()) is True
@@ -674,6 +693,64 @@ def test_rollout_adapter_routes_warmup_base_then_online_human_override():
     assert (
         online.result["forward_inputs"]["collection_phase_id"].item()
         == COLLECTION_PHASE_ONLINE
+    )
+
+    autonomous_online = adapter.predict(
+        env_obs={"states": torch.zeros((1, 3))},
+        policy_info={
+            "expert_takeover": torch.tensor([[False]]),
+            "in_critical_phase": torch.tensor([[True]]),
+            "record_transition": torch.tensor([[True]]),
+            "intervention_phase": torch.tensor([[0.0]]),
+        },
+        model_kwargs={"mode": "train"},
+        mode="train",
+        allow_expert=True,
+        update_version=5,
+    )
+    torch.testing.assert_close(
+        autonomous_online.actions,
+        torch.tensor([[[1.0, 1.0], [2.0, 2.0]]], dtype=torch.float32),
+    )
+    assert autonomous_online.expert_label_flag is False
+    assert autonomous_online.result["forward_inputs"]["student_control"].item() is True
+    assert (
+        autonomous_online.result["forward_inputs"]["source_chunk"]
+        == int(TransitionSource.RL)
+    ).all()
+
+    online_before_critical_phase = adapter.predict(
+        env_obs={"states": torch.zeros((1, 3))},
+        policy_info={
+            "expert_takeover": torch.tensor([[False]]),
+            "in_critical_phase": torch.tensor([[False]]),
+            "record_transition": torch.tensor([[False]]),
+            "intervention_phase": torch.tensor([[0.0]]),
+        },
+        model_kwargs={"mode": "train"},
+        mode="train",
+        allow_expert=True,
+        update_version=5,
+    )
+    torch.testing.assert_close(
+        online_before_critical_phase.actions,
+        torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+    )
+    assert (
+        online_before_critical_phase.result["forward_inputs"][
+            "student_control"
+        ].item()
+        is False
+    )
+    assert (
+        online_before_critical_phase.result["forward_inputs"]["source_chunk"]
+        == int(TransitionSource.BASE)
+    ).all()
+    assert (
+        online_before_critical_phase.result["forward_inputs"][
+            "record_transition"
+        ].item()
+        is False
     )
 
 
