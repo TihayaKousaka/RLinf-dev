@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -29,6 +30,8 @@ from .training_schedule import resolve_warmup_required_updates
 class RLTStage2RolloutAdapter:
     """Encapsulates RLT Stage 2 rollout-only behavior."""
 
+    enabled = True
+
     def __init__(
         self,
         *,
@@ -37,6 +40,8 @@ class RLTStage2RolloutAdapter:
         expert_model_getter,
         has_expert_model_config: bool,
     ) -> None:
+        if not self.is_enabled_cfg(cfg):
+            raise ValueError("RLTStage2RolloutAdapter requires RLT Stage2 TD3 config.")
         self.cfg = cfg
         self.student_model = student_model
         self.expert_model_getter = expert_model_getter
@@ -49,8 +54,7 @@ class RLTStage2RolloutAdapter:
         eval_env_type = str(self.cfg.env.eval.get("env_type", "")).lower()
         self._uses_realworld = "realworld" in {train_env_type, eval_env_type}
         if (
-            self.enabled()
-            and bool(intervention_cfg.get("enable", False))
+            bool(intervention_cfg.get("enable", False))
             and self.intervention_mode
             not in (
                 {"local_correction", "human_override"}
@@ -72,12 +76,29 @@ class RLTStage2RolloutAdapter:
             )
         )
 
-    def enabled(self) -> bool:
+    @staticmethod
+    def is_enabled_cfg(cfg) -> bool:
         return (
-            self.cfg.algorithm.get("loss_type", None) == "rlt_td3"
-            and SupportedModel(self.cfg.actor.model.model_type)
-            == SupportedModel.RLT_STAGE2
+            cfg.algorithm.get("loss_type", None) == "rlt_td3"
+            and SupportedModel(cfg.actor.model.model_type) == SupportedModel.RLT_STAGE2
         )
+
+    def expert_model_path(self, configured_path: str, expert_ckpt_path: str | None):
+        if expert_ckpt_path and os.path.isdir(str(expert_ckpt_path)):
+            return expert_ckpt_path
+        return configured_path
+
+    def configure_expert_model(self, expert_model_config) -> None:
+        if expert_model_config.get("rlt_stage2", None) is None:
+            raise RuntimeError(
+                "RLT Stage2 expert model config must include actor.model.rlt_stage2."
+            )
+        rollout_expert_cfg = self.cfg.rollout.expert_model
+        act_as_vla_reference = rollout_expert_cfg.get("act_as_vla_reference", True)
+        expert_model_config.rlt_stage2.act_as_vla_reference = act_as_vla_reference
+        if act_as_vla_reference:
+            expert_model_config.rlt_stage2.load_feature_backbones = True
+            expert_model_config.rlt_stage2.load_rl_token_model = False
 
     def ready_for_online(self, update_version: int) -> tuple[bool, int]:
         warmup_required_updates = resolve_warmup_required_updates(self.cfg)
@@ -115,11 +136,20 @@ class RLTStage2RolloutAdapter:
     def rollout_state_dict(self):
         return self.student_model.rollout_state_dict()
 
+    def use_dagger_beta(self) -> bool:
+        return False
+
+    def allow_bootstrap_values(self) -> bool:
+        return False
+
+    def final_forward_inputs(self, result: dict[str, Any]) -> dict[str, Any]:
+        return result["forward_inputs"]
+
     def encode_step_trace(
         self,
         step_obs: dict[str, Any] | None,
     ) -> dict[str, torch.Tensor]:
-        if step_obs is None or not self.enabled():
+        if step_obs is None:
             return {}
         if not hasattr(self.student_model, "encode_obs"):
             raise RuntimeError(

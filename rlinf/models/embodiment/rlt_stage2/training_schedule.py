@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .status import phase_id, resolve_training_phase, utc_timestamp
+
 
 SKIP_REASON_NONE = 0
 SKIP_REASON_BUFFER_NOT_READY = 1
@@ -48,6 +50,24 @@ class RLTUpdateSchedule:
     updates_to_run: int
     should_train: bool
     skip_reason: int
+
+
+@dataclass(frozen=True)
+class RLTReplayReadiness:
+    warmup_min_size: int
+    min_demo_buffer_size: int
+    demo_ready: bool
+    use_demo: bool
+    buffer_ready: bool
+
+
+@dataclass(frozen=True)
+class RLTTrainingPlan:
+    schedule: RLTUpdateSchedule
+    readiness: RLTReplayReadiness
+    ready_for_online: bool
+    status_phase: str
+    pending_update_budget: int
 
 
 def resolve_warmup_required_updates(cfg: Any) -> int:
@@ -228,3 +248,236 @@ def resolve_update_schedule(
         should_train=should_train,
         skip_reason=skip_reason,
     )
+
+
+def resolve_replay_readiness(
+    cfg: Any,
+    *,
+    has_demo_buffer: bool,
+    global_min_replay_size: int,
+    global_min_demo_size: int,
+) -> RLTReplayReadiness:
+    """Resolve whether replay/demo buffers are ready for RLT updates."""
+    replay_cfg = cfg.algorithm.get("replay_buffer", {})
+    warmup_min_size = int(
+        replay_cfg.get(
+            "min_buffer_size",
+            cfg.algorithm.get("warmup_min_size", 1),
+        )
+    )
+    min_demo_buffer_size = int(
+        cfg.algorithm.get("demo_buffer", {}).get("min_buffer_size", 0)
+    )
+    if has_demo_buffer:
+        min_demo_buffer_size = max(min_demo_buffer_size, 1)
+    demo_ready = (not has_demo_buffer) or global_min_demo_size >= min_demo_buffer_size
+    use_demo = bool(has_demo_buffer and demo_ready)
+    buffer_ready = global_min_replay_size >= warmup_min_size and demo_ready
+    return RLTReplayReadiness(
+        warmup_min_size=warmup_min_size,
+        min_demo_buffer_size=min_demo_buffer_size,
+        demo_ready=demo_ready,
+        use_demo=use_demo,
+        buffer_ready=buffer_ready,
+    )
+
+
+class RLTStage2TrainingScheduler:
+    """Stateful RLT Stage 2 update scheduler.
+
+    This object owns RLT-specific warmup/update-budget state. The actor worker
+    supplies distributed replay counters and executes the returned update plan.
+    """
+
+    def __init__(self) -> None:
+        self.pending_update_budget = 0
+        self.warmup_ready_total_transitions: int | None = None
+        self.warmup_ready_total_episodes: int | None = None
+
+    def plan(
+        self,
+        cfg: Any,
+        *,
+        update_step: int,
+        has_demo_buffer: bool,
+        global_counters: dict[str, float],
+        global_min_replay_size: int,
+        global_min_demo_size: int,
+    ) -> RLTTrainingPlan:
+        """Resolve the current RLT training plan from distributed counters."""
+        readiness = resolve_replay_readiness(
+            cfg,
+            has_demo_buffer=has_demo_buffer,
+            global_min_replay_size=global_min_replay_size,
+            global_min_demo_size=global_min_demo_size,
+        )
+        global_total_transitions_added = int(
+            global_counters["total_transitions_added"]
+        )
+        global_total_episodes_added = int(global_counters["total_episodes_added"])
+        if (
+            readiness.buffer_ready
+            and self.warmup_ready_total_transitions is None
+        ):
+            self.warmup_ready_total_transitions = global_total_transitions_added
+            self.warmup_ready_total_episodes = global_total_episodes_added
+
+        schedule = resolve_update_schedule(
+            cfg,
+            update_step=update_step,
+            buffer_ready=readiness.buffer_ready,
+            global_total_transitions_added=global_total_transitions_added,
+            global_total_episodes_added=global_total_episodes_added,
+            warmup_ready_total_transitions=self.warmup_ready_total_transitions,
+            warmup_ready_total_episodes=self.warmup_ready_total_episodes,
+        )
+        self.pending_update_budget = schedule.pending_update_budget
+        ready_for_online = int(update_step) >= schedule.warmup_required_updates
+        status_phase = resolve_training_phase(
+            buffer_ready=readiness.buffer_ready,
+            ready_for_online=ready_for_online,
+        )
+        return RLTTrainingPlan(
+            schedule=schedule,
+            readiness=readiness,
+            ready_for_online=ready_for_online,
+            status_phase=status_phase,
+            pending_update_budget=self.pending_update_budget,
+        )
+
+    def finish_updates(self, critic_updates_run: int) -> int:
+        """Consume scheduled update budget after local critic updates."""
+        self.pending_update_budget = max(
+            self.pending_update_budget - int(critic_updates_run),
+            0,
+        )
+        return self.pending_update_budget
+
+    @staticmethod
+    def ready_for_online(plan: RLTTrainingPlan, update_step: int) -> bool:
+        """Return whether the current update step opens online control."""
+        return int(update_step) >= plan.schedule.warmup_required_updates
+
+    def status_phase(self, plan: RLTTrainingPlan, update_step: int) -> str:
+        """Return the status phase for the current update step."""
+        return resolve_training_phase(
+            buffer_ready=plan.readiness.buffer_ready,
+            ready_for_online=self.ready_for_online(plan, update_step),
+        )
+
+    def metrics(
+        self,
+        *,
+        plan: RLTTrainingPlan,
+        update_step: int,
+        global_counters: dict[str, float],
+        global_min_replay_size: int,
+        global_min_demo_size: int,
+        should_train: bool,
+        skip_reason: int,
+        critic_updates_run: int = 0,
+        actor_updates_run: int = 0,
+    ) -> dict[str, float]:
+        """Build scalar metrics for RLT schedule/status logging."""
+        schedule = plan.schedule
+        readiness = plan.readiness
+        ready_for_online = self.ready_for_online(plan, update_step)
+        status_phase = self.status_phase(plan, update_step)
+        return {
+            "rlt_stage2/update_step": float(update_step),
+            "rlt_stage2/critic_updates_run": float(critic_updates_run),
+            "rlt_stage2/actor_updates_run": float(actor_updates_run),
+            "rlt_stage2/should_train": float(should_train),
+            "rlt_stage2/skip_reason": float(skip_reason),
+            "rlt_stage2/ready_for_online": float(ready_for_online),
+            "rlt_stage2/status_phase_id": float(phase_id(status_phase)),
+            "rlt_stage2/global_min_replay_size": float(global_min_replay_size),
+            "rlt_stage2/global_min_demo_size": float(global_min_demo_size),
+            "rlt_stage2/min_replay_buffer_size": float(readiness.warmup_min_size),
+            "rlt_stage2/min_demo_buffer_size": float(
+                readiness.min_demo_buffer_size
+            ),
+            "rlt_stage2/update_epoch": float(schedule.update_ratio),
+            "rlt_stage2/warmup_required_updates": float(
+                schedule.warmup_required_updates
+            ),
+            "rlt_stage2/pending_update_budget": float(
+                self.pending_update_budget
+            ),
+            "rlt_stage2/updates_scheduled": float(schedule.updates_scheduled),
+            "rlt_stage2/global_transitions_since_train": float(
+                global_counters["transitions_since_train"]
+            ),
+            "rlt_stage2/global_total_transitions_added": float(
+                global_counters["total_transitions_added"]
+            ),
+        }
+
+    def status_payload(
+        self,
+        *,
+        plan: RLTTrainingPlan,
+        rank: int,
+        update_step: int,
+        global_min_replay_size: int,
+        should_train: bool,
+        skip_reason: int,
+        critic_updates_run: int = 0,
+        actor_updates_run: int = 0,
+        global_total_transitions_added: int = 0,
+        global_total_episodes_added: int = 0,
+    ) -> dict[str, Any]:
+        """Build the actor-side status JSON payload."""
+        ready_for_online = self.ready_for_online(plan, update_step)
+        status_phase = self.status_phase(plan, update_step)
+        return {
+            "timestamp": utc_timestamp(),
+            "component": "actor",
+            "rank": int(rank),
+            "phase": status_phase,
+            "phase_id": phase_id(status_phase),
+            "ready_for_online": bool(ready_for_online),
+            "buffer_ready": bool(plan.readiness.buffer_ready),
+            "update_step": int(update_step),
+            "warmup_required_updates": int(plan.schedule.warmup_required_updates),
+            "global_min_replay_size": int(global_min_replay_size),
+            "warmup_min_size": int(plan.readiness.warmup_min_size),
+            "pending_update_budget": int(self.pending_update_budget),
+            "updates_scheduled": int(plan.schedule.updates_scheduled),
+            "critic_updates_run": int(critic_updates_run),
+            "actor_updates_run": int(actor_updates_run),
+            "should_train": bool(should_train),
+            "skip_reason": int(skip_reason),
+            "global_total_transitions_added": int(global_total_transitions_added),
+            "global_total_episodes_added": int(global_total_episodes_added),
+        }
+
+    def state_dict(self) -> dict[str, int | None]:
+        """Return checkpointable scheduler state."""
+        return {
+            "pending_update_budget": self.pending_update_budget,
+            "warmup_ready_total_transitions": self.warmup_ready_total_transitions,
+            "warmup_ready_total_episodes": self.warmup_ready_total_episodes,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Load scheduler state from checkpoint fields."""
+        self.pending_update_budget = int(state.get("pending_update_budget", 0))
+        warmup_ready_total_transitions = state.get(
+            "warmup_ready_total_transitions",
+            None,
+        )
+        self.warmup_ready_total_transitions = (
+            None
+            if warmup_ready_total_transitions is None
+            else int(warmup_ready_total_transitions)
+        )
+        warmup_ready_total_episodes = state.get(
+            "warmup_ready_total_episodes",
+            None,
+        )
+        self.warmup_ready_total_episodes = (
+            None
+            if warmup_ready_total_episodes is None
+            else int(warmup_ready_total_episodes)
+        )

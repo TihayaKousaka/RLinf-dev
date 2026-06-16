@@ -24,53 +24,34 @@ import torch
 from omegaconf import DictConfig
 
 from rlinf.data.embodied_io_struct import Trajectory
-from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
-from rlinf.hybrid_engines.weight_syncer import WeightSyncer
-from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+from rlinf.scheduler import Worker
 from rlinf.utils.distributed import all_reduce_dict
-from rlinf.utils.metric_utils import append_to_dict, compute_split_num
-from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.utils import clear_memory
+from rlinf.utils.metric_utils import append_to_dict
+from rlinf.utils.nested_dict_process import put_tensor_device
+from rlinf.utils.utils import collect_param_names_need_sync
 
 from ...models.embodiment.rlt_stage2.components import actor_loss, critic_loss
-from ...models.embodiment.rlt_stage2.proprio import resolve_proprio_dim
-from ...models.embodiment.rlt_stage2.replay_buffer import RLTStage2ReplayBuffer
-from ...models.embodiment.rlt_stage2.status import (
-    phase_id,
-    resolve_training_phase,
-    utc_timestamp,
-    write_status_json,
-)
+from ...models.embodiment.rlt_stage2.status import write_status_json
 from ...models.embodiment.rlt_stage2.training_schedule import (
+    RLTStage2TrainingScheduler,
+    RLTTrainingPlan,
     resolve_actor_loss_weights,
-    resolve_update_schedule,
 )
 from ...models.embodiment.rlt_stage2.trajectory_adapter import (
     RLTStage2TrajectoryReplayAdapter,
 )
+from .embodied_offpolicy_worker import EmbodiedOffPolicyFSDPActor
 
 
-class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
+class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
     def __init__(self, cfg: DictConfig):
-        Worker.__init__(self)
-        super().__init__(cfg.actor, self._world_size, self._rank)
-        self.cfg = cfg
-        self._rollout_group_name = cfg.rollout.group_name
-        self._component_placement = HybridComponentPlacement(cfg, Cluster())
-        self.stage_num = cfg.rollout.pipeline_stage_num
-        self.enable_offload = self.cfg.actor.get("enable_offload", False)
-        self.version = 0
+        super().__init__(cfg)
 
-        self.replay_buffer: RLTStage2ReplayBuffer | None = None
-        self.demo_buffer: RLTStage2ReplayBuffer | None = None
         self.trajectory_adapter: RLTStage2TrajectoryReplayAdapter | None = None
         self.qf_optimizer = None
         self.qf_lr_scheduler = None
-        self.update_step = 0
-        self.pending_update_budget = 0
-        self.warmup_ready_total_transitions: int | None = None
-        self.warmup_ready_total_episodes: int | None = None
-        self.gradient_accumulation = 1
+        self.training_scheduler = RLTStage2TrainingScheduler()
         self.actor_only_train_model = bool(
             cfg.algorithm.get("actor_only_train_model", True)
         )
@@ -80,27 +61,12 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         self.total_transitions_added = 0
         self.total_episodes_added = 0
         self._last_logged_status_phase: str | None = None
-        self._last_replay_autosave_transitions = 0
-        self._last_replay_autosave_episodes = 0
-
-        weight_syncer_cfg = cfg.get("weight_syncer", None)
-        assert weight_syncer_cfg is not None, (
-            "weight_syncer config must be provided for RLT stage2 actor worker."
-        )
-        self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
-        self._sync_weight_comm_options = self.weight_syncer.comm_options
-        self._is_weight_sender = self._rank == 0
-        self._actor_world_size = self._world_size
-        self._rollout_all_ranks = list(
-            range(self._component_placement.get_world_size("rollout"))
-        )
 
     def init_worker(self):
         self.setup_model_and_optimizer()
         self._init_replay_buffer()
         self.trajectory_adapter = RLTStage2TrajectoryReplayAdapter(
             cfg=self.cfg,
-            replay_buffer=self.replay_buffer,
         )
         if self.enable_offload:
             self.offload_param_and_grad()
@@ -129,6 +95,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
 
     def setup_model_and_optimizer(self) -> None:
         module = self.model_provider_func()
+        self.param_names_need_sync = collect_param_names_need_sync(module)
         self.model = self._strategy.wrap_model(
             model=module, device_mesh=self._device_mesh
         )
@@ -167,31 +134,18 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         capacity = int(
             replay_cfg.get("capacity", stage2_cfg.get("buffer_capacity", 200000))
         )
-        state_dim = int(stage2_cfg.embedding_dim) + resolve_proprio_dim(
-            stage2_cfg,
-            default_dim=int(self.cfg.actor.model.action_dim),
-        )
-        self.replay_buffer = RLTStage2ReplayBuffer(
-            capacity=capacity,
-            state_dim=state_dim,
-            action_chunk_dim=int(self.cfg.actor.model.num_action_chunks)
-            * int(self.cfg.actor.model.action_dim),
-            chunk_length=int(self.cfg.actor.model.num_action_chunks),
-            seed=int(self.cfg.actor.get("seed", 1234)) + self._rank,
-        )
         demo_cfg = self.cfg.algorithm.get("demo_buffer", None)
-        if demo_cfg is None:
-            return
-        self.demo_buffer = RLTStage2ReplayBuffer(
-            capacity=int(demo_cfg.get("capacity", capacity)),
-            state_dim=state_dim,
-            action_chunk_dim=int(self.cfg.actor.model.num_action_chunks)
-            * int(self.cfg.actor.model.action_dim),
-            chunk_length=int(self.cfg.actor.model.num_action_chunks),
-            seed=int(self.cfg.actor.get("seed", 1234)) + self._rank + 17,
+        demo_capacity = (
+            None if demo_cfg is None else int(demo_cfg.get("capacity", capacity))
         )
-        if demo_cfg.get("load_path", None) is not None:
-            self.demo_buffer.load_checkpoint(demo_cfg.load_path)
+        self.init_trajectory_replay_buffers(
+            replay_cfg=replay_cfg,
+            replay_seed=int(self.cfg.actor.get("seed", 1234)) + self._rank,
+            replay_capacity=capacity,
+            demo_cfg=demo_cfg,
+            demo_seed=int(self.cfg.actor.get("seed", 1234)) + self._rank + 17,
+            demo_capacity=demo_capacity,
+        )
 
     def soft_update_target_model(self, tau: float | None = None) -> None:
         if tau is None:
@@ -205,139 +159,36 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         self._rollout_sync_key_count = len(state_dict)
         return state_dict
 
-    async def sync_model_to_rollout(self) -> None:
-        if self.enable_offload:
-            if not self.is_optimizer_offloaded:
-                self.offload_optimizer()
-            if self.is_weight_offloaded:
-                self.load_param_and_grad(self.device, False)
+    def get_rollout_sync_param_names(self, state_dict: dict) -> list[str]:
+        return list(state_dict.keys())
 
-        state_dict = self.get_rollout_state_dict()
-
-        async def send_func(data):
-            if not self._is_weight_sender:
-                return
-            await self.broadcast(
-                data,
-                groups=[
-                    (self._group_name, 0),
-                    (self._rollout_group_name, self._rollout_all_ranks),
-                ],
-                src=(self._group_name, 0),
-                async_op=True,
-                options=self._sync_weight_comm_options,
-            ).async_wait()
-
-        async def recv_func():
-            return await self.recv(
-                src_group_name=self._rollout_group_name,
-                src_rank=0,
-                async_op=True,
-                options=self._sync_weight_comm_options,
-            ).async_wait()
-
-        if not self.weight_syncer.sender_initialized():
-            await self.weight_syncer.init_sender(
-                state_dict=state_dict,
-                send=send_func,
-                recv=recv_func,
-                param_names_need_sync=list(state_dict.keys()),
-            )
-
+    def get_rollout_sync_version(self) -> int:
         # Rollout uses this version as the number of completed TD3 updates.
         # Do not send runner global_step here, otherwise warmup/intervention
         # gates open before any actor/critic update has actually happened.
-        await self.weight_syncer.sync(state_dict, send_func, version=self.update_step)
+        return int(self.update_step)
 
-        if self.enable_offload:
-            self.offload_param_and_grad(True)
+    def add_rollout_trajectories(self, trajectories: list[Trajectory]) -> None:
+        if self.trajectory_adapter is None or self.replay_buffer is None:
+            raise RuntimeError("RLT Stage2 replay path is not initialized.")
 
-    def _add_rollout_trajectory_to_replay(self, traj: Trajectory) -> tuple[int, int]:
-        if self.trajectory_adapter is None:
-            raise RuntimeError("RLT Stage2 trajectory adapter is not initialized.")
-        return self.trajectory_adapter.add_trajectory(traj)
-
-    def _maybe_autosave_replay(
-        self,
-        *,
-        added: int,
-        completed_episodes: int,
-    ) -> None:
-        if added <= 0 or self.replay_buffer is None:
-            return
-        replay_cfg = self.cfg.algorithm.get("replay_buffer", {})
-        if not bool(replay_cfg.get("auto_save", False)):
-            return
-
-        every_transitions = int(replay_cfg.get("auto_save_every_transitions", 0))
-        every_episodes = int(replay_cfg.get("auto_save_every_episodes", 1))
-        transitions_delta = (
-            self.total_transitions_added - self._last_replay_autosave_transitions
-        )
-        episodes_delta = self.total_episodes_added - self._last_replay_autosave_episodes
-        should_save = (
-            every_transitions > 0 and transitions_delta >= every_transitions
-        ) or (every_episodes > 0 and episodes_delta >= every_episodes)
-        if not should_save:
-            return
-
-        base_dir = replay_cfg.get("auto_save_dir", None)
-        if base_dir is None:
-            base_dir = os.path.join(
-                self.cfg.runner.logger.log_path,
-                "debug",
-                "rlt_replay",
+        replay_trajectories: list[Trajectory] = []
+        completed_episodes = 0
+        for trajectory in trajectories:
+            new_trajectories, new_episodes = (
+                self.trajectory_adapter.build_replay_trajectories(trajectory)
             )
-        save_dir = os.path.join(str(base_dir), f"rank_{self._rank}")
-        self.replay_buffer.save_checkpoint(save_dir)
-        write_status_json(
-            os.path.join(save_dir, "metadata.json"),
-            {
-                "timestamp": utc_timestamp(),
-                "component": "actor",
-                "rank": self._rank,
-                "update_step": int(self.update_step),
-                "replay_size": int(len(self.replay_buffer)),
-                "replay_capacity": int(self.replay_buffer.capacity),
-                "total_transitions_added": int(self.total_transitions_added),
-                "total_episodes_added": int(self.total_episodes_added),
-                "transitions_since_last_save": int(transitions_delta),
-                "episodes_since_last_save": int(episodes_delta),
-                "added_transitions": int(added),
-                "completed_episodes": int(completed_episodes),
-                "auto_save_every_transitions": int(every_transitions),
-                "auto_save_every_episodes": int(every_episodes),
-            },
-        )
-        self._last_replay_autosave_transitions = int(self.total_transitions_added)
-        self._last_replay_autosave_episodes = int(self.total_episodes_added)
-        self.log_info(
-            "[RLT_REPLAY_AUTOSAVE] "
-            f"path={save_dir} size={len(self.replay_buffer)} "
-            f"transitions={self.total_transitions_added} "
-            f"episodes={self.total_episodes_added}"
-        )
+            replay_trajectories.extend(new_trajectories)
+            completed_episodes += new_episodes
 
-    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
-        clear_memory(sync=False)
+        if replay_trajectories:
+            self.replay_buffer.add_trajectories(replay_trajectories)
 
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
-
-        for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            added, completed_episodes = self._add_rollout_trajectory_to_replay(
-                trajectory
-            )
-            self.transitions_since_train += added
-            self.episodes_since_train += completed_episodes
-            self.total_transitions_added += added
-            self.total_episodes_added += completed_episodes
-            self._maybe_autosave_replay(
-                added=added,
-                completed_episodes=completed_episodes,
-            )
+        added = len(replay_trajectories)
+        self.transitions_since_train += added
+        self.episodes_since_train += completed_episodes
+        self.total_transitions_added += added
+        self.total_episodes_added += completed_episodes
 
     def _global_rollout_counters(self) -> dict[str, float]:
         return all_reduce_dict(
@@ -351,7 +202,9 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         )
 
     def _global_min_replay_size(self) -> int:
-        replay_size = 0 if self.replay_buffer is None else len(self.replay_buffer)
+        replay_size = (
+            0 if self.replay_buffer is None else self.replay_buffer.total_samples
+        )
         reduced = all_reduce_dict(
             {"min_replay_size": float(replay_size)},
             op=torch.distributed.ReduceOp.MIN,
@@ -359,7 +212,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         return int(reduced["min_replay_size"])
 
     def _global_min_demo_size(self) -> int:
-        demo_size = 0 if self.demo_buffer is None else len(self.demo_buffer)
+        demo_size = 0 if self.demo_buffer is None else self.demo_buffer.total_samples
         reduced = all_reduce_dict(
             {"min_demo_size": float(demo_size)},
             op=torch.distributed.ReduceOp.MIN,
@@ -374,85 +227,93 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
     ) -> dict[str, torch.Tensor]:
         assert self.replay_buffer is not None
         if not use_demo or self.demo_buffer is None:
-            return self.replay_buffer.sample(batch_size, self.device).to_dict()
+            return self._sample_buffer_batch(self.replay_buffer, batch_size)
 
         replay_batch_size = batch_size - batch_size // 2
         demo_batch_size = batch_size - replay_batch_size
-        replay_batch = self.replay_buffer.sample(
+        replay_batch = self._sample_buffer_batch(
+            self.replay_buffer,
             replay_batch_size,
-            self.device,
-        ).to_dict()
-        demo_batch = self.demo_buffer.sample(demo_batch_size, self.device).to_dict()
+        )
+        demo_batch = self._sample_buffer_batch(self.demo_buffer, demo_batch_size)
         return {
             key: torch.cat([replay_batch[key], demo_batch[key]], dim=0)
             for key in replay_batch
         }
 
-    def _append_training_schedule_metrics(
+    def _sample_buffer_batch(
+        self,
+        replay_buffer: TrajectoryReplayBuffer,
+        batch_size: int,
+    ) -> dict[str, torch.Tensor]:
+        sample_dicts = []
+        remaining = int(batch_size)
+        while remaining > 0:
+            batch = replay_buffer.sample(remaining)
+            if not batch:
+                raise RuntimeError("RLT Stage2 replay sample returned an empty batch.")
+            sampled = self._unwrap_rlt_forward_inputs(batch)
+            sample_dicts.append(sampled)
+            first_tensor = next(
+                value for value in sampled.values() if isinstance(value, torch.Tensor)
+            )
+            sampled_size = int(first_tensor.shape[0])
+            if sampled_size <= 0:
+                raise RuntimeError("RLT Stage2 replay sample has zero tensor rows.")
+            remaining -= sampled_size
+        merged = {
+            key: torch.cat([sample[key] for sample in sample_dicts], dim=0)[
+                :batch_size
+            ]
+            for key in sample_dicts[0]
+        }
+        return put_tensor_device(merged, self.device)
+
+    @staticmethod
+    def _unwrap_rlt_forward_inputs(
+        batch: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        forward_inputs = batch.get("forward_inputs", None)
+        if not isinstance(forward_inputs, dict):
+            raise RuntimeError(
+                "RLT Stage2 replay sample is missing forward_inputs. "
+                "Only RLT transition trajectories produced by "
+                "RLTStage2TrajectoryReplayAdapter are supported."
+            )
+        return forward_inputs
+
+    def _append_training_plan_metrics(
         self,
         metrics: dict[str, Any],
         *,
+        plan: RLTTrainingPlan,
         global_counters: dict[str, float],
         global_min_replay_size: int,
         global_min_demo_size: int,
-        warmup_min_size: int,
-        min_demo_buffer_size: int,
-        warmup_required_updates: int,
-        update_ratio: int,
         should_train: bool,
         skip_reason: int,
-        pending_update_budget: int,
-        updates_scheduled: int = 0,
         critic_updates_run: int = 0,
         actor_updates_run: int = 0,
     ) -> None:
-        ready_for_online = self.update_step >= warmup_required_updates
-        buffer_ready = global_min_replay_size >= warmup_min_size and (
-            self.demo_buffer is None or global_min_demo_size >= min_demo_buffer_size
-        )
-        status_phase = resolve_training_phase(
-            buffer_ready=buffer_ready,
-            ready_for_online=ready_for_online,
-        )
         append_to_dict(
             metrics,
-            {
-                "rlt_stage2/update_step": float(self.update_step),
-                "rlt_stage2/critic_updates_run": float(critic_updates_run),
-                "rlt_stage2/actor_updates_run": float(actor_updates_run),
-                "rlt_stage2/should_train": float(should_train),
-                "rlt_stage2/skip_reason": float(skip_reason),
-                "rlt_stage2/ready_for_online": float(ready_for_online),
-                "rlt_stage2/status_phase_id": float(phase_id(status_phase)),
-                "rlt_stage2/global_min_replay_size": float(global_min_replay_size),
-                "rlt_stage2/global_min_demo_size": float(global_min_demo_size),
-                "rlt_stage2/min_replay_buffer_size": float(warmup_min_size),
-                "rlt_stage2/min_demo_buffer_size": float(min_demo_buffer_size),
-                "rlt_stage2/update_epoch": float(update_ratio),
-                "rlt_stage2/warmup_required_updates": float(
-                    warmup_required_updates
-                ),
-                "rlt_stage2/pending_update_budget": float(pending_update_budget),
-                "rlt_stage2/updates_scheduled": float(updates_scheduled),
-                "rlt_stage2/global_transitions_since_train": float(
-                    global_counters["transitions_since_train"]
-                ),
-                "rlt_stage2/global_total_transitions_added": float(
-                    global_counters["total_transitions_added"]
-                ),
-            },
+            self.training_scheduler.metrics(
+                plan=plan,
+                update_step=self.update_step,
+                global_counters=global_counters,
+                global_min_replay_size=global_min_replay_size,
+                global_min_demo_size=global_min_demo_size,
+                should_train=should_train,
+                skip_reason=skip_reason,
+                critic_updates_run=critic_updates_run,
+                actor_updates_run=actor_updates_run,
+            ),
         )
         self._emit_training_status(
-            phase=status_phase,
-            ready_for_online=ready_for_online,
-            buffer_ready=buffer_ready,
+            plan=plan,
             global_min_replay_size=global_min_replay_size,
-            warmup_min_size=warmup_min_size,
-            warmup_required_updates=warmup_required_updates,
-            pending_update_budget=pending_update_budget,
             should_train=should_train,
             skip_reason=skip_reason,
-            updates_scheduled=updates_scheduled,
             critic_updates_run=critic_updates_run,
             actor_updates_run=actor_updates_run,
             global_total_transitions_added=int(
@@ -464,73 +325,98 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
     def _emit_training_status(
         self,
         *,
-        phase: str,
-        ready_for_online: bool,
-        buffer_ready: bool,
+        plan: RLTTrainingPlan,
         global_min_replay_size: int,
-        warmup_min_size: int,
-        warmup_required_updates: int,
-        pending_update_budget: int,
         should_train: bool,
         skip_reason: int,
-        updates_scheduled: int,
         critic_updates_run: int,
         actor_updates_run: int,
         global_total_transitions_added: int,
         global_total_episodes_added: int,
     ) -> None:
+        phase = self.training_scheduler.status_phase(plan, self.update_step)
         if self._rank == 0 and phase != self._last_logged_status_phase:
+            ready_for_online = self.training_scheduler.ready_for_online(
+                plan,
+                self.update_step,
+            )
             self.log_info(
                 "[RLT_STATUS][actor] "
                 f"phase={phase} ready={int(ready_for_online)} "
-                f"buffer_ready={int(buffer_ready)} "
-                f"replay={global_min_replay_size}/{warmup_min_size} "
-                f"update={self.update_step}/{warmup_required_updates} "
-                f"pending={pending_update_budget}"
+                f"buffer_ready={int(plan.readiness.buffer_ready)} "
+                f"replay={global_min_replay_size}/{plan.readiness.warmup_min_size} "
+                f"update={self.update_step}/{plan.schedule.warmup_required_updates} "
+                f"pending={self.training_scheduler.pending_update_budget}"
             )
             self._last_logged_status_phase = phase
 
         status_dir = os.path.join(self.cfg.runner.logger.log_path, "status")
         write_status_json(
             os.path.join(status_dir, f"rlt_actor_status_rank{self._rank}.json"),
-            {
-                "timestamp": utc_timestamp(),
-                "component": "actor",
-                "rank": self._rank,
-                "phase": phase,
-                "phase_id": phase_id(phase),
-                "ready_for_online": bool(ready_for_online),
-                "buffer_ready": bool(buffer_ready),
-                "update_step": int(self.update_step),
-                "warmup_required_updates": int(warmup_required_updates),
-                "global_min_replay_size": int(global_min_replay_size),
-                "warmup_min_size": int(warmup_min_size),
-                "pending_update_budget": int(pending_update_budget),
-                "updates_scheduled": int(updates_scheduled),
-                "critic_updates_run": int(critic_updates_run),
-                "actor_updates_run": int(actor_updates_run),
-                "should_train": bool(should_train),
-                "skip_reason": int(skip_reason),
-                "global_total_transitions_added": int(global_total_transitions_added),
-                "global_total_episodes_added": int(global_total_episodes_added),
-            },
+            self.training_scheduler.status_payload(
+                plan=plan,
+                rank=self._rank,
+                update_step=self.update_step,
+                global_min_replay_size=global_min_replay_size,
+                should_train=should_train,
+                skip_reason=skip_reason,
+                critic_updates_run=critic_updates_run,
+                actor_updates_run=actor_updates_run,
+                global_total_transitions_added=global_total_transitions_added,
+                global_total_episodes_added=global_total_episodes_added,
+            ),
         )
 
     def _append_replay_stats(self, metrics: dict[str, Any]) -> None:
         if self.replay_buffer is None:
             return
         stats = self.replay_buffer.get_stats()
+        append_to_dict(
+            metrics,
+            {"replay_buffer/size": self.replay_buffer.total_samples},
+        )
         for key, value in stats.items():
-            if key == "capacity":
-                continue
+            append_to_dict(metrics, {f"replay_buffer/{key}": value})
+        rlt_stats = self._rlt_replay_stats(self.replay_buffer)
+        for key, value in rlt_stats.items():
             append_to_dict(metrics, {f"replay_buffer/{key}": value})
         if self.demo_buffer is None:
             return
         demo_stats = self.demo_buffer.get_stats()
+        append_to_dict(metrics, {"demo_buffer/size": self.demo_buffer.total_samples})
         for key, value in demo_stats.items():
-            if key == "capacity":
-                continue
             append_to_dict(metrics, {f"demo_buffer/{key}": value})
+        demo_rlt_stats = self._rlt_replay_stats(self.demo_buffer)
+        for key, value in demo_rlt_stats.items():
+            append_to_dict(metrics, {f"demo_buffer/{key}": value})
+
+    @staticmethod
+    def _rlt_replay_stats(replay_buffer: TrajectoryReplayBuffer) -> dict[str, float]:
+        cache = replay_buffer._flat_trajectory_cache
+        if cache is None:
+            return {"intervention_rate": 0.0, "human_chunk_rate": 0.0}
+        buffer = cache.get_buffer()
+        if not isinstance(buffer, dict):
+            return {"intervention_rate": 0.0, "human_chunk_rate": 0.0}
+        forward_inputs = buffer.get("forward_inputs")
+        if not isinstance(forward_inputs, dict):
+            return {"intervention_rate": 0.0, "human_chunk_rate": 0.0}
+        intervention = forward_inputs.get("intervention")
+        source_chunk = forward_inputs.get("source_chunk")
+        intervention_rate = (
+            float(intervention.detach().float().mean().item())
+            if isinstance(intervention, torch.Tensor) and intervention.numel() > 0
+            else 0.0
+        )
+        human_chunk_rate = 0.0
+        if isinstance(source_chunk, torch.Tensor) and source_chunk.numel() > 0:
+            source_chunk = source_chunk.detach().to(torch.uint8)
+            human_or_mixed = torch.logical_or(source_chunk == 2, source_chunk == 3)
+            human_chunk_rate = float(human_or_mixed.any(dim=-1).float().mean().item())
+        return {
+            "intervention_rate": intervention_rate,
+            "human_chunk_rate": human_chunk_rate,
+        }
 
     @Worker.timer("run_training")
     def run_training(self):
@@ -538,78 +424,37 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             return {}
 
         metrics: dict[str, Any] = {}
-        replay_cfg = self.cfg.algorithm.get("replay_buffer", {})
-        warmup_min_size = int(
-            replay_cfg.get(
-                "min_buffer_size",
-                self.cfg.algorithm.get("warmup_min_size", 1),
-            )
-        )
         global_counters = self._global_rollout_counters()
         global_min_replay_size = self._global_min_replay_size()
         global_min_demo_size = self._global_min_demo_size()
-        min_demo_buffer_size = int(
-            self.cfg.algorithm.get("demo_buffer", {}).get("min_buffer_size", 0)
-        )
-        if self.demo_buffer is not None:
-            min_demo_buffer_size = max(min_demo_buffer_size, 1)
-        demo_ready = (
-            self.demo_buffer is None or global_min_demo_size >= min_demo_buffer_size
-        )
-        use_demo = self.demo_buffer is not None and demo_ready
-        buffer_ready = global_min_replay_size >= warmup_min_size and demo_ready
-        global_total_transitions_added = int(
-            global_counters["total_transitions_added"]
-        )
-        if buffer_ready and self.warmup_ready_total_transitions is None:
-            self.warmup_ready_total_transitions = global_total_transitions_added
-            self.warmup_ready_total_episodes = int(
-                global_counters["total_episodes_added"]
-            )
-
-        schedule = resolve_update_schedule(
+        plan = self.training_scheduler.plan(
             self.cfg,
             update_step=self.update_step,
-            buffer_ready=buffer_ready,
-            global_total_transitions_added=global_total_transitions_added,
-            global_total_episodes_added=int(global_counters["total_episodes_added"]),
-            warmup_ready_total_transitions=self.warmup_ready_total_transitions,
-            warmup_ready_total_episodes=self.warmup_ready_total_episodes,
+            has_demo_buffer=self.demo_buffer is not None,
+            global_counters=global_counters,
+            global_min_replay_size=global_min_replay_size,
+            global_min_demo_size=global_min_demo_size,
         )
-        self.pending_update_budget = schedule.pending_update_budget
+        schedule = plan.schedule
 
         if schedule.skip_reason != 0:
             self._append_replay_stats(metrics)
-            self._append_training_schedule_metrics(
+            self._append_training_plan_metrics(
                 metrics,
+                plan=plan,
                 global_counters=global_counters,
                 global_min_replay_size=global_min_replay_size,
                 global_min_demo_size=global_min_demo_size,
-                warmup_min_size=warmup_min_size,
-                min_demo_buffer_size=min_demo_buffer_size,
-                warmup_required_updates=schedule.warmup_required_updates,
-                update_ratio=schedule.update_ratio,
                 should_train=False,
                 skip_reason=schedule.skip_reason,
-                pending_update_budget=self.pending_update_budget,
-                updates_scheduled=schedule.updates_scheduled,
             )
-            return self._process_train_metrics(metrics)
+            return self.average_metrics(metrics)
 
-        if self.enable_offload:
-            if self.is_weight_offloaded:
-                self.load_param_and_grad(self.device)
-            if self.is_optimizer_offloaded:
-                self.load_optimizer(self.device)
+        self.ensure_training_state_loaded()
 
         global_batch_size_per_rank = (
             self.cfg.actor.global_batch_size // self._world_size
         )
-        assert global_batch_size_per_rank % self.cfg.actor.micro_batch_size == 0, (
-            "global batch per rank must be divisible by micro_batch_size"
-        )
-        micro_batch_cnt = global_batch_size_per_rank // self.cfg.actor.micro_batch_size
-        self.gradient_accumulation = micro_batch_cnt
 
         self.model.train()
         critic_updates_run = 0
@@ -617,13 +462,12 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         for _ in range(schedule.updates_to_run):
             batch_dict = self._sample_training_batch(
                 global_batch_size_per_rank,
-                use_demo=use_demo,
+                use_demo=plan.readiness.use_demo,
             )
-            micro_batches = []
-            for i in range(micro_batch_cnt):
-                begin = i * self.cfg.actor.micro_batch_size
-                end = begin + self.cfg.actor.micro_batch_size
-                micro_batches.append({k: v[begin:end] for k, v in batch_dict.items()})
+            micro_batches = self.prepare_micro_batches(
+                batch_dict,
+                global_batch_size_per_rank=global_batch_size_per_rank,
+            )
             epoch_metrics = self._update_one_epoch(
                 micro_batches,
                 global_min_replay_size=global_min_replay_size,
@@ -633,28 +477,23 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             critic_updates_run += 1
             if "rlt_stage2/actor_loss" in epoch_metrics:
                 actor_updates_run += 1
-        self.pending_update_budget = max(self.pending_update_budget - critic_updates_run, 0)
+        self.training_scheduler.finish_updates(critic_updates_run)
 
         self._append_replay_stats(metrics)
-        self._append_training_schedule_metrics(
+        self._append_training_plan_metrics(
             metrics,
+            plan=plan,
             global_counters=global_counters,
             global_min_replay_size=global_min_replay_size,
             global_min_demo_size=global_min_demo_size,
-            warmup_min_size=warmup_min_size,
-            min_demo_buffer_size=min_demo_buffer_size,
-            warmup_required_updates=schedule.warmup_required_updates,
-            update_ratio=schedule.update_ratio,
             should_train=True,
             skip_reason=0,
-            pending_update_budget=self.pending_update_budget,
-            updates_scheduled=schedule.updates_scheduled,
             critic_updates_run=critic_updates_run,
             actor_updates_run=actor_updates_run,
         )
         self.transitions_since_train = 0
         self.episodes_since_train = 0
-        return self._process_train_metrics(metrics)
+        return self.average_metrics(metrics)
 
     def _update_one_epoch(
         self,
@@ -690,7 +529,9 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                         critic_loss(q1, q2, td_target) / self.gradient_accumulation
                     )
                 self.grad_scaler.scale(loss).backward()
-            critic_losses.append(loss.detach().float().item() * self.gradient_accumulation)
+            critic_losses.append(
+                loss.detach().float().item() * self.gradient_accumulation
+            )
             q1_values.append(q1.detach().float().mean().item())
             q2_values.append(q2.detach().float().mean().item())
 
@@ -776,7 +617,9 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                         )
                         loss = actor_total_loss / self.gradient_accumulation
                     self.grad_scaler.scale(loss).backward()
-                actor_losses.append(loss.detach().float().item() * self.gradient_accumulation)
+                actor_losses.append(
+                    loss.detach().float().item() * self.gradient_accumulation
+                )
                 actor_q_values.append(q_value.detach().float().mean().item())
                 actor_action_ref_abs.append(
                     action_ref_delta.detach().float().abs().mean().item()
@@ -834,97 +677,55 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             self.soft_update_target_model()
         return metrics
 
-    def _process_train_metrics(self, metrics: dict[str, Any]) -> dict[str, float]:
-        mean_metric_dict = {}
-        for key, value in metrics.items():
-            if isinstance(value, list):
-                mean_metric_dict[key] = float(np.mean(value))
-            elif isinstance(value, torch.Tensor):
-                mean_metric_dict[key] = float(value.detach().cpu().item())
-            else:
-                mean_metric_dict[key] = float(value)
-        return all_reduce_dict(mean_metric_dict, op=torch.distributed.ReduceOp.AVG)
-
-    def compute_advantages_and_returns(self):
-        return {}
+    def _stage2_component_dir(self, base_path: str) -> str:
+        return os.path.join(base_path, "rlt_stage2_components")
 
     def save_checkpoint(self, save_base_path, step):
-        if self.is_weight_offloaded:
-            self.load_param_and_grad(self.device)
-            self.is_weight_offloaded = False
-        if self.is_optimizer_offloaded:
-            self.load_optimizer(self.device)
-            self.is_optimizer_offloaded = False
-
-        self._strategy.save_checkpoint(
-            model=self.model,
+        self.ensure_checkpoint_state_loaded()
+        self.save_model_checkpoint(
+            save_path=save_base_path,
             optimizers=[self.optimizer, self.qf_optimizer],
             lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
-            save_path=save_base_path,
-            checkpoint_format="local_shard"
-            if self.cfg.actor.fsdp_config.use_orig_params
-            else "dcp",
         )
 
-        stage2_save_path = os.path.join(save_base_path, "rlt_stage2_components")
+        stage2_save_path = self._stage2_component_dir(save_base_path)
         os.makedirs(stage2_save_path, exist_ok=True)
+        scheduler_state = self.training_scheduler.state_dict()
         torch.save(
             {
                 "update_step": self.update_step,
-                "pending_update_budget": self.pending_update_budget,
-                "warmup_ready_total_transitions": self.warmup_ready_total_transitions,
-                "warmup_ready_total_episodes": self.warmup_ready_total_episodes,
+                "pending_update_budget": scheduler_state["pending_update_budget"],
+                "warmup_ready_total_transitions": scheduler_state[
+                    "warmup_ready_total_transitions"
+                ],
+                "warmup_ready_total_episodes": scheduler_state[
+                    "warmup_ready_total_episodes"
+                ],
                 "version": self.version,
                 "transitions_since_train": self.transitions_since_train,
                 "episodes_since_train": self.episodes_since_train,
                 "total_transitions_added": self.total_transitions_added,
                 "total_episodes_added": self.total_episodes_added,
-                "replay_buffer": self.replay_buffer.state_dict()
-                if self.replay_buffer is not None
-                else None,
-                "demo_buffer": self.demo_buffer.state_dict()
-                if self.demo_buffer is not None
-                else None,
             },
             os.path.join(stage2_save_path, f"checkpoint_rank_{self._rank}.pt"),
         )
+        self.save_replay_checkpoints(stage2_save_path)
 
     def load_checkpoint(self, load_base_path):
-        self._strategy.load_checkpoint(
-            model=self.model,
+        self.load_model_checkpoint(
+            load_path=load_base_path,
             optimizers=[self.optimizer, self.qf_optimizer],
             lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
-            load_path=load_base_path,
-            checkpoint_format="local_shard"
-            if self.cfg.actor.fsdp_config.use_orig_params
-            else "dcp",
         )
 
         stage2_load_path = os.path.join(
-            load_base_path,
-            "rlt_stage2_components",
+            self._stage2_component_dir(load_base_path),
             f"checkpoint_rank_{self._rank}.pt",
         )
         if os.path.exists(stage2_load_path):
             state = torch.load(stage2_load_path, map_location="cpu", weights_only=False)
             self.update_step = int(state.get("update_step", 0))
-            self.pending_update_budget = int(state.get("pending_update_budget", 0))
-            warmup_ready_total_transitions = state.get(
-                "warmup_ready_total_transitions", None
-            )
-            self.warmup_ready_total_transitions = (
-                None
-                if warmup_ready_total_transitions is None
-                else int(warmup_ready_total_transitions)
-            )
-            warmup_ready_total_episodes = state.get(
-                "warmup_ready_total_episodes", None
-            )
-            self.warmup_ready_total_episodes = (
-                None
-                if warmup_ready_total_episodes is None
-                else int(warmup_ready_total_episodes)
-            )
+            self.training_scheduler.load_state_dict(state)
             self.version = int(state.get("version", self.update_step))
             self.transitions_since_train = int(
                 state.get("transitions_since_train", 0)
@@ -932,10 +733,18 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             self.episodes_since_train = int(state.get("episodes_since_train", 0))
             self.total_transitions_added = int(state.get("total_transitions_added", 0))
             self.total_episodes_added = int(state.get("total_episodes_added", 0))
-            if self.replay_buffer is not None and state.get("replay_buffer") is not None:
-                self.replay_buffer.load_state_dict(state["replay_buffer"])
-            if self.demo_buffer is not None and state.get("demo_buffer") is not None:
-                self.demo_buffer.load_state_dict(state["demo_buffer"])
+            has_legacy_replay = (
+                state.get("replay_buffer") is not None
+                or state.get("demo_buffer") is not None
+            )
+            if has_legacy_replay:
+                raise RuntimeError(
+                    "Legacy RLTStage2ReplayBuffer checkpoints are not supported by "
+                    "the TrajectoryReplayBuffer refactor. Load a checkpoint saved "
+                    "after the refactor or restart replay collection."
+                )
+
+        self.load_replay_checkpoints(self._stage2_component_dir(load_base_path))
 
     def set_global_step(self, global_step: int) -> None:
         self.version = global_step

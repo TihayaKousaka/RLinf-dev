@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Inspect saved RLT Stage2 replay buffers for real-world debugging."""
+"""Inspect RLinf TrajectoryReplayBuffer directories produced by RLT Stage2."""
 
 from __future__ import annotations
 
@@ -33,18 +33,31 @@ PHASE_NAMES = {
     1: "WARMUP",
     2: "ONLINE",
 }
+REQUIRED_FORWARD_INPUTS = (
+    "rewards",
+    "dones",
+    "intervention",
+    "source",
+    "source_chunk",
+    "collection_phase_id",
+    "success",
+    "intervention_flag",
+    "episode_id",
+    "step_id",
+)
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inspect an RLT Stage2 replay buffer snapshot or checkpoint."
+        description="Inspect an RLT Stage2 TrajectoryReplayBuffer directory."
     )
     parser.add_argument(
         "path",
         type=Path,
         help=(
-            "Path to buffer.pt, a replay autosave directory, or "
-            "rlt_stage2_components/checkpoint_rank_*.pt."
+            "Path to a replay rank directory containing metadata.json and "
+            "trajectory_index.json. Checkpoint bases with a single "
+            "rlt_stage2_components/replay_buffer/rank_* directory are accepted."
         ),
     )
     parser.add_argument(
@@ -61,67 +74,136 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_torch_file(path: Path) -> dict[str, Any]:
+def _torch():
     try:
         import torch
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "inspect_rlt_replay.py requires torch to read replay snapshots."
+            "inspect_rlt_replay.py requires torch to read trajectory_*.pt files."
         ) from exc
-
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(state, dict):
-        raise TypeError(f"Expected a dict in {path}, got {type(state).__name__}.")
-    return state
+    return torch
 
 
 def _numpy():
     try:
         import numpy as np
     except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "inspect_rlt_replay.py requires numpy to inspect replay snapshots."
-        ) from exc
+        raise RuntimeError("inspect_rlt_replay.py requires numpy.") from exc
     return np
 
 
-def _resolve_replay_path(path: Path) -> Path:
-    if path.is_dir():
-        candidate = path / "buffer.pt"
-        if candidate.exists():
-            return candidate
-        candidates = sorted(path.glob("checkpoint_rank_*.pt"))
-        if len(candidates) == 1:
-            return candidates[0]
-        if candidates:
-            raise ValueError(
-                f"{path} contains multiple checkpoint_rank_*.pt files; pass one explicitly."
+def _resolve_replay_dir(path: Path) -> Path:
+    if path.is_file():
+        raise ValueError(
+            "RLT replay inspect expects a TrajectoryReplayBuffer directory, not "
+            f"a file: {path}"
+        )
+    if _is_replay_dir(path):
+        return path
+
+    candidates = []
+    for relative in (
+        Path("rlt_stage2_components/replay_buffer"),
+        Path("replay_buffer"),
+    ):
+        root = path / relative
+        if root.is_dir():
+            candidates.extend(
+                child for child in sorted(root.glob("rank_*")) if _is_replay_dir(child)
             )
-        raise FileNotFoundError(f"{path} does not contain buffer.pt or checkpoint_rank_*.pt.")
-    return path
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        raise ValueError(
+            f"{path} contains multiple replay rank directories; pass one explicitly."
+        )
+    raise FileNotFoundError(
+        f"{path} is not a TrajectoryReplayBuffer directory. Expected "
+        "metadata.json and trajectory_index.json."
+    )
 
 
-def _extract_replay_state(state: dict[str, Any]) -> dict[str, Any]:
-    if "replay_buffer" in state:
-        replay_state = state["replay_buffer"]
-        if replay_state is None:
-            raise ValueError("checkpoint has replay_buffer=None.")
-        return replay_state
-    if "size" in state and "rewards" in state:
-        return state
-    raise KeyError("Could not find replay buffer state in file.")
+def _is_replay_dir(path: Path) -> bool:
+    return (path / "metadata.json").is_file() and (
+        path / "trajectory_index.json"
+    ).is_file()
 
 
-def _array(state: dict[str, Any], key: str, *, default=None):
+def _load_json(path: Path) -> dict[str, Any]:
+    with path.open("r") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise TypeError(f"Expected JSON object in {path}, got {type(data).__name__}.")
+    return data
+
+
+def _load_replay_directory(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    torch = _torch()
+    metadata = _load_json(path / "metadata.json")
+    index_data = _load_json(path / "trajectory_index.json")
+    trajectory_index = {
+        int(key): value
+        for key, value in index_data.get("trajectory_index", {}).items()
+    }
+    trajectory_ids = [int(item) for item in index_data.get("trajectory_id_list", [])]
+    trajectory_format = metadata.get("trajectory_format", "pt")
+    if trajectory_format != "pt":
+        raise ValueError(
+            f"Only pt trajectory replay is supported for RLT inspect, got {trajectory_format!r}."
+        )
+
+    trajectories = []
+    for trajectory_id in trajectory_ids:
+        info = trajectory_index.get(trajectory_id)
+        if info is None:
+            raise KeyError(f"trajectory_id {trajectory_id} is missing from index.")
+        model_weights_id = info.get("model_weights_id", "")
+        trajectory_path = path / f"trajectory_{trajectory_id}_{model_weights_id}.pt"
+        if not trajectory_path.is_file():
+            raise FileNotFoundError(f"Missing trajectory file: {trajectory_path}")
+        trajectory = torch.load(
+            trajectory_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if not isinstance(trajectory, dict):
+            raise TypeError(
+                f"Expected dict in {trajectory_path}, got {type(trajectory).__name__}."
+            )
+        trajectories.append(trajectory)
+    return metadata, trajectories
+
+
+def _to_numpy(value: Any):
     np = _numpy()
-    if key not in state:
-        if default is None:
-            return None
-        return np.asarray(default)
-    value = state[key]
     if hasattr(value, "detach"):
         value = value.detach().cpu().numpy()
     return np.asarray(value)
+
+
+def _flatten_sample_field(value: Any):
+    array = _to_numpy(value)
+    if array.ndim >= 2:
+        return array.reshape(-1, *array.shape[2:])
+    return array.reshape(-1)
+
+
+def _stack_forward_inputs(trajectories: list[dict[str, Any]]) -> dict[str, Any]:
+    np = _numpy()
+    values: dict[str, list[Any]] = {key: [] for key in REQUIRED_FORWARD_INPUTS}
+    missing: dict[str, int] = {}
+    for trajectory in trajectories:
+        forward_inputs = trajectory.get("forward_inputs")
+        if not isinstance(forward_inputs, dict):
+            raise KeyError("RLT replay trajectory is missing forward_inputs.")
+        for key in REQUIRED_FORWARD_INPUTS:
+            if key not in forward_inputs:
+                missing[key] = missing.get(key, 0) + 1
+                continue
+            values[key].append(_flatten_sample_field(forward_inputs[key]))
+    if missing:
+        raise KeyError(f"RLT replay forward_inputs missing required fields: {missing}")
+    return {key: np.concatenate(parts, axis=0) for key, parts in values.items()}
 
 
 def _histogram(values, names: dict[int, str]) -> dict[str, int]:
@@ -129,51 +211,42 @@ def _histogram(values, names: dict[int, str]) -> dict[str, int]:
     if values.size == 0:
         return {}
     unique, counts = np.unique(values.astype(np.int64).reshape(-1), return_counts=True)
-    return {names.get(int(value), str(int(value))): int(count) for value, count in zip(unique, counts)}
+    return {
+        names.get(int(value), str(int(value))): int(count)
+        for value, count in zip(unique, counts)
+    }
 
 
 def _ratio(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator else 0.0
 
 
-def _inspect(replay_state: dict[str, Any]) -> dict[str, Any]:
+def _inspect(metadata: dict[str, Any], trajectories: list[dict[str, Any]]) -> dict[str, Any]:
     np = _numpy()
-    size = int(replay_state.get("size", 0))
-    capacity = int(replay_state.get("capacity", 0))
-    chunk_length = int(replay_state.get("chunk_length", 0))
-    action_chunk_dim = int(replay_state.get("action_chunk_dim", 0))
+    fields = _stack_forward_inputs(trajectories)
+    rewards = fields["rewards"]
+    dones = fields["dones"]
+    intervention = fields["intervention"]
+    source = fields["source"]
+    source_chunk = fields["source_chunk"]
+    collection_phase_id = fields["collection_phase_id"]
+    success = fields["success"]
+    intervention_flag = fields["intervention_flag"]
+    episode_id = fields["episode_id"]
+    step_id = fields["step_id"]
 
-    rewards = _array(replay_state, "rewards", default=np.zeros((0, 0)))[:size]
-    dones = _array(replay_state, "dones", default=np.zeros((0, 1)))[:size]
-    intervention = _array(replay_state, "intervention", default=np.zeros((0, 1)))[:size]
-    source = _array(replay_state, "source", default=np.zeros((0, 1)))[:size]
-    source_chunk = _array(replay_state, "source_chunk", default=np.zeros((0, 0)))[:size]
-    collection_phase_id = _array(
-        replay_state,
-        "collection_phase_id",
-        default=np.zeros((0, 1)),
-    )[:size]
-    success = _array(replay_state, "success", default=np.zeros((0, 1)))[:size]
-    intervention_flag = _array(
-        replay_state,
-        "intervention_flag",
-        default=np.zeros((0, 1), dtype=np.bool_),
-    )[:size]
-    episode_id = _array(replay_state, "episode_id", default=np.zeros((0, 1)))[:size]
-    step_id = _array(replay_state, "step_id", default=np.zeros((0, 1)))[:size]
-
-    reward_flat = rewards.reshape(-1) if rewards is not None else np.asarray([])
+    size = int(rewards.shape[0])
+    reward_flat = rewards.reshape(-1) if rewards.size else np.asarray([])
     transition_reward = rewards.sum(axis=1) if rewards.size else np.asarray([])
     human_chunk = np.logical_or(source_chunk == 2, source_chunk == 3)
     rl_chunk = source_chunk == 1
     base_chunk = source_chunk == 0
 
-    summary: dict[str, Any] = {
-        "size": size,
-        "capacity": capacity,
-        "fill_ratio": _ratio(size, capacity),
-        "chunk_length": chunk_length,
-        "action_chunk_dim": action_chunk_dim,
+    return {
+        "num_trajectories": int(len(trajectories)),
+        "total_samples": int(metadata.get("total_samples", size)),
+        "inspected_samples": size,
+        "trajectory_format": metadata.get("trajectory_format", "pt"),
         "reward": {
             "mean_step": float(reward_flat.mean()) if reward_flat.size else 0.0,
             "min_step": float(reward_flat.min()) if reward_flat.size else 0.0,
@@ -211,7 +284,6 @@ def _inspect(replay_state: dict[str, Any]) -> dict[str, Any]:
             source_chunk=source_chunk,
         ),
     }
-    return summary
 
 
 def _episode_summary(
@@ -227,8 +299,16 @@ def _episode_summary(
     if episode_id.size == 0:
         return []
     episode_flat = episode_id.reshape(-1).astype(np.int64)
-    step_flat = step_id.reshape(-1).astype(np.int64) if step_id.size else np.zeros_like(episode_flat)
-    done_flat = dones.reshape(-1).astype(bool) if dones.size else np.zeros_like(episode_flat, dtype=bool)
+    step_flat = (
+        step_id.reshape(-1).astype(np.int64)
+        if step_id.size
+        else np.zeros_like(episode_flat)
+    )
+    done_flat = (
+        dones.reshape(-1).astype(bool)
+        if dones.size
+        else np.zeros_like(episode_flat, dtype=bool)
+    )
     intervention_flat = (
         intervention_flag.reshape(-1).astype(bool)
         if intervention_flag.size
@@ -263,14 +343,17 @@ def _episode_summary(
     return summaries
 
 
-def _print_text(summary: dict[str, Any], *, source_path: Path, top_episodes: int) -> None:
+def _print_text(
+    summary: dict[str, Any],
+    *,
+    source_path: Path,
+    top_episodes: int,
+) -> None:
     print(f"Replay: {source_path}")
     print(
-        "size={size} capacity={capacity} fill={fill:.3f} chunk_length={chunk}".format(
-            size=summary["size"],
-            capacity=summary["capacity"],
-            fill=summary["fill_ratio"],
-            chunk=summary["chunk_length"],
+        "trajectories={num_trajectories} total_samples={total_samples} "
+        "inspected_samples={inspected_samples} format={trajectory_format}".format(
+            **summary
         )
     )
     reward = summary["reward"]
@@ -286,7 +369,8 @@ def _print_text(summary: dict[str, Any], *, source_path: Path, top_episodes: int
     )
     print(
         "flags: done_rate={done:.3f} success_rate={success:.3f} "
-        "intervention_flag_rate={intervention:.3f} intervention_action_rate={action:.3f}".format(
+        "intervention_flag_rate={intervention:.3f} "
+        "intervention_action_rate={action:.3f}".format(
             done=summary["done_rate"],
             success=summary["success_rate"],
             intervention=summary["intervention_flag_rate"],
@@ -300,22 +384,27 @@ def _print_text(summary: dict[str, Any], *, source_path: Path, top_episodes: int
     print(f"episodes: {len(episodes)} unique ids")
     for item in episodes[:top_episodes]:
         print(
-            "  episode={episode_id} transitions={transitions} steps={min_step_id}-{max_step_id} "
-            "reward_sum={reward_sum:.3f} done_count={done_count} "
-            "intervention_rate={intervention_transition_rate:.3f} "
+            "  episode={episode_id} transitions={transitions} "
+            "steps={min_step_id}-{max_step_id} reward_sum={reward_sum:.3f} "
+            "done_count={done_count} intervention_rate="
+            "{intervention_transition_rate:.3f} "
             "human_chunk_rate={human_or_mixed_chunk_rate:.3f}".format(**item)
         )
 
 
 def main() -> int:
     args = _parse_args()
-    replay_path = _resolve_replay_path(args.path)
-    replay_state = _extract_replay_state(_load_torch_file(replay_path))
-    summary = _inspect(replay_state)
+    replay_dir = _resolve_replay_dir(args.path)
+    metadata, trajectories = _load_replay_directory(replay_dir)
+    summary = _inspect(metadata, trajectories)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:
-        _print_text(summary, source_path=replay_path, top_episodes=args.top_episodes)
+        _print_text(
+            summary,
+            source_path=replay_dir,
+            top_episodes=args.top_episodes,
+        )
     return 0
 
 

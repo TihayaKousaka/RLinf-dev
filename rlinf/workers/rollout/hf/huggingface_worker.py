@@ -29,10 +29,10 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.models.embodiment.rlt_stage2.rollout_adapter import RLTStage2RolloutAdapter
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.workers.rollout.hf.rollout_adapter import build_hf_rollout_adapter
 
 
 class MultiStepRolloutWorker(Worker):
@@ -61,6 +61,7 @@ class MultiStepRolloutWorker(Worker):
         self._has_expert_model_config = (
             self.cfg.rollout.get("expert_model", None) is not None
         )
+        self.rollout_adapter = None
 
         self.total_num_train_envs = cfg.env.train.total_num_envs
         self.total_num_eval_envs = cfg.env.eval.total_num_envs
@@ -106,21 +107,6 @@ class MultiStepRolloutWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
-        intervention_cfg = self.cfg.algorithm.get("intervention", {})
-        self.intervention_mode = str(
-            intervention_cfg.get("mode", "local_correction")
-        )
-        self.intervention_enabled = bool(intervention_cfg.get("enable", False)) and (
-            self.intervention_mode in {"local_correction", "human_override"}
-        )
-        self.local_correction_enabled = self.intervention_enabled and (
-            self.intervention_mode == "local_correction"
-        )
-        self.human_override_enabled = self.intervention_enabled and (
-            self.intervention_mode == "human_override"
-        )
-        self.intervention_success_baseline = None
-        self.intervention_last_success = None
 
         weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer", default=None)
         assert weight_syncer_cfg is not None, (
@@ -128,24 +114,6 @@ class MultiStepRolloutWorker(Worker):
         )
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
         self._sync_weight_comm_options = self.weight_syncer.comm_options
-
-    def _is_rlt_stage2_td3(self) -> bool:
-        return (
-            self.cfg.algorithm.get("loss_type", None) == "rlt_td3"
-            and SupportedModel(self.cfg.actor.model.model_type)
-            == SupportedModel.RLT_STAGE2
-        )
-
-    def set_intervention_state(
-        self,
-        *,
-        enabled: bool,
-        success_baseline: float | None = None,
-        last_success: float | None = None,
-    ) -> None:
-        self.intervention_enabled = bool(enabled)
-        self.intervention_success_baseline = success_baseline
-        self.intervention_last_success = last_success
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -159,17 +127,16 @@ class MultiStepRolloutWorker(Worker):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             self.hf_model.load_state_dict(model_dict)
 
-        if self._has_expert_model_config:
-            self._expert_model_config = self._build_expert_model_config()
-            if not self._is_rlt_stage2_td3():
-                self._ensure_expert_model_loaded()
-
-        self.rlt_rollout_adapter = RLTStage2RolloutAdapter(
+        self.rollout_adapter = build_hf_rollout_adapter(
             cfg=self.cfg,
             student_model=self.hf_model,
             expert_model_getter=self._ensure_expert_model_loaded,
             has_expert_model_config=self._has_expert_model_config,
         )
+        if self._has_expert_model_config:
+            self._expert_model_config = self._build_expert_model_config()
+            if self.rollout_adapter.use_dagger_beta():
+                self._ensure_expert_model_loaded()
 
         self.hf_model.eval()
         if self.expert_model is not None:
@@ -216,26 +183,14 @@ class MultiStepRolloutWorker(Worker):
     def _build_expert_model_config(self):
         expert_model_config = copy.deepcopy(self.cfg.actor.model)
         expert_ckpt_path = self.cfg.runner.get("expert_ckpt_path", None)
-        expert_model_path = self.cfg.rollout.expert_model.model_path
-        if (
-            self._is_rlt_stage2_td3()
-            and expert_ckpt_path
-            and os.path.isdir(str(expert_ckpt_path))
-        ):
-            expert_model_path = expert_ckpt_path
+        expert_model_path = self.rollout_adapter.expert_model_path(
+            self.cfg.rollout.expert_model.model_path,
+            expert_ckpt_path,
+        )
         with open_dict(expert_model_config):
             expert_model_config.precision = self.cfg.rollout.expert_model.precision
             expert_model_config.model_path = expert_model_path
-            if expert_model_config.get("rlt_stage2", None) is not None:
-                act_as_vla_reference = self.cfg.rollout.expert_model.get(
-                    "act_as_vla_reference", self._is_rlt_stage2_td3()
-                )
-                expert_model_config.rlt_stage2.act_as_vla_reference = (
-                    act_as_vla_reference
-                )
-                if act_as_vla_reference:
-                    expert_model_config.rlt_stage2.load_feature_backbones = True
-                    expert_model_config.rlt_stage2.load_rl_token_model = False
+            self.rollout_adapter.configure_expert_model(expert_model_config)
         return expert_model_config
 
     def _ensure_expert_model_loaded(self):
@@ -303,7 +258,7 @@ class MultiStepRolloutWorker(Worker):
     def update_dagger_beta(self):
         if not self._has_expert_model_config:
             return
-        if self._is_rlt_stage2_td3():
+        if not self.rollout_adapter.use_dagger_beta():
             return
 
         if self._dagger_sampling_params["beta_schedule"] == "exponential":
@@ -392,51 +347,31 @@ class MultiStepRolloutWorker(Worker):
         only_save_expert = self.cfg.algorithm.get("dagger", {}).get(
             "only_save_expert", True
         )
-        is_rlt_stage2_td3 = self._is_rlt_stage2_td3()
-
-        expert_takeover = None
-        if is_rlt_stage2_td3 and policy_info is not None:
-            expert_takeover = policy_info.get("expert_takeover")
-            if expert_takeover is not None:
-                expert_takeover = expert_takeover.to(
-                    self.device, dtype=torch.bool
-                ).reshape(-1)
 
         if (
             mode == "train"
             and allow_expert
             and self._has_expert_model_config
-            and (
-                (
-                    is_rlt_stage2_td3
-                    and expert_takeover is not None
-                    and expert_takeover.any()
-                )
-                or (not is_rlt_stage2_td3)
-            )
+            and self.rollout_adapter.use_dagger_beta()
         ):
-            use_expert = (
-                bool(expert_takeover.any().item())
-                if is_rlt_stage2_td3
-                else torch.rand(1).item() < self._dagger_sampling_params["beta"]
-            )
+            use_expert = torch.rand(1).item() < self._dagger_sampling_params["beta"]
         else:
             use_expert = False
 
         with torch.no_grad():
             expert_label_flag = False
-            if is_rlt_stage2_td3:
-                route_result = self.rlt_rollout_adapter.predict(
-                    env_obs=env_obs,
-                    policy_info=policy_info,
-                    model_kwargs=kwargs,
-                    mode=mode,
-                    allow_expert=allow_expert,
-                    update_version=self.version,
-                )
-                actions = route_result.actions
-                result = route_result.result
-                expert_label_flag = route_result.expert_label_flag
+            adapter_prediction = self.rollout_adapter.predict(
+                env_obs=env_obs,
+                policy_info=policy_info,
+                model_kwargs=kwargs,
+                mode=mode,
+                allow_expert=allow_expert,
+                update_version=self.version,
+            )
+            if adapter_prediction is not None:
+                actions = adapter_prediction.actions
+                result = adapter_prediction.result
+                expert_label_flag = adapter_prediction.expert_label_flag
             elif use_expert:
                 actions, result = self._ensure_expert_model_loaded().predict_action_batch(
                     env_obs=env_obs,
@@ -451,7 +386,7 @@ class MultiStepRolloutWorker(Worker):
 
             # Decide re-label or not
             if (
-                not is_rlt_stage2_td3
+                self.rollout_adapter.use_dagger_beta()
                 and not only_save_expert  # only re-label in classic dagger mode
                 and not use_expert  # only re-label if not using expert
                 and self._has_expert_model_config  # only re-label if expert exists
@@ -480,7 +415,7 @@ class MultiStepRolloutWorker(Worker):
     ) -> torch.Tensor | None:
         if final_obs is None:
             return None
-        if self._is_rlt_stage2_td3():
+        if not self.rollout_adapter.allow_bootstrap_values():
             return None
         if not (
             hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head")
@@ -523,11 +458,7 @@ class MultiStepRolloutWorker(Worker):
                 ).async_wait()
 
         if not self.weight_syncer.receiver_initialized():
-            receiver_state_dict = (
-                self.rlt_rollout_adapter.rollout_state_dict()
-                if self._is_rlt_stage2_td3()
-                else self.hf_model.state_dict()
-            )
+            receiver_state_dict = self.rollout_adapter.rollout_state_dict()
             await self.weight_syncer.init_receiver(
                 state_dict=receiver_state_dict,
                 recv=recv_func,
@@ -556,7 +487,7 @@ class MultiStepRolloutWorker(Worker):
                     env_output["obs"],
                     policy_info=env_output.get("policy_info", None),
                 )
-                rlt_step_trace = self.rlt_rollout_adapter.encode_step_trace(
+                step_trace = self.rollout_adapter.encode_step_trace(
                     env_output.get("step_obs", None)
                 )
 
@@ -582,7 +513,7 @@ class MultiStepRolloutWorker(Worker):
                         env_output.get("final_obs", None)
                     ),
                     save_flags=save_flags,
-                    rlt_step_trace=rlt_step_trace,
+                    rlt_step_trace=step_trace,
                     forward_inputs=result["forward_inputs"],
                     versions=torch.full_like(
                         result["prev_logprobs"],
@@ -598,18 +529,18 @@ class MultiStepRolloutWorker(Worker):
                 allow_expert=False,
                 policy_info=env_output.get("policy_info", None),
             )
-            rlt_step_trace = self.rlt_rollout_adapter.encode_step_trace(
+            step_trace = self.rollout_adapter.encode_step_trace(
                 env_output.get("step_obs", None)
             )
 
-            forward_inputs = result["forward_inputs"] if self._is_rlt_stage2_td3() else {}
+            forward_inputs = self.rollout_adapter.final_forward_inputs(result)
             rollout_result = RolloutResult(
                 actions=actions,
                 prev_values=result["prev_values"] if self.collect_prev_infos else None,
                 bootstrap_values=self.get_bootstrap_values(
                     env_output.get("final_obs", None)
                 ),
-                rlt_step_trace=rlt_step_trace,
+                rlt_step_trace=step_trace,
                 forward_inputs=forward_inputs,
             )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
@@ -724,169 +655,6 @@ class MultiStepRolloutWorker(Worker):
             split_indices = np.cumsum(sizes[:-1]).tolist()
             return list(np.split(actions, split_indices, axis=0))
         return list(torch.split(actions, sizes, dim=0))
-
-    def _flatten_step_obs(
-        self, step_obs: dict[str, Any]
-    ) -> tuple[dict[str, Any], int, int]:
-        first_tensor = next(
-            (
-                value
-                for key, value in step_obs.items()
-                if not key.startswith("_rlt_")
-                if isinstance(value, torch.Tensor)
-            ),
-            None,
-        )
-        if first_tensor is None:
-            raise ValueError("RLT step_obs must contain at least one tensor field.")
-        step_count = int(first_tensor.shape[0])
-        batch_size = int(first_tensor.shape[1])
-        flat_obs: dict[str, Any] = {}
-        for key, value in step_obs.items():
-            if key.startswith("_rlt_"):
-                continue
-            if isinstance(value, torch.Tensor):
-                flat_obs[key] = value.reshape(step_count * batch_size, *value.shape[2:])
-            elif isinstance(value, list):
-                flat_obs[key] = [
-                    item for step_values in value for item in step_values
-                ]
-            elif value is None:
-                flat_obs[key] = None
-            else:
-                flat_obs[key] = value
-        return flat_obs, step_count, batch_size
-
-    def _rlt_sparse_anchor_offsets(self, step_count: int) -> list[int]:
-        chunk_len = int(self.cfg.actor.model.num_action_chunks)
-        stride = int(self.cfg.actor.model.rlt_stage2.get("replay_subsample_stride", 0))
-        if stride <= 0 or chunk_len <= 0:
-            return []
-
-        offsets = set()
-        offset = 0
-        while True:
-            offset = (offset + stride) % chunk_len
-            if offset == 0 or offset in offsets:
-                break
-            if offset < step_count:
-                offsets.add(offset)
-        return sorted(offsets)
-
-    @staticmethod
-    def _slice_step_obs_offsets(
-        step_obs: dict[str, Any],
-        offsets: list[int],
-    ) -> dict[str, Any]:
-        sliced_obs: dict[str, Any] = {}
-        index_tensor = torch.as_tensor(offsets, dtype=torch.long)
-        for key, value in step_obs.items():
-            if key.startswith("_rlt_"):
-                continue
-            if isinstance(value, torch.Tensor):
-                sliced_obs[key] = value.index_select(
-                    0, index_tensor.to(device=value.device)
-                )
-            elif isinstance(value, list):
-                sliced_obs[key] = [value[offset] for offset in offsets]
-            elif value is None:
-                sliced_obs[key] = None
-            else:
-                sliced_obs[key] = value
-        return sliced_obs
-
-    @staticmethod
-    def _slice_flat_obs(
-        flat_obs: dict[str, Any],
-        begin: int,
-        end: int,
-    ) -> dict[str, Any]:
-        obs_chunk: dict[str, Any] = {}
-        for key, value in flat_obs.items():
-            if isinstance(value, torch.Tensor):
-                obs_chunk[key] = value[begin:end]
-            elif isinstance(value, list):
-                obs_chunk[key] = value[begin:end]
-            else:
-                obs_chunk[key] = value
-        return obs_chunk
-
-    def _encode_rlt_step_trace(
-        self,
-        step_obs: dict[str, Any] | None,
-    ) -> dict[str, torch.Tensor]:
-        if step_obs is None or not self._is_rlt_stage2_td3():
-            return {}
-        if not hasattr(self.hf_model, "encode_obs"):
-            raise RuntimeError(
-                "RLT Stage2 stride replay requires hf_model.encode_obs for step features."
-            )
-        first_tensor = next(
-            (
-                value
-                for key, value in step_obs.items()
-                if not key.startswith("_rlt_")
-                if isinstance(value, torch.Tensor)
-            ),
-            None,
-        )
-        explicit_offsets = step_obs.get("_rlt_step_offsets", None)
-        if explicit_offsets is not None:
-            if (
-                not isinstance(explicit_offsets, torch.Tensor)
-                or explicit_offsets.dim() != 2
-            ):
-                raise ValueError(
-                    "RLT step_obs['_rlt_step_offsets'] must have shape [A, B], "
-                    f"got {type(explicit_offsets)=}."
-                )
-            anchor_offset_tensor = explicit_offsets.to(torch.long).contiguous()
-        else:
-            if first_tensor is None:
-                raise ValueError("RLT step_obs must contain at least one tensor field.")
-            step_count = int(first_tensor.shape[0])
-            batch_size = int(first_tensor.shape[1])
-            anchor_offsets = self._rlt_sparse_anchor_offsets(step_count)
-            anchor_offset_tensor = (
-                torch.tensor(anchor_offsets, dtype=torch.long)[:, None]
-                .expand(len(anchor_offsets), batch_size)
-                .contiguous()
-            )
-            if anchor_offsets:
-                step_obs = self._slice_step_obs_offsets(step_obs, anchor_offsets)
-
-        if anchor_offset_tensor.shape[0] == 0:
-            return {"anchor_offsets": anchor_offset_tensor}
-
-        if first_tensor is None:
-            raise ValueError("RLT step_obs must contain obs tensors for sparse anchors.")
-        flat_obs, step_count, batch_size = self._flatten_step_obs(step_obs)
-        total = step_count * batch_size
-        micro_batch_size = int(
-            self.cfg.actor.model.rlt_stage2.get("replay_feature_batch_size", 32)
-        )
-        if micro_batch_size <= 0:
-            micro_batch_size = total
-        encoded_x = []
-        encoded_a_tilde = []
-        with torch.no_grad():
-            for begin in range(0, total, micro_batch_size):
-                end = min(begin + micro_batch_size, total)
-                obs_chunk = self._slice_flat_obs(flat_obs, begin, end)
-                x, a_tilde = self.hf_model.encode_obs(obs_chunk)
-                encoded_x.append(x.detach().cpu())
-                encoded_a_tilde.append(a_tilde.detach().cpu())
-        x_all = torch.cat(encoded_x, dim=0).reshape(step_count, batch_size, -1)
-        a_tilde_all = torch.cat(encoded_a_tilde, dim=0).reshape(
-            step_count,
-            batch_size,
-            -1,
-        )
-        return {
-            "anchor_offsets": anchor_offset_tensor,
-            "x": x_all.contiguous(),
-            "a_tilde": a_tilde_all.contiguous(),
-        }
 
     @staticmethod
     def _infer_env_batch_size(obs_batch: dict[str, Any]) -> int:

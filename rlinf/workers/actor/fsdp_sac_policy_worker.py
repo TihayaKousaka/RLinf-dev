@@ -29,35 +29,29 @@ from rlinf.data.embodied_buffer_dataset import (
     replay_buffer_collate_fn,
 )
 from rlinf.data.embodied_io_struct import Trajectory
-from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
-from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler import Worker
 from rlinf.utils import drq
-from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import (
     append_to_dict,
-    compute_split_num,
 )
 from rlinf.utils.nested_dict_process import (
     put_tensor_device,
     split_dict_to_chunk,
 )
-from rlinf.utils.utils import clear_memory, collect_param_names_need_sync
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.utils.utils import collect_param_names_need_sync
+from rlinf.workers.actor.embodied_offpolicy_worker import EmbodiedOffPolicyFSDPActor
 
 
-class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
+class EmbodiedSACFSDPPolicy(EmbodiedOffPolicyFSDPActor):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
 
         # SAC-specific initialization
-        self.replay_buffer = None
         self.target_model = None
         self.entropy_temp = None
-        self.demo_buffer = None
         self.alpha_optimizer = None
-        self.update_step = 0
         self.enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
 
     def init_worker(self):
@@ -172,51 +166,17 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         """Initialize SAC-specific components"""
         # Initialize replay buffer
         seed = self.cfg.actor.get("seed", 1234)
-        auto_save_path = self.cfg.algorithm.replay_buffer.get("auto_save_path", None)
-        if auto_save_path is None:
-            auto_save_path = os.path.join(
-                self.cfg.runner.logger.log_path, f"replay_buffer/rank_{self._rank}"
-            )
-        else:
-            auto_save_path = os.path.join(auto_save_path, f"rank_{self._rank}")
-        self.replay_buffer = TrajectoryReplayBuffer(
-            seed=seed,
-            enable_cache=self.cfg.algorithm.replay_buffer.enable_cache,
-            cache_size=self.cfg.algorithm.replay_buffer.cache_size,
-            sample_window_size=self.cfg.algorithm.replay_buffer.sample_window_size,
-            auto_save=self.cfg.algorithm.replay_buffer.get("auto_save", False),
-            auto_save_path=auto_save_path,
-            trajectory_format=self.cfg.algorithm.replay_buffer.get(
-                "trajectory_format", "pt"
-            ),
+        demo_cfg = self.cfg.algorithm.get("demo_buffer", None)
+        min_demo_buffer_size = self.init_trajectory_replay_buffers(
+            replay_cfg=self.cfg.algorithm.replay_buffer,
+            replay_seed=seed,
+            replay_capacity=self.cfg.algorithm.replay_buffer.cache_size,
+            demo_cfg=demo_cfg,
+            demo_seed=seed,
+            demo_capacity=None
+            if demo_cfg is None
+            else demo_cfg.get("cache_size", None),
         )
-
-        min_demo_buffer_size = 0
-        if self.cfg.algorithm.get("demo_buffer", None) is not None:
-            auto_save_path = self.cfg.algorithm.demo_buffer.get("auto_save_path", None)
-            if auto_save_path is None:
-                auto_save_path = os.path.join(
-                    self.cfg.runner.logger.log_path, f"demo_buffer/rank_{self._rank}"
-                )
-            else:
-                auto_save_path = os.path.join(auto_save_path, f"rank_{self._rank}")
-            self.demo_buffer = TrajectoryReplayBuffer(
-                seed=seed,
-                enable_cache=self.cfg.algorithm.demo_buffer.enable_cache,
-                cache_size=self.cfg.algorithm.demo_buffer.cache_size,
-                sample_window_size=self.cfg.algorithm.demo_buffer.sample_window_size,
-                auto_save=self.cfg.algorithm.demo_buffer.get("auto_save", False),
-                auto_save_path=auto_save_path,
-                trajectory_format="pt",
-            )
-            min_demo_buffer_size = self.cfg.algorithm.demo_buffer.min_buffer_size
-            if self.cfg.algorithm.demo_buffer.get("load_path", None) is not None:
-                self.demo_buffer.load_checkpoint(
-                    self.cfg.algorithm.demo_buffer.load_path,
-                    is_distributed=True,
-                    local_rank=self._rank,
-                    world_size=self._world_size,
-                )
 
         if self.cfg.algorithm.replay_buffer.get("enable_preload", False):
             buffer_dataset_cls = PreloadReplayBufferDataset
@@ -310,31 +270,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                         )
                         target_param.data.copy_(shadow.to(target_param.data.dtype))
 
-    @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
-        """
-        Receive rollout trajectories from rollout workers.
-
-        Args:
-            input_channel: The input channel to read from.
-        """
-        clear_memory(sync=False)
-
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
-
-        recv_list = []
-
-        for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            recv_list.append(trajectory)
-
-        self.replay_buffer.add_trajectories(recv_list)
+    def add_rollout_trajectories(self, trajectories: list[Trajectory]) -> None:
+        self.replay_buffer.add_trajectories(trajectories)
 
         if self.demo_buffer is not None:
             intervene_traj_list = []
-            for traj in recv_list:
+            for traj in trajectories:
                 assert isinstance(traj, Trajectory)
                 intervene_trajs = traj.extract_intervene_traj()
                 if intervene_trajs is not None:
@@ -702,9 +643,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
     @Worker.timer("run_training")
     def run_training(self):
         """SAC training using replay buffer"""
-        if self.cfg.actor.get("enable_offload", False):
-            self.load_param_and_grad(self.device)
-            self.load_optimizer(self.device)
+        self.ensure_training_state_loaded()
 
         # Check if replay buffer has enough samples
         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
@@ -746,31 +685,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         torch.cuda.empty_cache()
         return mean_metric_dict
 
-    @Worker.timer("actor/compute_adv")
-    def compute_advantages_and_returns(self):
-        """
-        SAC doesn't compute advantages/returns like PPO.
-        This method is kept for compatibility but returns empty metrics.
-        """
-        return {}
-
     def save_checkpoint(self, save_base_path, step):
-        if self.is_weight_offloaded:
-            self.load_param_and_grad(self.device)
-            self.is_weight_offloaded = False
-        if self.is_optimizer_offloaded:
-            self.load_optimizer(self.device)
-            self.is_optimizer_offloaded = False
+        self.ensure_checkpoint_state_loaded()
 
         # Save model
-        self._strategy.save_checkpoint(
-            model=self.model,
+        self.save_model_checkpoint(
+            save_path=save_base_path,
             optimizers=[self.optimizer, self.qf_optimizer],
             lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
-            save_path=save_base_path,
-            checkpoint_format="local_shard"
-            if self.cfg.actor.fsdp_config.use_orig_params
-            else "dcp",
         )
 
         # Save sac components
@@ -799,21 +721,19 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
 
         # save replay buffer
-        buffer_save_path = os.path.join(
-            save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+        self.replay_buffer.save_checkpoint(
+            self.replay_checkpoint_path(
+                os.path.join(save_base_path, "sac_components"),
+                "replay_buffer",
+            )
         )
-        self.replay_buffer.save_checkpoint(buffer_save_path)
 
     def load_checkpoint(self, load_base_path):
         # load model
-        self._strategy.load_checkpoint(
-            model=self.model,
+        self.load_model_checkpoint(
+            load_path=load_base_path,
             optimizers=[self.optimizer, self.qf_optimizer],
             lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
-            load_path=load_base_path,
-            checkpoint_format="local_shard"
-            if self.cfg.actor.fsdp_config.use_orig_params
-            else "dcp",
         )
 
         # load alpha
@@ -841,7 +761,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
 
         # load replay buffer
-        buffer_load_path = os.path.join(
-            load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+        self.replay_buffer.load_checkpoint(
+            self.replay_checkpoint_path(
+                os.path.join(load_base_path, "sac_components"),
+                "replay_buffer",
+            )
         )
-        self.replay_buffer.load_checkpoint(buffer_load_path)

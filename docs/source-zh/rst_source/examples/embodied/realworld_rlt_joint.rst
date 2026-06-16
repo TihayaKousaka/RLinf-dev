@@ -767,16 +767,16 @@ eval 的键盘奖励。
    algorithm:
      replay_buffer:
        auto_save: true
-       auto_save_every_episodes: 1
-       auto_save_every_transitions: 0
-       auto_save_dir: ${runner.logger.log_path}/debug/rlt_replay
+       auto_save_path: ${runner.logger.log_path}/debug/rlt_replay
+       trajectory_format: pt
 
-打开后 actor 会覆盖式保存：
+打开后 actor 会按 RLinf ``TrajectoryReplayBuffer`` 标准格式增量保存：
 
 .. code-block:: text
 
-   ${runner.logger.log_path}/debug/rlt_replay/rank_0/buffer.pt
    ${runner.logger.log_path}/debug/rlt_replay/rank_0/metadata.json
+   ${runner.logger.log_path}/debug/rlt_replay/rank_0/trajectory_index.json
+   ${runner.logger.log_path}/debug/rlt_replay/rank_0/trajectory_*.pt
 
 检查 replay 内容：
 
@@ -784,7 +784,7 @@ eval 的键盘奖励。
 
    python -m toolkits.rlt.inspect_rlt_replay ../results/debug/rlt_replay/rank_0
 
-重点看 ``size`` 是否增长、reward 是否长期全 0、``source_chunk`` 里是否真的有
+重点看 ``total_samples`` / ``inspected_samples`` 是否增长、reward 是否长期全 0、``source_chunk`` 里是否真的有
 ``HUMAN/MIXED``、``collection_phase`` 是否符合 warmup/online 预期，以及
 ``intervention_flag_rate`` 是否和现场 GELLO 接管大致一致。
 

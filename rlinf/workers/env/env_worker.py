@@ -14,7 +14,6 @@
 
 import asyncio
 import gc
-import os
 from collections import defaultdict
 from typing import Any, Literal
 
@@ -34,13 +33,6 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
-from rlinf.models.embodiment.rlt_stage2.status import (
-    metric_mean,
-    phase_id,
-    resolve_rollout_phase,
-    utc_timestamp,
-    write_status_json,
-)
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.metric_utils import compute_split_num
@@ -492,96 +484,6 @@ class EnvWorker(Worker):
                 "env.eval.action_exec_chunks, policy_setup, and action preparation."
             )
 
-    def _build_rlt_step_obs(
-        self,
-        start_obs: dict[str, Any] | None,
-        obs_list,
-    ) -> dict[str, Any] | None:
-        if start_obs is None or not isinstance(obs_list, (list, tuple)) or not obs_list:
-            return None
-
-        stride = int(self.cfg.actor.model.rlt_stage2.get("replay_subsample_stride", 0))
-        if stride <= 0:
-            return None
-
-        step_obs_list = [start_obs, *obs_list]
-        offsets = self._rlt_sparse_step_obs_offsets(len(step_obs_list))
-        step_obs: dict[str, Any] = {}
-        batch_size = self._infer_obs_batch_size(step_obs_list[0])
-        for key in step_obs_list[0].keys():
-            if not offsets:
-                continue
-            values = [step_obs_list[offset].get(key, None) for offset in offsets]
-            first_non_none = next((value for value in values if value is not None), None)
-            if first_non_none is None:
-                step_obs[key] = None
-            elif isinstance(first_non_none, torch.Tensor):
-                if any(value is None for value in values):
-                    raise ValueError(
-                        f"Inconsistent RLT step_obs key {key!r}: "
-                        "tensor values contain None."
-                    )
-                values = [
-                    value.to(first_non_none.device)
-                    if value.device != first_non_none.device
-                    else value
-                    for value in values
-                ]
-                step_obs[key] = torch.stack(values, dim=0)
-            elif isinstance(first_non_none, list):
-                step_obs[key] = values
-            else:
-                step_obs[key] = values
-        step_obs["_rlt_step_offsets"] = torch.tensor(
-            offsets,
-            dtype=torch.long,
-        )[:, None].expand(len(offsets), batch_size).contiguous()
-        return step_obs
-
-    def _rlt_sparse_step_obs_offsets(self, step_count: int) -> list[int]:
-        stride = int(self.cfg.actor.model.rlt_stage2.get("replay_subsample_stride", 0))
-        chunk_len = int(self.cfg.actor.model.num_action_chunks)
-        if stride <= 0 or chunk_len <= 0:
-            return []
-
-        offsets = set()
-        offset = 0
-        while True:
-            offset = (offset + stride) % chunk_len
-            if offset == 0 or offset in offsets:
-                break
-            if offset < step_count:
-                offsets.add(offset)
-        return sorted(offsets)
-
-    @staticmethod
-    def _infer_obs_batch_size(obs: dict[str, Any]) -> int:
-        for value in obs.values():
-            if isinstance(value, torch.Tensor):
-                return int(value.shape[0])
-            if isinstance(value, list):
-                return len(value)
-        raise ValueError("Cannot infer RLT step_obs batch size from observation.")
-
-    @staticmethod
-    def _is_rlt_stage2_td3_cfg(cfg) -> bool:
-        return (
-            cfg.algorithm.get("loss_type", None) == "rlt_td3"
-            and cfg.actor.model.get("model_type", None) == "rlt_stage2"
-        )
-
-    def _append_rlt_step_trace_to_previous_action(
-        self,
-        stage_id: int,
-        rollout_result: RolloutResult,
-    ) -> None:
-        if not self._is_rlt_stage2_td3_cfg(self.cfg):
-            return
-        if rollout_result.rlt_step_trace:
-            self.rollout_results[stage_id].append_rlt_step_trace(
-                rollout_result.rlt_step_trace
-            )
-
     def _build_chunk_step_result(
         self,
         rollout_result: RolloutResult,
@@ -645,10 +547,9 @@ class EnvWorker(Worker):
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
-            step_obs = (
-                self._build_rlt_step_obs(start_obs, obs_list)
-                if self._is_rlt_stage2_td3_cfg(self.cfg)
-                else None
+            step_obs = self.policy_info_adapter.build_step_obs(
+                start_obs=start_obs,
+                obs_list=obs_list,
             )
         else:
             step_obs = None
@@ -1049,7 +950,7 @@ class EnvWorker(Worker):
         env_batch = dict(env_batch)
         step_obs = env_batch.pop("step_obs", None)
         env_batches = split_dict(env_batch, split_sizes)
-        step_obs_batches = self._split_rlt_step_obs(step_obs, split_sizes)
+        step_obs_batches = self._split_step_obs(step_obs, split_sizes)
         for env_batch_i, step_obs_i in zip(
             env_batches, step_obs_batches, strict=True
         ):
@@ -1061,7 +962,7 @@ class EnvWorker(Worker):
             )
 
     @staticmethod
-    def _split_rlt_step_obs(
+    def _split_step_obs(
         step_obs: dict[str, Any] | None,
         split_sizes: list[int],
     ) -> list[dict[str, Any] | None]:
@@ -1350,80 +1251,6 @@ class EnvWorker(Worker):
             else:
                 env_metrics[key].append(value)
 
-    def _emit_rlt_rollout_status(
-        self,
-        env_metrics: dict[str, torch.Tensor],
-    ) -> None:
-        if not self._is_rlt_stage2_td3_cfg(self.cfg):
-            return
-        ready_value = metric_mean(env_metrics, "rlt_ready_for_online")
-        if ready_value is None:
-            return
-
-        ready_for_online = bool(ready_value >= 0.5)
-        in_critical_phase_rate = metric_mean(
-            env_metrics, "rlt_in_critical_phase", default=0.0
-        )
-        record_transition_rate = metric_mean(
-            env_metrics, "rlt_record_transition", default=0.0
-        )
-        student_control_rate = metric_mean(
-            env_metrics, "student_control_rate", default=0.0
-        )
-        phase = resolve_rollout_phase(
-            ready_for_online=ready_for_online,
-            student_control_rate=float(student_control_rate),
-        )
-        phase_numeric_id = phase_id(phase)
-
-        status_like = env_metrics["rlt_ready_for_online"].detach().float().reshape(-1)
-        env_metrics["rlt_status_phase_id"] = torch.full_like(
-            status_like,
-            float(phase_numeric_id),
-        )
-        env_metrics["rlt_status_ready_for_online"] = torch.full_like(
-            status_like,
-            float(ready_for_online),
-        )
-        env_metrics["rlt_status_in_critical_phase_rate"] = torch.full_like(
-            status_like,
-            float(in_critical_phase_rate),
-        )
-        env_metrics["rlt_status_record_transition_rate"] = torch.full_like(
-            status_like,
-            float(record_transition_rate),
-        )
-        env_metrics["rlt_status_student_control_rate"] = torch.full_like(
-            status_like,
-            float(student_control_rate),
-        )
-
-        if self._rank == 0 and phase != self._last_logged_status_phase:
-            self.log_info(
-                "[RLT_STATUS][env] "
-                f"phase={phase} ready={int(ready_for_online)} "
-                f"critical={float(in_critical_phase_rate):.2f} "
-                f"record={float(record_transition_rate):.2f} "
-                f"student={float(student_control_rate):.2f}"
-            )
-            self._last_logged_status_phase = phase
-
-        status_dir = os.path.join(self.cfg.runner.logger.log_path, "status")
-        write_status_json(
-            os.path.join(status_dir, f"rlt_env_status_rank{self._rank}.json"),
-            {
-                "timestamp": utc_timestamp(),
-                "component": "env",
-                "rank": self._rank,
-                "phase": phase,
-                "phase_id": phase_numeric_id,
-                "ready_for_online": ready_for_online,
-                "in_critical_phase_rate": float(in_critical_phase_rate),
-                "record_transition_rate": float(record_transition_rate),
-                "student_control_rate": float(student_control_rate),
-            },
-        )
-
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
         self.last_intervened_info_list = [
@@ -1501,74 +1328,16 @@ class EnvWorker(Worker):
                     rollout_result = self.recv_rollout_results(
                         input_channel, mode="train"
                     )
-                    intervention_flags = rollout_result.forward_inputs.get(
-                        "intervention_flags", None
+                    self.policy_info_adapter.collect_rollout_metrics(
+                        env_metrics=env_metrics,
+                        rollout_result=rollout_result,
                     )
-                    if intervention_flags is not None:
-                        actual_intervention = (
-                            intervention_flags.detach().float().reshape(-1).cpu()
-                        )
-                        env_metrics["expert_intervention_actual_rate"].append(
-                            actual_intervention
-                        )
-                        env_metrics["expert_takeover_rate"].append(actual_intervention)
-                        intervention_phase = rollout_result.forward_inputs.get(
-                            "intervention_phase", None
-                        )
-                        if intervention_phase is not None:
-                            phase = (
-                                intervention_phase.detach()
-                                .float()
-                                .reshape(-1)
-                                .cpu()
-                            )
-                            if phase.numel() == actual_intervention.numel():
-                                env_metrics["grasp_intervention_rate"].append(
-                                    actual_intervention * (phase == 1).float()
-                                )
-                                env_metrics["insert_intervention_rate"].append(
-                                    actual_intervention * (phase == 2).float()
-                                )
-                    intervention_requested = rollout_result.forward_inputs.get(
-                        "intervention_requested", None
-                    )
-                    if intervention_requested is not None:
-                        env_metrics["expert_intervention_requested_rate"].append(
-                            intervention_requested.detach().float().reshape(-1).cpu()
-                        )
-                    ready_for_online = rollout_result.forward_inputs.get(
-                        "ready_for_online", None
-                    )
-                    if ready_for_online is not None:
-                        env_metrics["rlt_ready_for_online"].append(
-                            ready_for_online.detach().float().reshape(-1).cpu()
-                        )
-                    in_critical_phase = rollout_result.forward_inputs.get(
-                        "in_critical_phase", None
-                    )
-                    if in_critical_phase is not None:
-                        env_metrics["rlt_in_critical_phase"].append(
-                            in_critical_phase.detach().float().reshape(-1).cpu()
-                        )
-                    record_transition = rollout_result.forward_inputs.get(
-                        "record_transition", None
-                    )
-                    if record_transition is not None:
-                        env_metrics["rlt_record_transition"].append(
-                            record_transition.detach().float().reshape(-1).cpu()
-                        )
-                    student_control = rollout_result.forward_inputs.get(
-                        "student_control", None
-                    )
-                    if student_control is not None:
-                        env_metrics["student_control_rate"].append(
-                            student_control.detach().float().reshape(-1).cpu()
-                        )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
-                    self._append_rlt_step_trace_to_previous_action(
-                        stage_id, rollout_result
+                    self.policy_info_adapter.append_step_trace(
+                        rollout_accumulator=self.rollout_results[stage_id],
+                        rollout_result=rollout_result,
                     )
                     chunk_step_result = self._build_chunk_step_result(
                         rollout_result,
@@ -1639,13 +1408,12 @@ class EnvWorker(Worker):
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
                 )
-                self._append_rlt_step_trace_to_previous_action(
-                    stage_id, rollout_result
+                self.policy_info_adapter.append_step_trace(
+                    rollout_accumulator=self.rollout_results[stage_id],
+                    rollout_result=rollout_result,
                 )
-                final_forward_inputs = (
-                    rollout_result.forward_inputs
-                    if self._is_rlt_stage2_td3_cfg(self.cfg)
-                    else {}
+                final_forward_inputs = self.policy_info_adapter.final_forward_inputs(
+                    rollout_result
                 )
                 chunk_step_result = self._build_chunk_step_result(
                     rollout_result,
@@ -1688,7 +1456,12 @@ class EnvWorker(Worker):
 
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
-        self._emit_rlt_rollout_status(env_metrics)
+        self._last_logged_status_phase = self.policy_info_adapter.emit_status(
+            env_metrics=env_metrics,
+            rank=self._rank,
+            last_logged_phase=self._last_logged_status_phase,
+            log_info=self.log_info,
+        )
 
         return env_metrics
 
@@ -1731,6 +1504,11 @@ class EnvWorker(Worker):
                             infos["final_observation"]
                             if "final_observation" in infos
                             else None
+                        ),
+                        policy_info=self.policy_info_adapter.init_stage(
+                            stage_id=stage_id,
+                            mode="eval",
+                            env=self.eval_env_list[stage_id],
                         ),
                     )
                     env_batch = env_output.to_dict()

@@ -1035,6 +1035,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def get_rollout_state_dict(self) -> dict:
         return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
 
+    def get_rollout_sync_param_names(self, state_dict: dict) -> list[str]:
+        """Return parameter names used to initialize rollout weight sync."""
+        return self.param_names_need_sync
+
+    def get_rollout_sync_version(self) -> int:
+        """Return the model version exposed to rollout workers."""
+        return self.version
+
     @Worker.timer("actor/sync_model_to_rollout")
     async def sync_model_to_rollout(self) -> None:
         if self.enable_offload:
@@ -1073,10 +1081,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 state_dict=state_dict,
                 send=send_func,
                 recv=recv_func,
-                param_names_need_sync=self.param_names_need_sync,
+                param_names_need_sync=self.get_rollout_sync_param_names(state_dict),
             )
 
-        await self.weight_syncer.sync(state_dict, send_func, version=self.version)
+        await self.weight_syncer.sync(
+            state_dict,
+            send_func,
+            version=self.get_rollout_sync_version(),
+        )
 
         if self.enable_offload:
             assert not self.is_weight_offloaded, (
