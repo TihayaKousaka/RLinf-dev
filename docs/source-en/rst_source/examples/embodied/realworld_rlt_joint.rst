@@ -306,32 +306,40 @@ Before any real robot run, check the following on site:
 7. For the first smoke test, reduce ``max_joint_delta`` to a small value such as ``0.03``.
 8. A human operator must watch the robot, logs, keyboard reward, and emergency stop throughout online training.
 
-Check the Franka controller from the slave:
+After Ray is started on the slave and hardware environment variables are set,
+run the unified preflight check from the slave:
+
+.. code-block:: bash
+
+   python -m toolkits.realworld_check.check_realworld_rlt_stack
+
+The script checks:
+
+- whether key placeholders remain in ``rlt_stage2_realworld_joint.yaml`` and
+  ``realworld_rlt_joint_peg_insertion.yaml``.
+- Franka IP, controller readiness, 7D joint state, and TCP pose readability.
+- ``main_camera`` and ``wrist_camera`` serial/type capture, including measured FPS.
+- GELLO serial existence and 7D joint/gripper readability.
+- whether ``RLINF_KEYBOARD_DEVICE`` is readable and supports ``a/b/c/v``.
+
+For partial checks on one machine, skip unavailable hardware:
+
+.. code-block:: bash
+
+   python -m toolkits.realworld_check.check_realworld_rlt_stack \
+     --skip-franka --skip-cameras
+
+The original single-purpose scripts are still useful for interactive debugging:
 
 .. code-block:: bash
 
    export FRANKA_ROBOT_IP=<Franka IP>
    python -m toolkits.realworld_check.test_franka_controller
-
-After the script starts, use ``getpos_euler`` to inspect the current end-effector
-pose. The RLT joint config resets by 7D joint qpos, not by an end-effector reset
-pose. Record Franka's 7 joint positions with your on-site control/status tools
-before filling the YAML.
-
-Check cameras:
-
-.. code-block:: bash
-
    python -m toolkits.realworld_check.test_franka_camera
-
-Check GELLO:
-
-.. code-block:: bash
-
-   ls /dev/serial/by-id/
    python rlinf/envs/realworld/common/gello/gello_expert.py --port /dev/serial/by-id/<your-gello-port>
 
-Do not enable ``use_gello`` until GELLO data can be read reliably.
+Do not start Stage2 if any hardware item reports ``FAIL``. Do not enable
+``use_gello`` until GELLO data can be read reliably.
 
 Configuration
 -------------
@@ -653,6 +661,35 @@ Stage2 uses replay-buffer size and learner updates to gate online control:
 - ``warmup_min_size`` counts replay transitions/windows, not episodes.
 - ``warmup_post_collect_updates`` counts actor/critic learner update steps.
 - With ``replay_subsample_stride: 0``, replay is built at chunk boundaries.
+
+At runtime, Stage2 emits fixed-format online switching status lines:
+
+.. code-block:: text
+
+   [RLT_STATUS][actor] phase=warmup ready=0 buffer_ready=0 replay=42/100 update=0/1000 pending=0
+   [RLT_STATUS][env] phase=warmup ready=0 critical=1.00 record=1.00 student=0.00
+
+It also writes read-only status files:
+
+.. code-block:: text
+
+   ${runner.logger.log_path}/status/rlt_actor_status_rank0.json
+   ${runner.logger.log_path}/status/rlt_env_status_rank0.json
+
+On site, you can inspect them directly:
+
+.. code-block:: bash
+
+   watch -n 1 'cat ../results/status/rlt_actor_status_rank0.json; cat ../results/status/rlt_env_status_rank0.json'
+
+``phase`` has three values:
+
+1. ``warmup``: replay has not reached ``warmup_min_size`` yet, so Stage2 is
+   still collecting warmup data.
+2. ``warmup_wait_online``: replay is ready, but the learner is still finishing
+   ``warmup_post_collect_updates``.
+3. ``online``: ``update_step >= warmup_post_collect_updates`` and
+   ``ready_for_online=true``; later attempts can let the Stage2 actor take over.
 
 The operator flow is:
 

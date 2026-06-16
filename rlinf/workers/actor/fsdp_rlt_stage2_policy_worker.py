@@ -35,9 +35,18 @@ from rlinf.utils.utils import clear_memory
 from ...models.embodiment.rlt_stage2.components import actor_loss, critic_loss
 from ...models.embodiment.rlt_stage2.proprio import resolve_proprio_dim
 from ...models.embodiment.rlt_stage2.replay_buffer import RLTStage2ReplayBuffer
-from ...models.embodiment.rlt_stage2.transition import (
-    TransitionSource,
-    resolve_chunk_source,
+from ...models.embodiment.rlt_stage2.status import (
+    phase_id,
+    resolve_training_phase,
+    utc_timestamp,
+    write_status_json,
+)
+from ...models.embodiment.rlt_stage2.training_schedule import (
+    resolve_actor_loss_weights,
+    resolve_update_schedule,
+)
+from ...models.embodiment.rlt_stage2.trajectory_adapter import (
+    RLTStage2TrajectoryReplayAdapter,
 )
 
 
@@ -54,6 +63,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
 
         self.replay_buffer: RLTStage2ReplayBuffer | None = None
         self.demo_buffer: RLTStage2ReplayBuffer | None = None
+        self.trajectory_adapter: RLTStage2TrajectoryReplayAdapter | None = None
         self.qf_optimizer = None
         self.qf_lr_scheduler = None
         self.update_step = 0
@@ -69,6 +79,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         self.episodes_since_train = 0
         self.total_transitions_added = 0
         self.total_episodes_added = 0
+        self._last_logged_status_phase: str | None = None
 
         weight_syncer_cfg = cfg.get("weight_syncer", None)
         assert weight_syncer_cfg is not None, (
@@ -82,97 +93,13 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             range(self._component_placement.get_world_size("rollout"))
         )
 
-    def _warmup_required_updates(self) -> int:
-        td3_bc_cfg = self.cfg.algorithm.get("td3_bc", {})
-        warmup_required_updates = int(
-            td3_bc_cfg.get(
-                "warmup_updates",
-                self.cfg.algorithm.get("warmup_post_collect_updates", 0),
-            )
-        )
-        if warmup_required_updates < 0:
-            raise ValueError(
-                "algorithm.td3_bc.warmup_updates must be >= 0, "
-                f"got {warmup_required_updates}."
-            )
-        return warmup_required_updates
-
-    def _resolve_actor_loss_weights(self) -> tuple[float, float, float, bool, float]:
-        td3_bc_cfg = self.cfg.algorithm.get("td3_bc", {})
-        stage2_cfg = self.cfg.actor.model.rlt_stage2
-        loss_warmup_updates = int(
-            td3_bc_cfg.get(
-                "actor_loss_warmup_updates",
-                self.cfg.algorithm.get("actor_loss_warmup_updates", 0),
-            )
-        )
-        in_warmup = self.update_step < loss_warmup_updates
-        warmup_bc_weight = float(
-            td3_bc_cfg.get(
-                "warmup_bc_weight",
-                stage2_cfg.get(
-                    "warmup_bc_weight",
-                    stage2_cfg.get("bc_regularizer_beta", 1.0),
-                ),
-            )
-        )
-        warmup_q_weight = float(
-            td3_bc_cfg.get(
-                "warmup_q_weight",
-                stage2_cfg.get("warmup_q_weight", 0.1),
-            )
-        )
-        online_bc_weight = float(
-            td3_bc_cfg.get(
-                "online_bc_weight",
-                stage2_cfg.get(
-                    "online_bc_weight",
-                    stage2_cfg.get("bc_regularizer_beta", 1.0),
-                ),
-            )
-        )
-        online_q_weight = float(
-            td3_bc_cfg.get(
-                "online_q_weight",
-                stage2_cfg.get("online_q_weight", 0.1),
-            )
-        )
-        if in_warmup:
-            bc_weight = warmup_bc_weight
-            q_weight = warmup_q_weight
-            ramp_progress = 0.0
-        else:
-            ramp_updates = int(
-                td3_bc_cfg.get(
-                    "actor_loss_ramp_updates",
-                    self.cfg.algorithm.get("actor_loss_ramp_updates", 0),
-                )
-            )
-            if ramp_updates > 0:
-                ramp_progress = min(
-                    1.0,
-                    max(
-                        0.0,
-                        float(self.update_step - loss_warmup_updates + 1)
-                        / float(ramp_updates),
-                    ),
-                )
-            else:
-                ramp_progress = 1.0
-            bc_weight = warmup_bc_weight + ramp_progress * (
-                online_bc_weight - warmup_bc_weight
-            )
-            q_weight = warmup_q_weight + ramp_progress * (
-                online_q_weight - warmup_q_weight
-            )
-        delta_weight = float(
-            td3_bc_cfg.get("delta_weight", stage2_cfg.get("delta_weight", 0.0))
-        )
-        return bc_weight, q_weight, delta_weight, in_warmup, ramp_progress
-
     def init_worker(self):
         self.setup_model_and_optimizer()
         self._init_replay_buffer()
+        self.trajectory_adapter = RLTStage2TrajectoryReplayAdapter(
+            cfg=self.cfg,
+            replay_buffer=self.replay_buffer,
+        )
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
@@ -323,567 +250,10 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         if self.enable_offload:
             self.offload_param_and_grad(True)
 
-    @staticmethod
-    def _to_numpy_float(tensor: torch.Tensor) -> np.ndarray:
-        return tensor.detach().cpu().numpy().astype(np.float32, copy=False)
-
-    @staticmethod
-    def _to_numpy_uint8(tensor: torch.Tensor) -> np.ndarray:
-        return tensor.detach().cpu().numpy().astype(np.uint8, copy=False)
-
-    def _step_trace_to_transitions(self, traj: Trajectory) -> tuple[int, int]:
-        if (
-            self.replay_buffer is None
-            or traj.actions is None
-            or traj.rewards is None
-            or traj.dones is None
-            or not traj.rlt_step_trace
-        ):
-            return 0, 0
-
-        x_boundary = traj.forward_inputs.get("x") if traj.forward_inputs else None
-        a_tilde_boundary = (
-            traj.forward_inputs.get("a_tilde") if traj.forward_inputs else None
-        )
-        if x_boundary is None or a_tilde_boundary is None:
-            raise RuntimeError(
-                "RLT Stage2 stride replay requires chunk-boundary "
-                "forward_inputs['x'] and forward_inputs['a_tilde']; rollout must "
-                "cache policy-call features instead of forcing actor-side VLA encoding."
-            )
-
-        anchor_offsets = traj.rlt_step_trace.get("anchor_offsets")
-        x_trace = traj.rlt_step_trace.get("x")
-        a_tilde_trace = traj.rlt_step_trace.get("a_tilde")
-        if anchor_offsets is None:
-            raise RuntimeError(
-                "RLT Stage2 stride replay requires sparse "
-                "rlt_step_trace['anchor_offsets']; refusing to fall back to "
-                "chunk-boundary replay."
-            )
-
-        chunk_steps = int(traj.actions.shape[0])
-        bsz = int(traj.actions.shape[1])
-        chunk_len = int(self.cfg.actor.model.num_action_chunks)
-        action_dim = int(self.cfg.actor.model.action_dim)
-        stride = int(self.cfg.actor.model.rlt_stage2.get("replay_subsample_stride", 0))
-        allow_terminal_partial = bool(
-            self.cfg.actor.model.rlt_stage2.get("replay_allow_terminal_partial", True)
-        )
-        if stride <= 0:
-            return 0, 0
-        if x_boundary.shape[0] < chunk_steps + 1:
-            raise ValueError(
-                "RLT stride replay requires one extra final chunk-boundary feature "
-                f"for bootstrapping: expected at least {chunk_steps + 1}, got "
-                f"{x_boundary.shape[0]}."
-            )
-        if x_boundary.shape[1] != bsz or a_tilde_boundary.shape[1] != bsz:
-            raise ValueError(
-                "RLT boundary feature batch mismatch: "
-                f"{x_boundary.shape=}, {a_tilde_boundary.shape=}, expected B={bsz}."
-            )
-        if traj.rewards.shape[0] != chunk_steps:
-            raise ValueError(
-                "RLT step trace/reward length mismatch: "
-                f"{chunk_steps=} but traj.rewards.shape[0]={traj.rewards.shape[0]}."
-            )
-        if anchor_offsets.dim() != 3:
-            raise ValueError(
-                "RLT sparse anchor_offsets must have shape [chunk_steps, A, B], "
-                f"got {anchor_offsets.shape}."
-            )
-        if anchor_offsets.shape[0] != chunk_steps or anchor_offsets.shape[2] != bsz:
-            raise ValueError(
-                "RLT sparse anchor_offsets/action shape mismatch: "
-                f"{anchor_offsets.shape=}, expected chunk_steps={chunk_steps}, B={bsz}."
-            )
-        feature_steps = int(anchor_offsets.shape[1])
-        if feature_steps > 0:
-            if x_trace is None or a_tilde_trace is None:
-                raise RuntimeError(
-                    "RLT sparse anchor trace has non-boundary offsets but is missing "
-                    "rlt_step_trace['x'] or rlt_step_trace['a_tilde']."
-                )
-            if (
-                x_trace.shape[0] != chunk_steps
-                or x_trace.shape[1] != feature_steps
-                or x_trace.shape[2] != bsz
-                or a_tilde_trace.shape[0] != chunk_steps
-                or a_tilde_trace.shape[1] != feature_steps
-                or a_tilde_trace.shape[2] != bsz
-            ):
-                raise ValueError(
-                    "RLT sparse anchor feature shape mismatch: "
-                    f"{x_trace.shape=}, {a_tilde_trace.shape=}, "
-                    f"{anchor_offsets.shape=}."
-                )
-
-        flat_actions = traj.actions.reshape(chunk_steps, bsz, chunk_len, action_dim)
-        flat_rewards = traj.rewards.reshape(chunk_steps, bsz, chunk_len)
-        dones_all = traj.dones
-        if dones_all.shape[0] == chunk_steps + 1:
-            # EmbodiedRolloutResult stores an initial bootstrap done frame.
-            dones_all = dones_all[1:]
-        if dones_all.shape[0] != chunk_steps:
-            raise ValueError(
-                "RLT step trace/done length mismatch: expected dones to have "
-                f"{chunk_steps} or {chunk_steps + 1} chunk steps, got "
-                f"{traj.dones.shape[0]}."
-            )
-        flat_dones = dones_all.reshape(chunk_steps, bsz, chunk_len)
-        intervention_flags_all = traj.intervene_flags
-        if intervention_flags_all is None:
-            flat_interventions = torch.zeros_like(flat_rewards, dtype=torch.bool)
-        else:
-            if intervention_flags_all.shape[0] != chunk_steps:
-                raise ValueError(
-                    "RLT intervention/action length mismatch: "
-                    f"expected {chunk_steps}, got {intervention_flags_all.shape[0]}."
-                )
-            flat_interventions = intervention_flags_all.reshape(
-                chunk_steps,
-                bsz,
-                chunk_len,
-                -1,
-            ).any(dim=-1)
-        source_chunk_all = (
-            traj.forward_inputs.get("source_chunk") if traj.forward_inputs else None
-        )
-        if source_chunk_all is None:
-            flat_sources = torch.where(
-                flat_interventions,
-                torch.full_like(flat_interventions, int(TransitionSource.HUMAN), dtype=torch.uint8),
-                torch.full_like(flat_interventions, int(TransitionSource.RL), dtype=torch.uint8),
-            )
-        else:
-            if source_chunk_all.shape[0] < chunk_steps:
-                raise ValueError(
-                    "RLT source_chunk/action length mismatch: "
-                    f"expected at least {chunk_steps}, got {source_chunk_all.shape[0]}."
-                )
-            flat_sources = source_chunk_all[:chunk_steps].reshape(
-                chunk_steps,
-                bsz,
-                chunk_len,
-            ).to(torch.uint8)
-        collection_phase_id_all = (
-            traj.forward_inputs.get("collection_phase_id") if traj.forward_inputs else None
-        )
-        record_transition_all = (
-            traj.forward_inputs.get("record_transition") if traj.forward_inputs else None
-        )
-        if record_transition_all is None:
-            flat_record_transitions = torch.ones_like(flat_rewards, dtype=torch.bool)
-        else:
-            if record_transition_all.shape[0] < chunk_steps:
-                raise ValueError(
-                    "RLT record_transition/action length mismatch: "
-                    f"expected at least {chunk_steps}, got "
-                    f"{record_transition_all.shape[0]}."
-                )
-            record_transition_all = record_transition_all[:chunk_steps]
-            if record_transition_all.dim() <= 2:
-                flat_record_transitions = record_transition_all.reshape(
-                    chunk_steps,
-                    bsz,
-                    1,
-                ).expand(-1, -1, chunk_len)
-            elif (
-                record_transition_all.dim() == 3
-                and record_transition_all.shape[2] == 1
-            ):
-                flat_record_transitions = record_transition_all.expand(
-                    -1,
-                    -1,
-                    chunk_len,
-                )
-            elif (
-                record_transition_all.dim() == 3
-                and record_transition_all.shape[2] == chunk_len
-            ):
-                flat_record_transitions = record_transition_all
-            else:
-                flat_record_transitions = record_transition_all.reshape(
-                    chunk_steps,
-                    bsz,
-                    chunk_len,
-                    -1,
-                ).any(dim=-1)
-            flat_record_transitions = flat_record_transitions.to(torch.bool)
-
-        added = 0
-        completed_episodes = 0
-        auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
-        total_control_steps = chunk_steps * chunk_len
-
-        def get_feature(
-            global_step: int,
-            env_idx: int,
-            *,
-            terminal_fallback: tuple[torch.Tensor, torch.Tensor] | None = None,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            if global_step < 0 or global_step > total_control_steps:
-                raise RuntimeError(
-                    f"RLT feature lookup out of range: {global_step=} "
-                    f"with {total_control_steps=}."
-                )
-
-            if global_step % chunk_len == 0:
-                boundary_idx = global_step // chunk_len
-                if boundary_idx < x_boundary.shape[0]:
-                    return (
-                        x_boundary[boundary_idx, env_idx],
-                        a_tilde_boundary[boundary_idx, env_idx],
-                    )
-                if terminal_fallback is not None:
-                    return terminal_fallback
-                raise RuntimeError(
-                    "Missing RLT chunk-boundary feature for non-terminal stride "
-                    f"window end: {global_step=}, {boundary_idx=}."
-                )
-
-            chunk_idx = global_step // chunk_len
-            offset = global_step % chunk_len
-            if chunk_idx >= chunk_steps:
-                if terminal_fallback is not None:
-                    return terminal_fallback
-                raise RuntimeError(
-                    "Missing RLT sparse feature beyond rollout chunk range: "
-                    f"{global_step=}, {chunk_idx=}."
-                )
-            if feature_steps > 0 and x_trace is not None and a_tilde_trace is not None:
-                env_offsets = anchor_offsets[chunk_idx, :, env_idx].to(torch.long)
-                match = torch.nonzero(env_offsets == offset, as_tuple=False).reshape(-1)
-                if match.numel() > 0:
-                    pos = int(match[0].item())
-                    return (
-                        x_trace[chunk_idx, pos, env_idx],
-                        a_tilde_trace[chunk_idx, pos, env_idx],
-                    )
-            if terminal_fallback is not None:
-                return terminal_fallback
-            raise RuntimeError(
-                "Missing RLT sparse anchor feature for non-terminal stride window: "
-                f"{global_step=}, {chunk_idx=}, {offset=}, {stride=}, "
-                f"{anchor_offsets.shape=}."
-            )
-
-        for env_idx in range(bsz):
-            env_actions = flat_actions[:, env_idx].reshape(total_control_steps, action_dim)
-            env_rewards = flat_rewards[:, env_idx].reshape(total_control_steps)
-            env_dones = flat_dones[:, env_idx].reshape(total_control_steps)
-            env_interventions = flat_interventions[:, env_idx].reshape(total_control_steps)
-            env_sources = flat_sources[:, env_idx].reshape(total_control_steps)
-            env_record_transitions = flat_record_transitions[:, env_idx].reshape(
-                total_control_steps
-            )
-            done_indices = [
-                int(idx.item())
-                for idx in torch.nonzero(env_dones, as_tuple=False).reshape(-1)
-            ]
-            segment_start = 0
-            stop_env = False
-
-            def add_windows_for_segment(
-                segment_start_idx: int,
-                segment_end_idx: int,
-                *,
-                segment_terminal: bool,
-            ) -> None:
-                nonlocal added
-                if segment_end_idx <= segment_start_idx:
-                    return
-
-                for start in range(segment_start_idx, segment_end_idx, stride):
-                    end = start + chunk_len
-                    valid_end = min(end, segment_end_idx)
-                    terminal = bool(
-                        segment_terminal and valid_end == segment_end_idx
-                    )
-                    is_partial = end > segment_end_idx
-                    if is_partial and (not terminal or not allow_terminal_partial):
-                        # Only terminal partial windows are valid; padding a live
-                        # rollout boundary would fabricate future actions/rewards.
-                        continue
-                    if not bool(env_record_transitions[start:valid_end].all().item()):
-                        continue
-
-                    x_tensor, a_tilde_tensor = get_feature(start, env_idx)
-                    next_x_tensor, next_a_tilde_tensor = get_feature(
-                        valid_end,
-                        env_idx,
-                        terminal_fallback=(
-                            (x_tensor, a_tilde_tensor) if terminal else None
-                        ),
-                    )
-
-                    x = self._to_numpy_float(x_tensor)
-                    a_tilde = self._to_numpy_float(a_tilde_tensor)
-                    next_x = self._to_numpy_float(next_x_tensor)
-                    next_a_tilde = self._to_numpy_float(next_a_tilde_tensor)
-
-                    valid_len = valid_end - start
-                    action_chunk = torch.zeros(
-                        chunk_len,
-                        action_dim,
-                        dtype=env_actions.dtype,
-                        device=env_actions.device,
-                    )
-                    reward_chunk = torch.zeros(
-                        chunk_len,
-                        dtype=env_rewards.dtype,
-                        device=env_rewards.device,
-                    )
-                    intervention_chunk = torch.zeros(
-                        chunk_len,
-                        dtype=env_interventions.dtype,
-                        device=env_interventions.device,
-                    )
-                    source_chunk = torch.full(
-                        (chunk_len,),
-                        int(TransitionSource.BASE),
-                        dtype=torch.uint8,
-                        device=env_sources.device,
-                    )
-                    action_chunk[:valid_len] = env_actions[start:valid_end]
-                    reward_chunk[:valid_len] = env_rewards[start:valid_end]
-                    intervention_chunk[:valid_len] = env_interventions[start:valid_end]
-                    source_chunk[:valid_len] = env_sources[start:valid_end]
-
-                    action_np = self._to_numpy_float(action_chunk).reshape(-1)
-                    rewards_np = self._to_numpy_float(reward_chunk)
-                    intervention_np = self._to_numpy_float(intervention_chunk)
-                    source_chunk_np = self._to_numpy_uint8(source_chunk)
-                    collection_phase_id = None
-                    if collection_phase_id_all is not None:
-                        phase_idx = min(start // chunk_len, collection_phase_id_all.shape[0] - 1)
-                        collection_phase_id = int(
-                            collection_phase_id_all[phase_idx, env_idx]
-                            .reshape(-1)[0]
-                            .detach()
-                            .cpu()
-                            .item()
-                        )
-
-                    self.replay_buffer.add(
-                        x=x,
-                        action_chunk=action_np,
-                        ref_chunk=a_tilde,
-                        rewards=rewards_np,
-                        next_x=next_x,
-                        next_ref_chunk=next_a_tilde,
-                        done=float(terminal),
-                        intervention=intervention_np,
-                        source=resolve_chunk_source(source_chunk_np),
-                        source_chunk=source_chunk_np,
-                        collection_phase=collection_phase_id,
-                        intervention_flag=bool(intervention_np.any()),
-                        step_id=start,
-                    )
-                    added += 1
-
-                    if terminal and not auto_reset:
-                        break
-
-            for done_idx in done_indices:
-                episode_end = done_idx + 1
-                if episode_end <= segment_start:
-                    continue
-                add_windows_for_segment(
-                    segment_start,
-                    episode_end,
-                    segment_terminal=True,
-                )
-                completed_episodes += 1
-                if not auto_reset:
-                    stop_env = True
-                    break
-                # A clean new episode is not available until the next action chunk
-                # boundary. Do not treat the post-done tail as replay data.
-                segment_start = min(
-                    total_control_steps,
-                    ((done_idx // chunk_len) + 1) * chunk_len,
-                )
-
-            if not stop_env and segment_start < total_control_steps:
-                add_windows_for_segment(
-                    segment_start,
-                    total_control_steps,
-                    segment_terminal=False,
-                )
-
-        return added, completed_episodes
-
-    def _chunk_trajectory_to_transitions(self, traj: Trajectory) -> tuple[int, int]:
-        if self.replay_buffer is None or traj.actions is None or not traj.forward_inputs:
-            return 0, 0
-
-        traj_len = traj.actions.shape[0]
-        bsz = traj.actions.shape[1]
-        added = 0
-        completed_episodes = 0
-
-        x_all = traj.forward_inputs.get("x")
-        a_tilde_all = traj.forward_inputs.get("a_tilde")
-        if x_all is None or a_tilde_all is None:
-            return 0, 0
-
-        dones_all = traj.dones
-        rewards_all = traj.rewards
-        if dones_all is None or rewards_all is None:
-            return 0, 0
-        intervention_flags_all = traj.forward_inputs.get("intervention_flags")
-        if intervention_flags_all is None:
-            intervention_flags_all = traj.intervene_flags
-        source_chunk_all = traj.forward_inputs.get("source_chunk")
-        collection_phase_id_all = traj.forward_inputs.get("collection_phase_id")
-        record_transition_all = traj.forward_inputs.get("record_transition")
-        auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
-
-        for env_idx in range(bsz):
-            for t in range(traj_len):
-                if record_transition_all is not None:
-                    record_transition = (
-                        record_transition_all[t, env_idx]
-                        .detach()
-                        .to(torch.bool)
-                        .reshape(-1)
-                    )
-                    if not bool(record_transition.all().item()):
-                        continue
-                done_idx = min(t + 1, dones_all.shape[0] - 1)
-                env_done = float(dones_all[done_idx, env_idx].any().item())
-                done = float(env_done > 0.0)
-                intervention_mask: float | np.ndarray = 0.0
-                if intervention_flags_all is not None:
-                    intervention_mask = (
-                        intervention_flags_all[t, env_idx]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .astype(np.float32, copy=False)
-                        .reshape(-1)
-                    )
-                source_chunk: np.ndarray | None = None
-                source: int | None = None
-                if source_chunk_all is not None:
-                    source_chunk = (
-                        source_chunk_all[t, env_idx]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .astype(np.uint8, copy=False)
-                        .reshape(-1)
-                    )
-                    source = resolve_chunk_source(source_chunk)
-                collection_phase_id = None
-                if collection_phase_id_all is not None:
-                    collection_phase_id = int(
-                        collection_phase_id_all[t, env_idx]
-                        .reshape(-1)[0]
-                        .detach()
-                        .cpu()
-                        .item()
-                    )
-
-                x = x_all[t, env_idx].detach().cpu().numpy().astype(np.float32, copy=False)
-                a_tilde = (
-                    a_tilde_all[t, env_idx]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float32, copy=False)
-                )
-                action = (
-                    traj.actions[t, env_idx]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float32, copy=False)
-                )
-                rewards = (
-                    rewards_all[t, env_idx]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float32, copy=False)
-                )
-
-                if done > 0.0:
-                    next_x = x
-                    next_a_tilde = a_tilde
-                elif t + 1 < traj_len:
-                    next_x = (
-                        x_all[t + 1, env_idx]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .astype(np.float32, copy=False)
-                    )
-                    next_a_tilde = (
-                        a_tilde_all[t + 1, env_idx]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .astype(np.float32, copy=False)
-                    )
-                else:
-                    if x_all.shape[0] <= t + 1 or a_tilde_all.shape[0] <= t + 1:
-                        raise RuntimeError(
-                            "RLT Stage2 rollout boundary transition is non-terminal "
-                            "but missing cached final x/a_tilde. Rollout must send "
-                            "the final student forward_inputs so actor training can "
-                            "bootstrap without re-encoding VLA observations."
-                        )
-                    next_x = (
-                        x_all[t + 1, env_idx]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .astype(np.float32, copy=False)
-                    )
-                    next_a_tilde = (
-                        a_tilde_all[t + 1, env_idx]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .astype(np.float32, copy=False)
-                    )
-
-                self.replay_buffer.add(
-                    x=x,
-                    action_chunk=action,
-                    ref_chunk=a_tilde,
-                    rewards=rewards,
-                    next_x=next_x,
-                    next_ref_chunk=next_a_tilde,
-                    done=done,
-                    intervention=intervention_mask,
-                    source=source,
-                    source_chunk=source_chunk,
-                    collection_phase=collection_phase_id,
-                    intervention_flag=bool(np.asarray(intervention_mask).any()),
-                    step_id=t,
-                )
-                added += 1
-                if env_done > 0.0:
-                    completed_episodes += 1
-                    if not auto_reset:
-                        break
-
-        return added, completed_episodes
-
-    def _trajectory_to_transitions(self, traj: Trajectory) -> tuple[int, int]:
-        stride = int(self.cfg.actor.model.rlt_stage2.get("replay_subsample_stride", 0))
-        if stride > 0:
-            if not traj.rlt_step_trace:
-                raise RuntimeError(
-                    "RLT Stage2 stride replay is enabled but trajectory has no "
-                    "rlt_step_trace. Refusing to fall back to chunk-boundary replay."
-                )
-            return self._step_trace_to_transitions(traj)
-        return self._chunk_trajectory_to_transitions(traj)
+    def _add_rollout_trajectory_to_replay(self, traj: Trajectory) -> tuple[int, int]:
+        if self.trajectory_adapter is None:
+            raise RuntimeError("RLT Stage2 trajectory adapter is not initialized.")
+        return self.trajectory_adapter.add_trajectory(traj)
 
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
         clear_memory(sync=False)
@@ -894,7 +264,9 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
 
         for _ in range(split_num):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            added, completed_episodes = self._trajectory_to_transitions(trajectory)
+            added, completed_episodes = self._add_rollout_trajectory_to_replay(
+                trajectory
+            )
             self.transitions_since_train += added
             self.episodes_since_train += completed_episodes
             self.total_transitions_added += added
@@ -960,8 +332,6 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         min_demo_buffer_size: int,
         warmup_required_updates: int,
         update_ratio: int,
-        train_every_transitions: int,
-        train_every_episodes: int,
         should_train: bool,
         skip_reason: int,
         pending_update_budget: int,
@@ -969,6 +339,14 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         critic_updates_run: int = 0,
         actor_updates_run: int = 0,
     ) -> None:
+        ready_for_online = self.update_step >= warmup_required_updates
+        buffer_ready = global_min_replay_size >= warmup_min_size and (
+            self.demo_buffer is None or global_min_demo_size >= min_demo_buffer_size
+        )
+        status_phase = resolve_training_phase(
+            buffer_ready=buffer_ready,
+            ready_for_online=ready_for_online,
+        )
         append_to_dict(
             metrics,
             {
@@ -977,9 +355,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 "rlt_stage2/actor_updates_run": float(actor_updates_run),
                 "rlt_stage2/should_train": float(should_train),
                 "rlt_stage2/skip_reason": float(skip_reason),
-                "rlt_stage2/ready_for_online": float(
-                    self.update_step >= warmup_required_updates
-                ),
+                "rlt_stage2/ready_for_online": float(ready_for_online),
+                "rlt_stage2/status_phase_id": float(phase_id(status_phase)),
                 "rlt_stage2/global_min_replay_size": float(global_min_replay_size),
                 "rlt_stage2/global_min_demo_size": float(global_min_demo_size),
                 "rlt_stage2/min_replay_buffer_size": float(warmup_min_size),
@@ -996,6 +373,79 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 "rlt_stage2/global_total_transitions_added": float(
                     global_counters["total_transitions_added"]
                 ),
+            },
+        )
+        self._emit_training_status(
+            phase=status_phase,
+            ready_for_online=ready_for_online,
+            buffer_ready=buffer_ready,
+            global_min_replay_size=global_min_replay_size,
+            warmup_min_size=warmup_min_size,
+            warmup_required_updates=warmup_required_updates,
+            pending_update_budget=pending_update_budget,
+            should_train=should_train,
+            skip_reason=skip_reason,
+            updates_scheduled=updates_scheduled,
+            critic_updates_run=critic_updates_run,
+            actor_updates_run=actor_updates_run,
+            global_total_transitions_added=int(
+                global_counters["total_transitions_added"]
+            ),
+            global_total_episodes_added=int(global_counters["total_episodes_added"]),
+        )
+
+    def _emit_training_status(
+        self,
+        *,
+        phase: str,
+        ready_for_online: bool,
+        buffer_ready: bool,
+        global_min_replay_size: int,
+        warmup_min_size: int,
+        warmup_required_updates: int,
+        pending_update_budget: int,
+        should_train: bool,
+        skip_reason: int,
+        updates_scheduled: int,
+        critic_updates_run: int,
+        actor_updates_run: int,
+        global_total_transitions_added: int,
+        global_total_episodes_added: int,
+    ) -> None:
+        if self._rank == 0 and phase != self._last_logged_status_phase:
+            self.log_info(
+                "[RLT_STATUS][actor] "
+                f"phase={phase} ready={int(ready_for_online)} "
+                f"buffer_ready={int(buffer_ready)} "
+                f"replay={global_min_replay_size}/{warmup_min_size} "
+                f"update={self.update_step}/{warmup_required_updates} "
+                f"pending={pending_update_budget}"
+            )
+            self._last_logged_status_phase = phase
+
+        status_dir = os.path.join(self.cfg.runner.logger.log_path, "status")
+        write_status_json(
+            os.path.join(status_dir, f"rlt_actor_status_rank{self._rank}.json"),
+            {
+                "timestamp": utc_timestamp(),
+                "component": "actor",
+                "rank": self._rank,
+                "phase": phase,
+                "phase_id": phase_id(phase),
+                "ready_for_online": bool(ready_for_online),
+                "buffer_ready": bool(buffer_ready),
+                "update_step": int(self.update_step),
+                "warmup_required_updates": int(warmup_required_updates),
+                "global_min_replay_size": int(global_min_replay_size),
+                "warmup_min_size": int(warmup_min_size),
+                "pending_update_budget": int(pending_update_budget),
+                "updates_scheduled": int(updates_scheduled),
+                "critic_updates_run": int(critic_updates_run),
+                "actor_updates_run": int(actor_updates_run),
+                "should_train": bool(should_train),
+                "skip_reason": int(skip_reason),
+                "global_total_transitions_added": int(global_total_transitions_added),
+                "global_total_episodes_added": int(global_total_episodes_added),
             },
         )
 
@@ -1028,15 +478,6 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 self.cfg.algorithm.get("warmup_min_size", 1),
             )
         )
-        warmup_required_updates = self._warmup_required_updates()
-        update_ratio = int(self.cfg.algorithm.get("update_epoch", 1))
-        max_updates_per_train_step = int(
-            self.cfg.algorithm.get("max_updates_per_train_step", 0)
-        )
-        train_every_transitions = int(
-            self.cfg.algorithm.get("train_every_transitions", 0)
-        )
-        train_every_episodes = int(self.cfg.algorithm.get("train_every_episodes", 0))
         global_counters = self._global_rollout_counters()
         global_min_replay_size = self._global_min_replay_size()
         global_min_demo_size = self._global_min_demo_size()
@@ -1059,51 +500,18 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 global_counters["total_episodes_added"]
             )
 
-        desired_total_updates = 0
-        if (
-            buffer_ready
-            and self.warmup_ready_total_transitions is not None
-            and update_ratio > 0
-        ):
-            online_transitions_added = max(
-                global_total_transitions_added - self.warmup_ready_total_transitions,
-                0,
-            )
-            online_episodes_added = max(
-                int(global_counters["total_episodes_added"])
-                - int(self.warmup_ready_total_episodes or 0),
-                0,
-            )
-            transition_cycles = (
-                online_transitions_added // train_every_transitions
-                if train_every_transitions > 0
-                else 0
-            )
-            episode_cycles = (
-                online_episodes_added // train_every_episodes
-                if train_every_episodes > 0
-                else 0
-            )
-            if train_every_transitions <= 0 and train_every_episodes <= 0:
-                online_update_cycles = online_transitions_added
-            else:
-                online_update_cycles = max(transition_cycles, episode_cycles)
-            desired_total_updates = (
-                warmup_required_updates + online_update_cycles * update_ratio
-            )
-        self.pending_update_budget = max(desired_total_updates - self.update_step, 0)
-        updates_scheduled = int(self.pending_update_budget)
-        should_train = buffer_ready and updates_scheduled > 0
+        schedule = resolve_update_schedule(
+            self.cfg,
+            update_step=self.update_step,
+            buffer_ready=buffer_ready,
+            global_total_transitions_added=global_total_transitions_added,
+            global_total_episodes_added=int(global_counters["total_episodes_added"]),
+            warmup_ready_total_transitions=self.warmup_ready_total_transitions,
+            warmup_ready_total_episodes=self.warmup_ready_total_episodes,
+        )
+        self.pending_update_budget = schedule.pending_update_budget
 
-        skip_reason = 0
-        if update_ratio <= 0:
-            skip_reason = 3
-        elif not buffer_ready:
-            skip_reason = 1
-        elif not should_train:
-            skip_reason = 2
-
-        if skip_reason != 0:
+        if schedule.skip_reason != 0:
             self._append_replay_stats(metrics)
             self._append_training_schedule_metrics(
                 metrics,
@@ -1112,14 +520,12 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 global_min_demo_size=global_min_demo_size,
                 warmup_min_size=warmup_min_size,
                 min_demo_buffer_size=min_demo_buffer_size,
-                warmup_required_updates=warmup_required_updates,
-                update_ratio=update_ratio,
-                train_every_transitions=train_every_transitions,
-                train_every_episodes=train_every_episodes,
+                warmup_required_updates=schedule.warmup_required_updates,
+                update_ratio=schedule.update_ratio,
                 should_train=False,
-                skip_reason=skip_reason,
+                skip_reason=schedule.skip_reason,
                 pending_update_budget=self.pending_update_budget,
-                updates_scheduled=updates_scheduled,
+                updates_scheduled=schedule.updates_scheduled,
             )
             return self._process_train_metrics(metrics)
 
@@ -1141,10 +547,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         self.model.train()
         critic_updates_run = 0
         actor_updates_run = 0
-        updates_to_run = int(self.pending_update_budget)
-        if max_updates_per_train_step > 0:
-            updates_to_run = min(updates_to_run, max_updates_per_train_step)
-        for _ in range(updates_to_run):
+        for _ in range(schedule.updates_to_run):
             batch_dict = self._sample_training_batch(
                 global_batch_size_per_rank,
                 use_demo=use_demo,
@@ -1173,14 +576,12 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             global_min_demo_size=global_min_demo_size,
             warmup_min_size=warmup_min_size,
             min_demo_buffer_size=min_demo_buffer_size,
-            warmup_required_updates=warmup_required_updates,
-            update_ratio=update_ratio,
-            train_every_transitions=train_every_transitions,
-            train_every_episodes=train_every_episodes,
+            warmup_required_updates=schedule.warmup_required_updates,
+            update_ratio=schedule.update_ratio,
             should_train=True,
             skip_reason=0,
             pending_update_budget=self.pending_update_budget,
-            updates_scheduled=updates_scheduled,
+            updates_scheduled=schedule.updates_scheduled,
             critic_updates_run=critic_updates_run,
             actor_updates_run=actor_updates_run,
         )
@@ -1249,9 +650,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             )
         )
         replay_ready = global_min_replay_size >= warmup_min_size
-        bc_weight, q_weight, delta_weight, in_loss_warmup, loss_ramp_progress = (
-            self._resolve_actor_loss_weights()
-        )
+        loss_weights = resolve_actor_loss_weights(self.cfg, self.update_step)
         update_actor = (
             replay_ready
             and (self.update_step + 1) % int(self.cfg.algorithm.critic_actor_ratio) == 0
@@ -1263,7 +662,6 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             actor_bc_losses = []
             actor_bc_ref_losses = []
             actor_bc_human_losses = []
-            actor_bc_human_weighted_losses = []
             actor_human_mask_ratios = []
             self.optimizer.zero_grad()
             self.model.set_online_critic_requires_grad(False)
@@ -1305,12 +703,9 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                             a_tilde=a_tilde_chunk,
                             action_chunk=executed_action_chunk,
                             source_chunk=batch["source_chunk"].to(torch.uint8),
-                            bc_weight=bc_weight,
-                            q_weight=q_weight,
-                            delta_weight=delta_weight,
-                            human_bc_weight=float(
-                                stage2_cfg.get("human_bc_weight", 0.0)
-                            ),
+                            bc_weight=loss_weights.bc_weight,
+                            q_weight=loss_weights.q_weight,
+                            delta_weight=loss_weights.delta_weight,
                         )
                         loss = actor_total_loss / self.gradient_accumulation
                     self.grad_scaler.scale(loss).backward()
@@ -1327,11 +722,6 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 )
                 actor_bc_human_losses.append(
                     float(actor_loss_metrics["bc_human_loss"].float().item())
-                )
-                actor_bc_human_weighted_losses.append(
-                    float(
-                        actor_loss_metrics["bc_human_weighted_loss"].float().item()
-                    )
                 )
                 actor_human_mask_ratios.append(
                     float(actor_loss_metrics["human_mask_ratio"].float().item())
@@ -1352,25 +742,19 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     "actor/grad_norm": float(actor_grad_norm),
                     "actor/lr": self.optimizer.param_groups[0]["lr"],
                     "actor/action_ref_abs_mean": float(np.mean(actor_action_ref_abs)),
-                    "actor/bc_weight": bc_weight,
-                    "actor/q_weight": q_weight,
+                    "actor/bc_weight": loss_weights.bc_weight,
+                    "actor/q_weight": loss_weights.q_weight,
                     "actor/bc_loss": float(np.mean(actor_bc_losses)),
                     "actor/bc_ref_loss": float(np.mean(actor_bc_ref_losses)),
                     "actor/bc_human_loss": float(np.mean(actor_bc_human_losses)),
-                    "actor/bc_human_weighted_loss": float(
-                        np.mean(actor_bc_human_weighted_losses)
-                    ),
-                    "actor/human_bc_weight": float(
-                        stage2_cfg.get("human_bc_weight", 0.0)
-                    ),
                     "actor/human_mask_ratio": float(np.mean(actor_human_mask_ratios)),
                 }
             )
         else:
             metrics.update(
                 {
-                    "actor/bc_weight": bc_weight,
-                    "actor/q_weight": q_weight,
+                    "actor/bc_weight": loss_weights.bc_weight,
+                    "actor/q_weight": loss_weights.q_weight,
                 }
             )
 

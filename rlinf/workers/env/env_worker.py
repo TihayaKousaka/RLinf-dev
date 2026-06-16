@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import os
 from collections import defaultdict
 from typing import Any, Literal
 
@@ -33,6 +34,13 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
+from rlinf.models.embodiment.rlt_stage2.status import (
+    metric_mean,
+    phase_id,
+    resolve_rollout_phase,
+    utc_timestamp,
+    write_status_json,
+)
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.metric_utils import compute_split_num
@@ -50,6 +58,7 @@ from rlinf.utils.utils import (
     preprocess_embodied_batch,
 )
 from rlinf.workers.env.history_manager import HistoryManager
+from rlinf.workers.env.policy_info_adapter import build_policy_info_adapter
 
 
 class EnvWorker(Worker):
@@ -149,19 +158,27 @@ class EnvWorker(Worker):
             // self.eval_action_exec_chunks
         )
         self.actor_split_num = self.get_actor_split_num()
+        self.policy_info_adapter = build_policy_info_adapter(
+            self.cfg,
+            train_batch_size=(
+                self.train_num_envs_per_stage if not self.only_eval else None
+            ),
+            eval_batch_size=(
+                self.eval_num_envs_per_stage if self.enable_eval else None
+            ),
+        )
 
         if not self.only_eval:
             self.train_prev_done: list[torch.Tensor] = [
                 torch.zeros(self.train_num_envs_per_stage, dtype=torch.bool)
                 for _ in range(self.stage_num)
             ]
-            self.rlt_local_policy_state: list[dict[str, torch.Tensor]] = []
         if self.enable_eval:
             self.eval_prev_done: list[torch.Tensor] = [
                 torch.zeros(self.eval_num_envs_per_stage, dtype=torch.bool)
                 for _ in range(self.stage_num)
             ]
-            self.eval_rlt_local_policy_state: list[dict[str, torch.Tensor]] = []
+        self._last_logged_status_phase: str | None = None
 
     def init_worker(self):
         self.dst_rank_map = self._setup_dst_rank_map()
@@ -204,7 +221,11 @@ class EnvWorker(Worker):
                 f"{self.cfg.env.eval.max_steps_per_rollout_epoch}"
             )
             self.eval_policy_info_list = [
-                self._init_rlt_local_policy_state(i, mode="eval")
+                self.policy_info_adapter.init_stage(
+                    stage_id=i,
+                    mode="eval",
+                    env=self.eval_env_list[i],
+                )
                 for i in range(self.stage_num)
             ]
 
@@ -436,650 +457,14 @@ class EnvWorker(Worker):
                 self.last_obs_list.append(extracted_obs)
                 self.last_intervened_info_list.append((None, None))
                 self.last_policy_info_list.append(
-                    self._init_rlt_local_policy_state(i)
+                    self.policy_info_adapter.init_stage(
+                        stage_id=i,
+                        mode="train",
+                        env=self.env_list[i],
+                    )
                 )
             if self.enable_offload and hasattr(self.env_list[i], "offload"):
                 self.env_list[i].offload()
-
-    def _rlt_stage2_td3_enabled(self) -> bool:
-        return (
-            self.cfg.algorithm.get("loss_type", None) == "rlt_td3"
-            and self.cfg.actor.model.get("model_type", None) == "rlt_stage2"
-        )
-
-    def _rlt_stage2_intervention_mode(self) -> str:
-        intervention_cfg = self.cfg.algorithm.get("intervention", {})
-        return str(intervention_cfg.get("mode", "local_correction"))
-
-    def _rlt_stage2_intervention_enabled(self) -> bool:
-        intervention_cfg = self.cfg.algorithm.get("intervention", {})
-        return self._rlt_stage2_td3_enabled() and bool(
-            intervention_cfg.get("enable", False)
-        ) and self._rlt_stage2_intervention_mode() in {
-            "local_correction",
-            "human_override",
-        }
-
-    def _rlt_stage2_local_correction_enabled(self) -> bool:
-        return (
-            self._rlt_stage2_intervention_enabled()
-            and self._rlt_stage2_intervention_mode() == "local_correction"
-        )
-
-    def _rlt_stage2_policy_info_enabled(
-        self,
-        mode: Literal["train", "eval"] = "train",
-    ) -> bool:
-        if self._rlt_stage2_local_correction_enabled():
-            return True
-        env_cfg = self.cfg.env.train if mode == "train" else self.cfg.env.eval
-        return self._rlt_stage2_intervention_enabled() and (
-            str(env_cfg.get("env_type", "")).lower() == "realworld"
-        )
-
-    def _rlt_policy_env_type(self, mode: Literal["train", "eval"]) -> str:
-        env_cfg = self.cfg.env.train if mode == "train" else self.cfg.env.eval
-        return str(env_cfg.get("env_type", "")).lower()
-
-    def _init_rlt_local_policy_state(
-        self, stage_id: int, mode: Literal["train", "eval"] = "train"
-    ) -> dict[str, torch.Tensor] | None:
-        if not self._rlt_stage2_policy_info_enabled(mode):
-            return None
-
-        batch_size = (
-            self.train_num_envs_per_stage
-            if mode == "train"
-            else self.eval_num_envs_per_stage
-        )
-        state = {
-            "intervention_region": torch.zeros(batch_size, dtype=torch.bool),
-            "intervention_phase": torch.zeros(batch_size, dtype=torch.int64),
-            "expert_takeover": torch.zeros(batch_size, dtype=torch.bool),
-            "deviation": torch.zeros(batch_size, dtype=torch.bool),
-            "deviation_count": torch.zeros(batch_size, dtype=torch.int64),
-            "grasp_deviation_count": torch.zeros(batch_size, dtype=torch.int64),
-            "takeover_left": torch.zeros(batch_size, dtype=torch.int64),
-            "takeover_used": torch.zeros(batch_size, dtype=torch.int64),
-            "prev_yz_error": torch.full((batch_size,), float("nan"), dtype=torch.float32),
-            "prev_hole_x": torch.full((batch_size,), float("nan"), dtype=torch.float32),
-            "in_critical_phase": torch.full(
-                (batch_size,),
-                self._rlt_realworld_default_in_critical_phase(mode),
-                dtype=torch.bool,
-            ),
-            "record_transition": torch.full(
-                (batch_size,),
-                self._rlt_realworld_default_record_transition(mode),
-                dtype=torch.bool,
-            ),
-            "critical_phase_started": torch.full(
-                (batch_size,),
-                self._rlt_realworld_default_in_critical_phase(mode),
-                dtype=torch.bool,
-            ),
-        }
-        states = (
-            self.rlt_local_policy_state
-            if mode == "train"
-            else self.eval_rlt_local_policy_state
-        )
-        while len(states) <= stage_id:
-            states.append({})
-        states[stage_id] = state
-        return self._export_rlt_local_policy_info(state)
-
-    @staticmethod
-    def _export_rlt_local_policy_info(
-        state: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        policy_info = {
-            "expert_takeover": state["expert_takeover"][:, None],
-            "deviation": state["deviation"][:, None],
-            "deviation_count": state["deviation_count"].to(torch.float32)[:, None],
-            "grasp_deviation_count": state["grasp_deviation_count"].to(torch.float32)[
-                :, None
-            ],
-            "intervention_phase": state["intervention_phase"].to(torch.float32)[
-                :, None
-            ],
-            "takeover_left": state["takeover_left"].to(torch.float32)[:, None],
-            "takeover_used": state["takeover_used"].to(torch.float32)[:, None],
-        }
-        for key in (
-            "in_critical_phase",
-            "record_transition",
-            "critical_phase_started",
-        ):
-            if key in state:
-                policy_info[key] = state[key].to(torch.bool)[:, None]
-        return policy_info
-
-    def _rlt_realworld_task_mode(self, mode: Literal["train", "eval"]) -> str:
-        env_cfg = self.cfg.env.train if mode == "train" else self.cfg.env.eval
-        return str(env_cfg.get("task_mode", "critical_phase"))
-
-    def _rlt_realworld_default_in_critical_phase(
-        self,
-        mode: Literal["train", "eval"],
-    ) -> bool:
-        return self._rlt_realworld_task_mode(mode) == "critical_phase"
-
-    def _rlt_realworld_default_record_transition(
-        self,
-        mode: Literal["train", "eval"],
-    ) -> bool:
-        env_cfg = self.cfg.env.train if mode == "train" else self.cfg.env.eval
-        if bool(env_cfg.get("record_prefix_before_critical_phase", False)):
-            return True
-        return self._rlt_realworld_default_in_critical_phase(mode)
-
-    @staticmethod
-    def _select_rlt_policy_source_info(
-        infos: dict[str, Any],
-        required_keys: list[str],
-    ) -> dict[str, Any]:
-        if all(key in infos for key in required_keys):
-            return infos
-        final_info = infos.get("final_info")
-        if isinstance(final_info, dict) and all(
-            key in final_info for key in required_keys
-        ):
-            return final_info
-        missing = [key for key in required_keys if key not in infos]
-        raise RuntimeError(
-            "RLT intervention control is enabled, but ManiSkill info is missing "
-            f"required keys {missing}. This usually means the env wrapper is not "
-            "using the aligned peg-insertion info path."
-        )
-
-    @staticmethod
-    def _unwrap_env(env: Any) -> Any:
-        while hasattr(env, "env"):
-            env = env.env
-        return getattr(env, "unwrapped", env)
-
-    @staticmethod
-    def _lookup_rlt_policy_info_value(infos: dict[str, Any], key: str) -> Any:
-        if key in infos:
-            return infos[key]
-        policy_info = infos.get("policy_info")
-        if isinstance(policy_info, dict) and key in policy_info:
-            return policy_info[key]
-        final_info = infos.get("final_info")
-        if isinstance(final_info, dict):
-            if key in final_info:
-                return final_info[key]
-            final_policy_info = final_info.get("policy_info")
-            if isinstance(final_policy_info, dict) and key in final_policy_info:
-                return final_policy_info[key]
-        return None
-
-    @staticmethod
-    def _coerce_rlt_bool_info(
-        value: Any,
-        *,
-        batch_size: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if value is None:
-            return torch.zeros(batch_size, dtype=torch.bool, device=device)
-        tensor = torch.as_tensor(value, device=device)
-        if tensor.numel() == 1:
-            return torch.full(
-                (batch_size,),
-                bool(tensor.reshape(-1)[0].item()),
-                dtype=torch.bool,
-                device=device,
-            )
-        tensor = tensor.reshape(batch_size, -1)
-        return tensor.to(torch.bool).any(dim=1)
-
-    @staticmethod
-    def _coerce_rlt_int_info(
-        value: Any,
-        *,
-        batch_size: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if value is None:
-            return torch.zeros(batch_size, dtype=torch.int64, device=device)
-        tensor = torch.as_tensor(value, device=device)
-        if tensor.numel() == 1:
-            return torch.full(
-                (batch_size,),
-                int(tensor.reshape(-1)[0].item()),
-                dtype=torch.int64,
-                device=device,
-            )
-        tensor = tensor.reshape(batch_size, -1)
-        return tensor[:, -1].to(torch.int64)
-
-    def _update_rlt_generic_policy_state(
-        self,
-        infos: dict[str, Any],
-        chunk_dones: torch.Tensor,
-        stage_id: int,
-        mode: Literal["train", "eval"],
-    ) -> dict[str, torch.Tensor]:
-        states = (
-            self.rlt_local_policy_state
-            if mode == "train"
-            else self.eval_rlt_local_policy_state
-        )
-        state = states[stage_id]
-        device = chunk_dones.device
-        done_any = chunk_dones.any(dim=1).to(device)
-        batch_size = int(done_any.shape[0])
-        for key, value in state.items():
-            state[key] = value.to(device)
-
-        expert_takeover = self._coerce_rlt_bool_info(
-            self._lookup_rlt_policy_info_value(infos, "expert_takeover"),
-            batch_size=batch_size,
-            device=device,
-        )
-        deviation = self._coerce_rlt_bool_info(
-            self._lookup_rlt_policy_info_value(infos, "deviation"),
-            batch_size=batch_size,
-            device=device,
-        )
-        intervention_region = self._coerce_rlt_bool_info(
-            self._lookup_rlt_policy_info_value(infos, "intervention_region"),
-            batch_size=batch_size,
-            device=device,
-        )
-        state["expert_takeover"] = torch.where(
-            done_any,
-            torch.zeros_like(expert_takeover),
-            expert_takeover,
-        )
-        state["deviation"] = torch.where(done_any, torch.zeros_like(deviation), deviation)
-        state["intervention_region"] = torch.where(
-            done_any,
-            torch.zeros_like(intervention_region),
-            intervention_region,
-        )
-        for key in (
-            "in_critical_phase",
-            "record_transition",
-            "critical_phase_started",
-        ):
-            if key not in state:
-                continue
-            default_value = (
-                self._rlt_realworld_default_record_transition(mode)
-                if key == "record_transition"
-                else self._rlt_realworld_default_in_critical_phase(mode)
-            )
-            default_tensor = torch.full_like(state[key], default_value)
-            current_value = self._coerce_rlt_bool_info(
-                self._lookup_rlt_policy_info_value(infos, key),
-                batch_size=batch_size,
-                device=device,
-            )
-            state[key] = torch.where(done_any, default_tensor, current_value)
-        for key in (
-            "deviation_count",
-            "grasp_deviation_count",
-            "takeover_left",
-            "takeover_used",
-        ):
-            state[key] = torch.where(
-                done_any,
-                torch.zeros_like(state[key]),
-                self._coerce_rlt_int_info(
-                    self._lookup_rlt_policy_info_value(infos, key),
-                    batch_size=batch_size,
-                    device=device,
-                ),
-            )
-        state["prev_yz_error"] = torch.full_like(state["prev_yz_error"], float("nan"))
-        state["prev_hole_x"] = torch.full_like(state["prev_hole_x"], float("nan"))
-        state["intervention_phase"] = torch.where(
-            done_any,
-            torch.zeros_like(state["intervention_phase"]),
-            state["intervention_phase"],
-        )
-        return self._export_rlt_local_policy_info(state)
-
-    def _update_rlt_local_policy_state(
-        self,
-        infos: dict[str, Any] | None,
-        chunk_dones: torch.Tensor,
-        stage_id: int,
-        mode: Literal["train", "eval"] = "train",
-    ) -> dict[str, torch.Tensor] | None:
-        states = (
-            self.rlt_local_policy_state
-            if mode == "train"
-            else self.eval_rlt_local_policy_state
-        )
-        if (
-            not self._rlt_stage2_policy_info_enabled(mode)
-            or infos is None
-            or not states
-        ):
-            return None
-
-        if self._rlt_policy_env_type(mode) != "maniskill":
-            return self._update_rlt_generic_policy_state(
-                infos,
-                chunk_dones,
-                stage_id,
-                mode,
-            )
-
-        required_keys = [
-            "consecutive_grasp_current",
-            "prealigned_current",
-            "partial_insert_current",
-            "success_current",
-            "peg_head_goal_yz_dist",
-            "peg_body_goal_yz_dist",
-            "peg_head_hole_x",
-            "peg_head_hole_abs_y",
-            "peg_head_hole_abs_z",
-            "tcp_peg_dist",
-        ]
-        infos = self._select_rlt_policy_source_info(infos, required_keys)
-
-        intervention_cfg = self.cfg.algorithm.get("intervention", {})
-        intervention_enabled = self._rlt_stage2_local_correction_enabled()
-        state = states[stage_id]
-        device = infos["peg_head_hole_x"].device
-        if "intervention_region" not in state:
-            state["intervention_region"] = torch.zeros(
-                state["expert_takeover"].shape, dtype=torch.bool
-            )
-        if "intervention_phase" not in state:
-            state["intervention_phase"] = torch.zeros(
-                state["expert_takeover"].shape, dtype=torch.int64
-            )
-        if "grasp_deviation_count" not in state:
-            state["grasp_deviation_count"] = torch.zeros(
-                state["expert_takeover"].shape, dtype=torch.int64
-            )
-        for key, value in state.items():
-            state[key] = value.to(device)
-
-        done_any = chunk_dones.any(dim=1).to(device)
-
-        success = infos["success_current"].to(torch.bool)
-        grasp = infos["consecutive_grasp_current"].to(torch.bool)
-        prealigned = infos["prealigned_current"].to(torch.bool)
-        partial_insert = infos["partial_insert_current"].to(torch.bool)
-        yz_error = torch.maximum(
-            infos["peg_head_goal_yz_dist"].to(torch.float32),
-            infos["peg_body_goal_yz_dist"].to(torch.float32),
-        )
-        hole_x = infos["peg_head_hole_x"].to(torch.float32)
-        abs_y = infos["peg_head_hole_abs_y"].to(torch.float32)
-        abs_z = infos["peg_head_hole_abs_z"].to(torch.float32)
-        tcp_peg_dist = infos["tcp_peg_dist"].to(torch.float32)
-
-        hole_radii = None
-        env_list = self.env_list if mode == "train" else self.eval_env_list
-        unwrapped = self._unwrap_env(env_list[stage_id])
-        if hasattr(unwrapped, "box_hole_radii"):
-            hole_radii = unwrapped.box_hole_radii.to(device, dtype=torch.float32)
-        if hole_radii is None:
-            fallback_hole_radius = intervention_cfg.get(
-                "fallback_hole_radius",
-                0.035,
-            )
-            hole_radii = torch.full_like(abs_y, float(fallback_hole_radius))
-
-        no_phase = torch.zeros_like(state["intervention_phase"])
-        grasp_phase = torch.full_like(state["intervention_phase"], 1)
-        insert_phase = torch.full_like(state["intervention_phase"], 2)
-        previous_grasp_region = state["intervention_region"] & (
-            state["intervention_phase"] == 1
-        )
-        previous_insert_region = state["intervention_region"] & (
-            state["intervention_phase"] == 2
-        )
-
-        grasp_entry = torch.zeros_like(success)
-        grasp_hold = torch.zeros_like(success)
-        insert_entry = torch.zeros_like(success)
-        insert_hold = torch.zeros_like(success)
-        if intervention_enabled:
-            enable_grasp_phase = bool(intervention_cfg.get("enable_grasp_phase", False))
-            if enable_grasp_phase:
-                grasp_near_peg_dist = float(
-                    intervention_cfg.get("grasp_near_peg_dist", 0.05)
-                )
-                grasp_entry = (
-                    (~grasp) & (tcp_peg_dist <= grasp_near_peg_dist) & (~success)
-                )
-                grasp_hold = previous_grasp_region & (~grasp) & (~success)
-
-            intervention_near_hole_x_min = float(
-                intervention_cfg.get("near_hole_x_min", -0.05)
-            )
-            intervention_exit_hole_x_min = float(
-                intervention_cfg.get("exit_hole_x_min", -0.12)
-            )
-            intervention_yz_margin = float(
-                intervention_cfg.get("near_hole_yz_margin", 1.5)
-            )
-            intervention_yz = (
-                (yz_error <= intervention_yz_margin * hole_radii)
-                & (abs_y <= intervention_yz_margin * hole_radii)
-                & (abs_z <= intervention_yz_margin * hole_radii)
-            ) | prealigned | partial_insert
-            intervention_near_hole = hole_x >= intervention_near_hole_x_min
-            insert_entry = (
-                grasp & intervention_near_hole & intervention_yz & (~success)
-            )
-            insert_hold = (
-                previous_insert_region
-                & (~success)
-                & (hole_x >= intervention_exit_hole_x_min)
-            )
-            grasp_region = grasp_entry | grasp_hold
-            insert_region = insert_entry | insert_hold
-            intervention_region = grasp_region | insert_region
-        else:
-            grasp_region = torch.zeros_like(success)
-            insert_region = torch.zeros_like(success)
-            intervention_region = torch.zeros_like(success)
-
-        region_phase = torch.where(
-            grasp_region,
-            grasp_phase,
-            torch.where(insert_region, insert_phase, no_phase),
-        )
-
-        has_prev_yz = torch.isfinite(state["prev_yz_error"])
-        has_prev_x = torch.isfinite(state["prev_hole_x"])
-        progress_eps = float(intervention_cfg.get("progress_eps", 0.002))
-        yz_error_eps = float(intervention_cfg.get("yz_error_eps", 0.002))
-        safe_yz_margin = float(intervention_cfg.get("safe_yz_margin", 1.25))
-        yz_worse = has_prev_yz & (yz_error > state["prev_yz_error"] + yz_error_eps)
-        no_x_progress = has_prev_x & (hole_x <= state["prev_hole_x"] + progress_eps)
-        safe_yz = (abs_y <= safe_yz_margin * hole_radii) & (
-            abs_z <= safe_yz_margin * hole_radii
-        )
-        moved_away_from_hole = (
-            has_prev_x
-            & previous_insert_region
-            & (hole_x < state["prev_hole_x"] - progress_eps)
-        )
-        lost_grasp = (~grasp) & previous_insert_region
-        insert_deviation = insert_region & (
-            yz_worse
-            | no_x_progress
-            | (~safe_yz)
-            | lost_grasp
-            | moved_away_from_hole
-        )
-        grasp_deviation = grasp_region & (~grasp)
-        deviation = insert_deviation | grasp_deviation
-
-        patience = int(intervention_cfg.get("deviation_patience", 2))
-        state["deviation_count"] = torch.where(
-            insert_deviation,
-            state["deviation_count"] + 1,
-            torch.zeros_like(state["deviation_count"]),
-        )
-        grasp_patience = int(
-            intervention_cfg.get(
-                "grasp_deviation_patience",
-                intervention_cfg.get("deviation_patience", 2),
-            )
-        )
-        state["grasp_deviation_count"] = torch.where(
-            grasp_deviation,
-            state["grasp_deviation_count"] + 1,
-            torch.zeros_like(state["grasp_deviation_count"]),
-        )
-
-        takeover_chunks = int(intervention_cfg.get("takeover_chunks", 5))
-        takeover_max_chunks = int(intervention_cfg.get("takeover_max_chunks", 10))
-        if takeover_chunks <= 0 or takeover_max_chunks < takeover_chunks:
-            raise ValueError(
-                "algorithm.intervention must satisfy "
-                "0 < takeover_chunks <= takeover_max_chunks, got "
-                f"{takeover_chunks=} and {takeover_max_chunks=}."
-            )
-        grasp_takeover_chunks = int(
-            intervention_cfg.get("grasp_takeover_chunks", takeover_chunks)
-        )
-        grasp_takeover_max_chunks = int(
-            intervention_cfg.get("grasp_takeover_max_chunks", takeover_max_chunks)
-        )
-        if (
-            grasp_takeover_chunks <= 0
-            or grasp_takeover_max_chunks < grasp_takeover_chunks
-        ):
-            raise ValueError(
-                "algorithm.intervention must satisfy "
-                "0 < grasp_takeover_chunks <= grasp_takeover_max_chunks, got "
-                f"{grasp_takeover_chunks=} and {grasp_takeover_max_chunks=}."
-            )
-
-        previous_takeover = state["expert_takeover"]
-        previous_phase = state["intervention_phase"]
-        takeover_used_after_chunk = torch.where(
-            previous_takeover,
-            state["takeover_used"] + 1,
-            state["takeover_used"],
-        )
-        if mode == "train" and intervention_enabled:
-            trigger_grasp = (
-                grasp_region
-                & (~previous_takeover)
-                & (state["grasp_deviation_count"] >= grasp_patience)
-            )
-            trigger_insert = (
-                insert_region
-                & (~previous_takeover)
-                & (state["deviation_count"] >= patience)
-            )
-        else:
-            trigger_grasp = torch.zeros_like(intervention_region)
-            trigger_insert = torch.zeros_like(intervention_region)
-        trigger = trigger_grasp | trigger_insert
-        active_phase = torch.where(previous_takeover, previous_phase, region_phase)
-        takeover_phase = torch.where(
-            trigger_grasp,
-            grasp_phase,
-            torch.where(trigger_insert, insert_phase, active_phase),
-        )
-        is_grasp_takeover = takeover_phase == 1
-        phase_min_chunks = torch.where(
-            is_grasp_takeover,
-            torch.full_like(state["takeover_used"], grasp_takeover_chunks),
-            torch.full_like(state["takeover_used"], takeover_chunks),
-        )
-        phase_max_chunks = torch.where(
-            is_grasp_takeover,
-            torch.full_like(state["takeover_used"], grasp_takeover_max_chunks),
-            torch.full_like(state["takeover_used"], takeover_max_chunks),
-        )
-        grasp_recovered = is_grasp_takeover & grasp
-        insert_recovered = (
-            (takeover_phase == 2) & insert_region & grasp & safe_yz & (~insert_deviation)
-        )
-        recovered = grasp_recovered | insert_recovered
-        keep_until_min_chunks = previous_takeover & (
-            takeover_used_after_chunk < phase_min_chunks
-        )
-        keep_for_min_chunks = torch.where(
-            is_grasp_takeover,
-            keep_until_min_chunks & (~recovered),
-            keep_until_min_chunks,
-        )
-        extend_until_recovered = (
-            previous_takeover
-            & (~recovered)
-            & (takeover_used_after_chunk < phase_max_chunks)
-        )
-        next_takeover = (trigger | keep_for_min_chunks | extend_until_recovered) & (
-            ~success
-        )
-        next_takeover = torch.where(
-            done_any, torch.zeros_like(next_takeover), next_takeover
-        )
-        released_takeover = previous_takeover & (~next_takeover)
-
-        state["takeover_used"] = torch.where(
-            trigger,
-            torch.zeros_like(state["takeover_used"]),
-            takeover_used_after_chunk,
-        )
-        state["takeover_used"] = torch.where(
-            next_takeover,
-            state["takeover_used"],
-            torch.zeros_like(state["takeover_left"]),
-        )
-        remaining_to_min = torch.clamp(phase_min_chunks - state["takeover_used"], min=0)
-        remaining_to_max = torch.clamp(phase_max_chunks - state["takeover_used"], min=0)
-        state["takeover_left"] = torch.where(
-            next_takeover,
-            torch.where(
-                state["takeover_used"] < phase_min_chunks,
-                remaining_to_min,
-                remaining_to_max,
-            ),
-            torch.zeros_like(state["takeover_used"]),
-        )
-        state["expert_takeover"] = next_takeover
-        state["intervention_phase"] = torch.where(
-            done_any,
-            no_phase,
-            torch.where(next_takeover, takeover_phase, region_phase),
-        )
-        state["intervention_region"] = torch.where(
-            done_any, torch.zeros_like(intervention_region), intervention_region
-        )
-        state["deviation"] = torch.where(
-            done_any, torch.zeros_like(deviation), deviation
-        )
-        state["deviation_count"] = torch.where(
-            done_any | (~intervention_region) | trigger | released_takeover,
-            torch.zeros_like(state["deviation_count"]),
-            state["deviation_count"],
-        )
-        state["grasp_deviation_count"] = torch.where(
-            done_any | (~grasp_region) | trigger | released_takeover | grasp_recovered,
-            torch.zeros_like(state["grasp_deviation_count"]),
-            state["grasp_deviation_count"],
-        )
-        state["prev_yz_error"] = torch.where(
-            insert_region,
-            yz_error,
-            torch.full_like(yz_error, float("nan")),
-        )
-        state["prev_hole_x"] = torch.where(
-            insert_region,
-            hole_x,
-            torch.full_like(hole_x, float("nan")),
-        )
-
-        return self._export_rlt_local_policy_info(state)
 
     @staticmethod
     def _shape_str(value) -> str:
@@ -1319,7 +704,13 @@ class EnvWorker(Worker):
                 intervene_actions = final_info["intervene_action"]
                 intervene_flags = final_info["intervene_flag"]
 
-        policy_info = self._update_rlt_local_policy_state(infos, chunk_dones, stage_id)
+        policy_info = self.policy_info_adapter.update_stage(
+            infos=infos,
+            chunk_dones=chunk_dones,
+            stage_id=stage_id,
+            mode="train",
+            env=self.env_list[stage_id],
+        )
         if policy_info is not None:
             env_info["deviation_rate"] = (
                 policy_info["deviation"].float().mean().reshape(1).cpu()
@@ -1403,8 +794,12 @@ class EnvWorker(Worker):
                 for key in infos["episode"]:
                     env_info[key] = infos["episode"][key][newly_done].cpu()
 
-        policy_info = self._update_rlt_local_policy_state(
-            infos, chunk_dones, stage_id, mode="eval"
+        policy_info = self.policy_info_adapter.update_stage(
+            infos=infos,
+            chunk_dones=chunk_dones,
+            stage_id=stage_id,
+            mode="eval",
+            env=self.eval_env_list[stage_id],
         )
         if policy_info is not None:
             policy_info["expert_takeover"] = torch.zeros_like(
@@ -1881,7 +1276,11 @@ class EnvWorker(Worker):
                     ),
                     intervene_actions=None,
                     intervene_flags=None,
-                    policy_info=self._init_rlt_local_policy_state(stage_id),
+                    policy_info=self.policy_info_adapter.init_stage(
+                        stage_id=stage_id,
+                        mode="train",
+                        env=self.env_list[stage_id],
+                    ),
                 )
                 env_outputs.append(env_output)
         else:
@@ -1950,6 +1349,80 @@ class EnvWorker(Worker):
                     env_metrics[key].append(value)
             else:
                 env_metrics[key].append(value)
+
+    def _emit_rlt_rollout_status(
+        self,
+        env_metrics: dict[str, torch.Tensor],
+    ) -> None:
+        if not self._is_rlt_stage2_td3_cfg(self.cfg):
+            return
+        ready_value = metric_mean(env_metrics, "rlt_ready_for_online")
+        if ready_value is None:
+            return
+
+        ready_for_online = bool(ready_value >= 0.5)
+        in_critical_phase_rate = metric_mean(
+            env_metrics, "rlt_in_critical_phase", default=0.0
+        )
+        record_transition_rate = metric_mean(
+            env_metrics, "rlt_record_transition", default=0.0
+        )
+        student_control_rate = metric_mean(
+            env_metrics, "student_control_rate", default=0.0
+        )
+        phase = resolve_rollout_phase(
+            ready_for_online=ready_for_online,
+            student_control_rate=float(student_control_rate),
+        )
+        phase_numeric_id = phase_id(phase)
+
+        status_like = env_metrics["rlt_ready_for_online"].detach().float().reshape(-1)
+        env_metrics["rlt_status_phase_id"] = torch.full_like(
+            status_like,
+            float(phase_numeric_id),
+        )
+        env_metrics["rlt_status_ready_for_online"] = torch.full_like(
+            status_like,
+            float(ready_for_online),
+        )
+        env_metrics["rlt_status_in_critical_phase_rate"] = torch.full_like(
+            status_like,
+            float(in_critical_phase_rate),
+        )
+        env_metrics["rlt_status_record_transition_rate"] = torch.full_like(
+            status_like,
+            float(record_transition_rate),
+        )
+        env_metrics["rlt_status_student_control_rate"] = torch.full_like(
+            status_like,
+            float(student_control_rate),
+        )
+
+        if self._rank == 0 and phase != self._last_logged_status_phase:
+            self.log_info(
+                "[RLT_STATUS][env] "
+                f"phase={phase} ready={int(ready_for_online)} "
+                f"critical={float(in_critical_phase_rate):.2f} "
+                f"record={float(record_transition_rate):.2f} "
+                f"student={float(student_control_rate):.2f}"
+            )
+            self._last_logged_status_phase = phase
+
+        status_dir = os.path.join(self.cfg.runner.logger.log_path, "status")
+        write_status_json(
+            os.path.join(status_dir, f"rlt_env_status_rank{self._rank}.json"),
+            {
+                "timestamp": utc_timestamp(),
+                "component": "env",
+                "rank": self._rank,
+                "phase": phase,
+                "phase_id": phase_numeric_id,
+                "ready_for_online": ready_for_online,
+                "in_critical_phase_rate": float(in_critical_phase_rate),
+                "record_transition_rate": float(record_transition_rate),
+                "student_control_rate": float(student_control_rate),
+            },
+        )
 
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
@@ -2215,6 +1688,7 @@ class EnvWorker(Worker):
 
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+        self._emit_rlt_rollout_status(env_metrics)
 
         return env_metrics
 

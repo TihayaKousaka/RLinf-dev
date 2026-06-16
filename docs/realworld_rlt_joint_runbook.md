@@ -222,29 +222,37 @@ ray status
 7. 第一次 smoke 把 `max_joint_delta` 调小，例如 `0.03`。
 8. 真机在线训练必须有人盯机器人、日志、键盘奖励和急停。
 
-检查 Franka controller：
+在 slave 上启动 Ray、设置好硬件环境变量后，先跑统一自检：
+
+```bash
+python -m toolkits.realworld_check.check_realworld_rlt_stack
+```
+
+这个脚本会一次性检查：
+
+- `rlt_stage2_realworld_joint.yaml` 和 `realworld_rlt_joint_peg_insertion.yaml` 里的关键占位符是否还没替换。
+- Franka IP、controller ready、7D joint state、TCP pose 是否可读。
+- `main_camera` 和 `wrist_camera` 的 serial/type 是否能逐个取流，并报告实际 FPS。
+- GELLO 串口是否存在、是否能读到 7D joint 和 gripper。
+- `RLINF_KEYBOARD_DEVICE` 是否可读，并且是否支持 `a/b/c/v`。
+
+如果某台机器只想先做局部检查，可以跳过部分硬件项：
+
+```bash
+python -m toolkits.realworld_check.check_realworld_rlt_stack \
+  --skip-franka --skip-cameras
+```
+
+单项原始脚本仍可用于交互式排查：
 
 ```bash
 export FRANKA_ROBOT_IP=<Franka IP>
 python -m toolkits.realworld_check.test_franka_controller
-```
-
-脚本提示后可以输入 `getpos_euler` 查看当前末端位姿。RLT joint 配置真正用于 reset 的是 7D joint qpos，不是 EE reset pose；如果需要记录当前关节角，请用现场控制/状态工具读取 Franka 7 个关节位置后填入 YAML。
-
-检查相机：
-
-```bash
 python -m toolkits.realworld_check.test_franka_camera
-```
-
-检查 GELLO：
-
-```bash
-ls /dev/serial/by-id/
 python rlinf/envs/realworld/common/gello/gello_expert.py --port /dev/serial/by-id/<your-gello-port>
 ```
 
-GELLO 读不到数据时不要打开 `use_gello`。
+统一自检里任何硬件项 `FAIL` 时都不要开始 Stage2。GELLO 读不到数据时不要打开 `use_gello`。
 
 ## 4. YAML 需要改什么
 
@@ -584,7 +592,33 @@ env:
 
 ## 10. Stage2 现场操作
 
-Stage2 分四个阶段看：
+Stage2 运行时会在日志里输出固定格式的在线切换状态：
+
+```text
+[RLT_STATUS][actor] phase=warmup ready=0 buffer_ready=0 replay=42/100 update=0/1000 pending=0
+[RLT_STATUS][env] phase=warmup ready=0 critical=1.00 record=1.00 student=0.00
+```
+
+同时会写只读状态文件：
+
+```text
+${runner.logger.log_path}/status/rlt_actor_status_rank0.json
+${runner.logger.log_path}/status/rlt_env_status_rank0.json
+```
+
+现场可以直接查看：
+
+```bash
+watch -n 1 'cat ../results/status/rlt_actor_status_rank0.json; cat ../results/status/rlt_env_status_rank0.json'
+```
+
+`phase` 有三个值：
+
+1. `warmup`：replay 还没达到 `warmup_min_size`，还在收 warmup 数据。
+2. `warmup_wait_online`：replay 已经够了，后台 learner 正在补 `warmup_post_collect_updates`。
+3. `online`：`update_step >= warmup_post_collect_updates`，`ready_for_online=true`，后续尝试可以让 Stage2 actor 上场。
+
+Stage2 现场操作按四个阶段看：
 
 1. `replay_size < warmup_min_size`：收 warmup 数据。看老策略表现，GELLO 只救命，不做纠偏教学。
 2. `replay_size >= warmup_min_size` 但 `update_step < warmup_post_collect_updates`：材料够了但还在训练。继续按 warmup 规则操作，或让机器人停着等后台更新。
