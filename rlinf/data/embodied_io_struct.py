@@ -29,10 +29,6 @@ from rlinf.utils.nested_dict_process import (
     stack_list_of_dict_tensor,
 )
 
-_RLT_SOURCE_HUMAN = 2
-_RLT_SOURCE_MIXED = 3
-
-
 def get_model_weights_id(versions: torch.Tensor) -> str:
     """
     Get the model weights id from the tensor.
@@ -54,7 +50,6 @@ class EnvOutput:
 
     obs: dict[str, Any]
     final_obs: Optional[dict[str, Any]] = None
-    step_obs: Optional[dict[str, Any]] = None
     dones: Optional[torch.Tensor] = None  # [B]
     terminations: Optional[torch.Tensor] = None  # [B]
     truncations: Optional[torch.Tensor] = None  # [B]
@@ -63,18 +58,12 @@ class EnvOutput:
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
-    policy_info: Optional[dict[str, torch.Tensor]] = None
 
     def __post_init__(self):
         self.obs = put_tensor_device(self.obs, "cpu")
         self.final_obs = (
             put_tensor_device(self.final_obs, "cpu")
             if self.final_obs is not None
-            else None
-        )
-        self.step_obs = (
-            put_tensor_device(self.step_obs, "cpu")
-            if self.step_obs is not None
             else None
         )
         self.dones = self.dones.cpu().contiguous() if self.dones is not None else None
@@ -106,8 +95,6 @@ class EnvOutput:
             if self.intervene_flags is not None
             else None
         )
-        if self.policy_info is not None:
-            self.policy_info = put_tensor_device(self.policy_info, "cpu")
 
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
         image_tensor = obs["main_images"] if "main_images" in obs else None
@@ -189,7 +176,7 @@ class EnvOutput:
             allow_partial_none: bool = False,
             fill_value: float | bool = 0,
         ) -> torch.Tensor | None:
-            values = [env_output[field_name] for env_output in env_outputs]
+            values = [env_output.get(field_name) for env_output in env_outputs]
             if all(value is None for value in values):
                 return None
 
@@ -254,8 +241,7 @@ class EnvOutput:
         merged_obs = _merge_obs_dicts([env_output["obs"] for env_output in env_outputs])
 
         merged_final_obs = None
-        final_obs_list = [env_output["final_obs"] for env_output in env_outputs]
-        step_obs_list = [env_output.get("step_obs", None) for env_output in env_outputs]
+        final_obs_list = [env_output.get("final_obs") for env_output in env_outputs]
         if any(final_obs is not None for final_obs in final_obs_list):
             # Some shards may not have done episodes in this step, so their final_obs
             # is None. Use obs as fallback to keep merged batch shape aligned.
@@ -264,31 +250,6 @@ class EnvOutput:
                 for env_output, final_obs in zip(env_outputs, final_obs_list)
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
-
-        merged_step_obs = None
-        if any(step_obs is not None for step_obs in step_obs_list):
-            if any(step_obs is None for step_obs in step_obs_list):
-                raise ValueError(
-                    "Inconsistent step_obs: some shards are None while others are present."
-                )
-            merged_step_obs = {}
-            assert step_obs_list[0] is not None
-            for key in step_obs_list[0].keys():
-                values = [step_obs[key] for step_obs in step_obs_list]
-                first_non_none = next(
-                    (value for value in values if value is not None), None
-                )
-                if first_non_none is None:
-                    merged_step_obs[key] = None
-                elif isinstance(first_non_none, torch.Tensor):
-                    merged_step_obs[key] = torch.cat(values, dim=1)
-                elif isinstance(first_non_none, list):
-                    merged_step_obs[key] = [
-                        [item for value in values for item in value[t]]
-                        for t in range(len(first_non_none))
-                    ]
-                else:
-                    merged_step_obs[key] = values
 
         merged_dones = _merge_optional_tensor_field("dones")
         merged_terminations = _merge_optional_tensor_field("terminations")
@@ -305,42 +266,10 @@ class EnvOutput:
             allow_partial_none=True,
             fill_value=False,
         )
-        policy_info_list = [env_output.get("policy_info") for env_output in env_outputs]
-        merged_policy_info = None
-        if any(policy_info is not None for policy_info in policy_info_list):
-            keys = set()
-            for policy_info in policy_info_list:
-                if policy_info is not None:
-                    keys.update(policy_info.keys())
-            merged_policy_info = {}
-            for key in keys:
-                values = []
-                ref_tensor = next(
-                    (
-                        policy_info[key]
-                        for policy_info in policy_info_list
-                        if policy_info is not None and key in policy_info
-                    ),
-                    None,
-                )
-                assert ref_tensor is not None
-                for env_output, policy_info in zip(env_outputs, policy_info_list):
-                    if policy_info is None or key not in policy_info:
-                        batch_size = _get_batch_size(env_output)
-                        values.append(
-                            torch.zeros(
-                                (batch_size, *ref_tensor.shape[1:]),
-                                dtype=ref_tensor.dtype,
-                            )
-                        )
-                    else:
-                        values.append(policy_info[key])
-                merged_policy_info[key] = torch.cat(values, dim=0)
         # turn to EnvOutput and turn to dict to call post init for tensor processing
         return EnvOutput(
             obs=merged_obs,
             final_obs=merged_final_obs,
-            step_obs=merged_step_obs,
             dones=merged_dones,
             terminations=merged_terminations,
             truncations=merged_truncations,
@@ -348,7 +277,6 @@ class EnvOutput:
             env_infos=merged_env_infos,
             intervene_actions=merged_intervene_actions,
             intervene_flags=merged_intervene_flags,
-            policy_info=merged_policy_info,
         ).to_dict()
 
     def to_dict(self) -> dict[str, Any]:
@@ -360,7 +288,6 @@ class EnvOutput:
             if self.final_obs is not None
             else None
         )
-        env_output_dict["step_obs"] = self.step_obs
         env_output_dict["dones"] = self.dones
         env_output_dict["terminations"] = self.terminations
         env_output_dict["truncations"] = self.truncations
@@ -368,7 +295,6 @@ class EnvOutput:
         env_output_dict["env_infos"] = self.env_infos
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
-        env_output_dict["policy_info"] = self.policy_info
 
         return env_output_dict
 
@@ -384,7 +310,6 @@ class RolloutResult:
     bootstrap_values: torch.Tensor = None  # [B, 1]
     save_flags: torch.Tensor = None  # [B, num_action_chunks]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
-    step_trace: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
 
     def __post_init__(self):
@@ -400,8 +325,6 @@ class RolloutResult:
             self.save_flags = self.save_flags.cpu().contiguous()
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
-        if self.step_trace:
-            self.step_trace = put_tensor_device(self.step_trace, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
 
@@ -436,24 +359,6 @@ class RolloutResult:
             merged_forward_inputs = {}
         else:
             merged_forward_inputs = cat_list_of_dict_tensor(forward_inputs_list)
-        step_trace_list = [
-            rollout_result.step_trace for rollout_result in rollout_results
-        ]
-        if all(not step_trace for step_trace in step_trace_list):
-            merged_step_trace = {}
-        else:
-            merged_step_trace = {}
-            keys = set()
-            for step_trace in step_trace_list:
-                keys.update(step_trace.keys())
-            for key in keys:
-                tensors = [
-                    step_trace[key]
-                    for step_trace in step_trace_list
-                    if key in step_trace
-                ]
-                if tensors:
-                    merged_step_trace[key] = torch.cat(tensors, dim=1)
         return RolloutResult(
             actions=merged_actions,
             prev_logprobs=merged_prev_logprobs,
@@ -461,7 +366,6 @@ class RolloutResult:
             bootstrap_values=merged_bootstrap_values,
             save_flags=merged_save_flags,
             forward_inputs=merged_forward_inputs,
-            step_trace=merged_step_trace,
             versions=merged_versions,
         )
 
@@ -478,7 +382,6 @@ class ChunkStepResult:
     terminations: torch.Tensor = None  # [B, 1]
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
-    step_trace: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
 
     def __post_init__(self):
@@ -498,8 +401,6 @@ class ChunkStepResult:
             self.rewards = self.rewards.cpu().contiguous()
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
-        if self.step_trace:
-            self.step_trace = put_tensor_device(self.step_trace, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
 
@@ -522,7 +423,6 @@ class Trajectory:
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
     forward_inputs: dict[str, Any] = field(default_factory=dict)
-    step_trace: dict[str, Any] = field(default_factory=dict)
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
@@ -670,7 +570,6 @@ class EmbodiedRolloutResult:
     forward_inputs: list[dict[str, Any]] = field(
         default_factory=list
     )  # trajectory_length
-    step_trace: list[dict[str, Any]] = field(default_factory=list)
 
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
@@ -697,17 +596,6 @@ class EmbodiedRolloutResult:
             self.versions.append(result.versions)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
-        if result.step_trace:
-            self.append_step_trace(result.step_trace)
-
-    def append_step_trace(self, step_trace: dict[str, Any] | None):
-        if step_trace:
-            if len(self.step_trace) >= len(self.actions):
-                raise ValueError(
-                    "Cannot append a step_trace without a matching action chunk. "
-                    f"Got {len(self.step_trace)=} and {len(self.actions)=}."
-                )
-            self.step_trace.append(step_trace)
 
     def mark_last_step_with_flags(self, save_flags: torch.Tensor):
         if not self.intervene_flags:
@@ -770,26 +658,6 @@ class EmbodiedRolloutResult:
                     last_fi["action_chunk"] = (
                         last_full_action.reshape(bsz, -1).cpu().contiguous()
                     )
-                if "source_chunk" in last_fi:
-                    source_chunk = last_fi["source_chunk"].clone()
-                    source_chunk = source_chunk.reshape(bsz, num_action_chunks)
-                    source_chunk[intervene_flags.to(source_chunk.device)] = (
-                        _RLT_SOURCE_HUMAN
-                    )
-                    last_fi["source_chunk"] = source_chunk.cpu().contiguous()
-                    last_fi["source"] = torch.where(
-                        source_chunk.eq(source_chunk[:, :1]).all(
-                            dim=1,
-                            keepdim=True,
-                        ),
-                        source_chunk[:, :1],
-                        torch.full(
-                            (bsz, 1),
-                            _RLT_SOURCE_MIXED,
-                            dtype=source_chunk.dtype,
-                            device=source_chunk.device,
-                        ),
-                    ).cpu().contiguous()
                 if "intervention_flags" in last_fi:
                     last_fi["intervention_flags"] = (
                         intervene_flags.cpu().contiguous()
@@ -818,7 +686,6 @@ class EmbodiedRolloutResult:
         self.prev_values.clear()
         self.versions.clear()
         self.forward_inputs.clear()
-        self.step_trace.clear()
         self.curr_obs.clear()
         self.next_obs.clear()
 
@@ -860,22 +727,6 @@ class EmbodiedRolloutResult:
             for key in trajectory.forward_inputs.keys():
                 trajectory.forward_inputs[key] = (
                     trajectory.forward_inputs[key].cpu().contiguous()
-                )
-
-        if len(self.step_trace) > 0:
-            if len(self.actions) > 0 and len(self.step_trace) != len(self.actions):
-                raise ValueError(
-                    "step_trace length must match action trajectory length, got "
-                    f"{len(self.step_trace)=} and {len(self.actions)=}."
-                )
-            if len(self.actions) == 0:
-                raise ValueError(
-                    "step_trace cannot be serialized without action chunks."
-                )
-            trajectory.step_trace = stack_list_of_dict_tensor(self.step_trace)
-            for key in trajectory.step_trace.keys():
-                trajectory.step_trace[key] = (
-                    trajectory.step_trace[key].cpu().contiguous()
                 )
 
         if len(self.curr_obs) > 0:
@@ -923,16 +774,6 @@ class EmbodiedRolloutResult:
             )
             for i in range(split_size):
                 splited_trajectories[i].forward_inputs = splited_forward_inputs[i]
-
-        if (
-            all_trajectory.step_trace is not None
-            and len(all_trajectory.step_trace) > 0
-        ):
-            splited_step_trace = split_dict_to_chunk(
-                all_trajectory.step_trace, split_size, dim=2
-            )
-            for i in range(split_size):
-                splited_trajectories[i].step_trace = splited_step_trace[i]
 
         for field_name in all_trajectory.__dataclass_fields__.keys():
             value = getattr(all_trajectory, field_name)
@@ -1006,20 +847,6 @@ def convert_trajectories_to_batch(
             ]
             if tensors:
                 batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
-
-    if trajectories[0].step_trace:
-        all_keys: set[str] = set()
-        for traj in trajectories:
-            all_keys.update(traj.step_trace.keys())
-        batch["step_trace"] = {}
-        for key in all_keys:
-            tensors = [
-                traj.step_trace[key]
-                for traj in trajectories
-                if key in traj.step_trace
-            ]
-            if tensors:
-                batch["step_trace"][key] = torch.cat(tensors, dim=2)
 
     # -------- tensor fields --------
     reference_trajectory = trajectories[0]

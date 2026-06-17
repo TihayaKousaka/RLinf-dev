@@ -206,6 +206,7 @@ class RealWorldEnv(gym.Env):
             self._reset_metrics(env_idx)
         else:
             self._reset_metrics()
+        self._normalize_policy_info(infos)
         return extracted_obs, infos
 
     def _wrap_obs(self, raw_obs):
@@ -303,7 +304,7 @@ class RealWorldEnv(gym.Env):
                     intervene_action[env_id] = env_intervene_action.copy()
         infos["intervene_action"] = to_tensor(intervene_action)
         infos["intervene_flag"] = to_tensor(intervene_flag)
-        self._inject_rlt_policy_info(infos)
+        self._normalize_policy_info(infos)
 
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset
@@ -418,18 +419,20 @@ class RealWorldEnv(gym.Env):
         infos["_elapsed_steps"] = dones
         return obs, infos
 
-    def _inject_rlt_policy_info(self, infos: dict[str, Any]) -> None:
+    def _normalize_policy_info(self, infos: dict[str, Any]) -> None:
         policy_info = infos.get("policy_info")
         if not isinstance(policy_info, dict):
             return
 
         for key, value in list(policy_info.items()):
-            if isinstance(value, str):
+            if key.startswith("_") or isinstance(value, str):
                 policy_info.pop(key, None)
+                infos.pop(key, None)
                 continue
-            tensor = self._rlt_policy_info_value_to_tensor(value)
+            tensor = self._policy_info_value_to_tensor(value)
             if tensor.numel() == 0:
                 policy_info.pop(key, None)
+                infos.pop(key, None)
                 continue
             if tensor.numel() == 1:
                 tensor = tensor.reshape(1).repeat(self.num_envs)
@@ -437,9 +440,10 @@ class RealWorldEnv(gym.Env):
                 tensor = tensor.reshape(self.num_envs, -1).squeeze(-1)
             policy_info[key] = tensor
             infos[key] = tensor
+            infos.pop(f"_{key}", None)
 
     @staticmethod
-    def _rlt_policy_info_value_to_tensor(value: Any) -> torch.Tensor:
+    def _policy_info_value_to_tensor(value: Any) -> torch.Tensor:
         if isinstance(value, torch.Tensor):
             return value
         if isinstance(value, np.ndarray):

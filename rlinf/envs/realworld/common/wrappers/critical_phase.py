@@ -69,7 +69,9 @@ class CriticalPhaseWrapper(gym.Wrapper):
         self.in_critical_phase = self.task_mode == "critical_phase"
         self.critical_phase_started_once = self.in_critical_phase
         self._key_was_down = False
-        return self.env.reset(seed=seed, options=options)
+        observation, info = self.env.reset(seed=seed, options=options)
+        self._inject_policy_info(info)
+        return observation, info
 
     def step(
         self, action: ActType

@@ -99,6 +99,7 @@ env:
     use_fixed_reset_state_ids: False
     wrap_obs_mode: rlt_openpi_joint  # Image + proprio + prompt wrapper.
     reward_mode: only_success
+    rlt_intervention: ${algorithm.intervention}
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
     init_params:
@@ -120,6 +121,8 @@ env:
     use_fixed_reset_state_ids: True
     wrap_obs_mode: rlt_openpi_joint
     reward_mode: only_success
+    rlt_intervention:
+      enable: False
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
     policy_mode: eval  # Deterministic eval; use train only for diagnostics.
@@ -155,7 +158,10 @@ rollout:
   expert_model:
     model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260531-16:37:53/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_8000/actor"
     precision: null
-    act_as_vla_reference: True  # Expert is VLA reference only.
+    rlt_stage2:
+      act_as_vla_reference: True  # Expert is VLA reference only.
+      load_feature_backbones: True
+      load_rl_token_model: False
   enable_torch_compile: False
   enable_cuda_graph: False
 

@@ -30,6 +30,7 @@ from rlinf.envs.maniskill.peg_insertion_side_variants import (
     is_peg_insertion_side_env_id,
     register_rlinf_peg_insertion_side_variants,
 )
+from rlinf.envs.maniskill.rlt_intervention import ManiSkillLocalCorrectionController
 
 __all__ = ["ManiskillEnv"]
 
@@ -222,6 +223,8 @@ class ManiskillEnv(gym.Env):
         self.cfg = cfg
         self.task_id = getattr(cfg.init_params, "id", None)
         self._is_peg_insertion_side = is_peg_insertion_side_env_id(self.task_id)
+        self.rlt_intervention_cfg = getattr(cfg, "rlt_intervention", None)
+        self.rlt_intervention_controller = None
 
         with open_dict(cfg):
             cfg.init_params.num_envs = num_envs
@@ -268,6 +271,7 @@ class ManiskillEnv(gym.Env):
         if self.record_metrics:
             self._init_metrics()
         self._init_persistent_done_state()
+        self._init_rlt_intervention_controller()
 
     @property
     def total_num_group_envs(self):
@@ -484,6 +488,44 @@ class ManiskillEnv(gym.Env):
         self.peg_success_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
+
+    def _init_rlt_intervention_controller(self):
+        if self.rlt_intervention_cfg is None:
+            self.rlt_intervention_controller = None
+            return
+        if not bool(self.rlt_intervention_cfg.get("enable", False)):
+            self.rlt_intervention_controller = None
+            return
+        if (
+            str(self.rlt_intervention_cfg.get("mode", "local_correction"))
+            != "local_correction"
+        ):
+            self.rlt_intervention_controller = None
+            return
+        if not self._is_peg_insertion_side:
+            raise ValueError(
+                "ManiSkill RLT local correction is only supported for peg-insertion tasks."
+            )
+        env = self.env.unwrapped
+        self.rlt_intervention_controller = ManiSkillLocalCorrectionController(
+            cfg=OmegaConf.create(
+                {
+                    "algorithm": {
+                        "intervention": OmegaConf.to_container(
+                            self.rlt_intervention_cfg,
+                            resolve=True,
+                        )
+                    }
+                }
+            ),
+            batch_size=self.num_envs,
+            mode="train",
+            hole_radii=getattr(env, "box_hole_radii", None),
+        )
+
+    def _reset_rlt_intervention_controller(self):
+        if self.rlt_intervention_controller is not None:
+            self._init_rlt_intervention_controller()
 
     def _reset_peg_insertion_event_state(self, env_idx=None):
         if not self._is_peg_insertion_side:
@@ -737,6 +779,7 @@ class ManiskillEnv(gym.Env):
             self._reset_peg_insertion_event_state()
             self._reset_metrics()
         self._reset_persistent_done_state(options.get("env_idx"))
+        self._reset_rlt_intervention_controller()
         return extracted_obs, infos
 
     def step(
@@ -971,6 +1014,22 @@ class ManiskillEnv(gym.Env):
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
+
+        if self.rlt_intervention_controller is not None:
+            infos_last = infos_list[-1]
+            policy_info = self.rlt_intervention_controller.update(
+                infos=infos_last,
+                chunk_dones=torch.logical_or(
+                    raw_chunk_terminations,
+                    raw_chunk_truncations,
+                ),
+                intervention_enabled=True,
+            )
+            infos_last["policy_info"] = policy_info
+            for key, value in policy_info.items():
+                if isinstance(value, torch.Tensor):
+                    infos_last[key] = value
+            infos_list[-1] = infos_last
 
         if past_dones.any() and self.auto_reset:
             obs_list[-1], infos_list[-1] = self._handle_auto_reset(

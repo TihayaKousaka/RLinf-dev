@@ -193,6 +193,13 @@ class TrajectoryCache:
     def get_slot_length(self) -> Optional[int]:
         return self._traj_num_samples
 
+    def remove(self, trajectory_id: int) -> None:
+        if trajectory_id not in self.cache:
+            return
+        slot = self.cache.pop(trajectory_id)
+        self._traj_key_lengths.pop(trajectory_id, None)
+        self._slot_to_id.pop(slot, None)
+
     def put(self, trajectory_id: int, trajectory: dict):
         key_lengths = self._get_key_lengths(trajectory)
         max_num_samples = self._get_max_num_samples(key_lengths)
@@ -237,6 +244,7 @@ class TrajectoryReplayBuffer:
         enable_cache: bool = True,
         cache_size: int = 5,
         sample_window_size: int = 100,
+        max_num_samples: Optional[int] = None,
         auto_save: bool = False,
         auto_save_path: str = "",
         trajectory_format: str = "pt",
@@ -251,11 +259,15 @@ class TrajectoryReplayBuffer:
             cache_size: Maximum number of trajectories to cache in memory
             trajectory_format: Storage format ("pt", "pkl")
             sample_window_size: Number of trajectories to sample from for window cache
+            max_num_samples: Maximum active samples to keep. None keeps all samples.
             auto_save: Whether to automatically save trajectories to disk
         """
         self.trajectory_format = trajectory_format
         self.enable_cache = enable_cache
         self.sample_window_size = sample_window_size
+        self.max_num_samples = (
+            None if max_num_samples is None else max(0, int(max_num_samples))
+        )
         self.auto_save = auto_save
         self.logger = get_logger()
 
@@ -317,7 +329,7 @@ class TrajectoryReplayBuffer:
 
         # Buffer state
         self.size = 0  # Current number of trajectories
-        self._total_samples = 0  # Total number of samples across all trajectories
+        self._total_samples = 0  # Current number of active samples.
 
         # Random seed
         self.seed = seed
@@ -362,6 +374,7 @@ class TrajectoryReplayBuffer:
                 "trajectory_format": self.trajectory_format,
                 "size": self.size,
                 "total_samples": self._total_samples,
+                "max_num_samples": self.max_num_samples,
                 "trajectory_counter": self._trajectory_counter,
                 "seed": self.seed,
             }
@@ -496,6 +509,7 @@ class TrajectoryReplayBuffer:
                 self.size += 1
                 self._total_samples += num_samples
                 self._index_version += 1
+                self._evict_to_max_samples_locked(keep_trajectory_id=trajectory_id)
 
             if self._flat_trajectory_cache is not None:
                 self._flat_trajectory_cache.put(
@@ -513,6 +527,36 @@ class TrajectoryReplayBuffer:
                 self._save_trajectory_index()
 
             self._save_executor.submit(_flush_metadata)
+
+    def _evict_to_max_samples_locked(
+        self,
+        *,
+        keep_trajectory_id: int | None = None,
+    ) -> None:
+        """Evict oldest trajectories until the active sample cap is satisfied."""
+        if self.max_num_samples is None or self.max_num_samples <= 0:
+            return
+
+        while (
+            self._total_samples > self.max_num_samples
+            and len(self._trajectory_id_list) > 1
+        ):
+            evict_id = self._trajectory_id_list[0]
+            if keep_trajectory_id is not None and evict_id == keep_trajectory_id:
+                evict_id = self._trajectory_id_list[1]
+            self._trajectory_id_list.remove(evict_id)
+            evicted = self._trajectory_index.pop(evict_id, None)
+            self._trajectory_file_path.pop(evict_id, None)
+            if self._flat_trajectory_cache is not None:
+                self._flat_trajectory_cache.remove(evict_id)
+            if evicted is None:
+                continue
+            self.size = max(0, self.size - 1)
+            self._total_samples = max(
+                0,
+                self._total_samples - int(evicted.get("num_samples", 0)),
+            )
+            self._index_version += 1
 
     def _reshape_flat_for_save(self, value: object, T: int, B: int) -> object:
         if isinstance(value, torch.Tensor):
@@ -886,7 +930,7 @@ class TrajectoryReplayBuffer:
 
     @property
     def total_samples(self) -> int:
-        """Return total number of samples across all trajectories."""
+        """Return current number of active samples."""
         return self._total_samples
 
     def is_ready(self, min_size: int) -> bool:
@@ -911,12 +955,14 @@ class TrajectoryReplayBuffer:
         self.size = 0
         self._total_samples = 0
         self._trajectory_counter = 0
+        self._index_version += 1
 
     def get_stats(self) -> dict[str, float]:
         """Get buffer statistics."""
         stats = {
             "num_trajectories": self.size,
             "total_samples": self._total_samples,
+            "max_num_samples": float(self.max_num_samples or 0),
             "cache_size": len(self._flat_trajectory_cache.cache)
             if self._flat_trajectory_cache
             else 0,
@@ -969,17 +1015,20 @@ class TrajectoryReplayBuffer:
                     )
                 )
         else:
-            for trajectory_id in self._window_cache_ids:
-                model_weights_id = self._trajectory_index[trajectory_id][
-                    "model_weights_id"
+            with self._index_lock:
+                active_trajectories = [
+                    (trajectory_id, self._trajectory_index[trajectory_id])
+                    for trajectory_id in self._trajectory_id_list
+                    if trajectory_id in self._trajectory_index
                 ]
+            for trajectory_id, trajectory_info in active_trajectories:
+                model_weights_id = trajectory_info["model_weights_id"]
                 trajectory_path = self._get_trajectory_path(
                     trajectory_id, model_weights_id
                 )
                 if not os.path.isfile(trajectory_path):
                     continue
 
-                # copy trajectory file from trajectory_path to save_path
                 target_path = os.path.join(save_path, os.path.basename(trajectory_path))
                 save_futures.append(
                     self._checkpoint_executor.submit(
@@ -1025,6 +1074,11 @@ class TrajectoryReplayBuffer:
         if "seed" in metadata:
             self.seed = metadata["seed"]
             self._init_random_generator(self.seed)
+        if (
+            self.max_num_samples is None
+            and metadata.get("max_num_samples", None) is not None
+        ):
+            self.max_num_samples = int(metadata["max_num_samples"])
 
         # Load trajectory index and uuid list from save_path
         index_path = os.path.join(load_path, "trajectory_index.json")
@@ -1101,6 +1155,9 @@ class TrajectoryReplayBuffer:
             self.size = metadata.get("size", 0)
             self._total_samples = metadata.get("total_samples", 0)
             self._trajectory_counter = metadata.get("trajectory_counter", 0)
+
+        with self._index_lock:
+            self._evict_to_max_samples_locked()
 
         if self._flat_trajectory_cache is not None:
             self._flat_trajectory_cache.clear()

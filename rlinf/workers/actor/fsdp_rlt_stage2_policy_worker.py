@@ -241,13 +241,20 @@ class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
                 default_subdir,
             )
         fallback_capacity = 5 if capacity is None else int(capacity)
+        sample_window_size = int(
+            buffer_cfg.get(
+                "sample_window_size",
+                fallback_capacity,
+            )
+        )
+        if capacity is not None:
+            sample_window_size = max(sample_window_size, int(capacity))
         return TrajectoryReplayBuffer(
             seed=int(seed),
             enable_cache=bool(buffer_cfg.get("enable_cache", True)),
             cache_size=int(buffer_cfg.get("cache_size", fallback_capacity)),
-            sample_window_size=int(
-                buffer_cfg.get("sample_window_size", fallback_capacity)
-            ),
+            sample_window_size=sample_window_size,
+            max_num_samples=None if capacity is None else fallback_capacity,
             auto_save=bool(buffer_cfg.get("auto_save", False)),
             auto_save_path=os.path.join(str(auto_save_path), f"rank_{self._rank}"),
             trajectory_format=buffer_cfg.get("trajectory_format", "pt"),
@@ -606,22 +613,44 @@ class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
         cache = replay_buffer._flat_trajectory_cache
         if cache is None:
             return {"intervention_rate": 0.0, "human_chunk_rate": 0.0}
-        buffer = cache.get_buffer()
-        if not isinstance(buffer, dict):
+        interventions = []
+        source_chunks = []
+        for trajectory_id in replay_buffer._trajectory_id_list:
+            trajectory = cache.get(trajectory_id)
+            if trajectory is None and trajectory_id in replay_buffer._trajectory_index:
+                info = replay_buffer._trajectory_index[trajectory_id]
+                loaded = replay_buffer._load_trajectory(
+                    trajectory_id,
+                    info["model_weights_id"],
+                )
+                trajectory = replay_buffer._flatten_trajectory(loaded)
+            if not isinstance(trajectory, dict):
+                continue
+            forward_inputs = trajectory.get("forward_inputs")
+            if not isinstance(forward_inputs, dict):
+                continue
+            intervention = forward_inputs.get("intervention")
+            if isinstance(intervention, torch.Tensor) and intervention.numel() > 0:
+                interventions.append(intervention.detach().reshape(-1))
+            source_chunk = forward_inputs.get("source_chunk")
+            if isinstance(source_chunk, torch.Tensor) and source_chunk.numel() > 0:
+                source_chunks.append(source_chunk.detach())
+        if not interventions and not source_chunks:
             return {"intervention_rate": 0.0, "human_chunk_rate": 0.0}
-        forward_inputs = buffer.get("forward_inputs")
-        if not isinstance(forward_inputs, dict):
-            return {"intervention_rate": 0.0, "human_chunk_rate": 0.0}
-        intervention = forward_inputs.get("intervention")
-        source_chunk = forward_inputs.get("source_chunk")
         intervention_rate = (
-            float(intervention.detach().float().mean().item())
-            if isinstance(intervention, torch.Tensor) and intervention.numel() > 0
+            float(torch.cat(interventions).float().mean().item())
+            if interventions
             else 0.0
         )
         human_chunk_rate = 0.0
-        if isinstance(source_chunk, torch.Tensor) and source_chunk.numel() > 0:
-            source_chunk = source_chunk.detach().to(torch.uint8)
+        if source_chunks:
+            source_chunk = torch.cat(
+                [
+                    chunk.to(torch.uint8).reshape(chunk.shape[0], -1)
+                    for chunk in source_chunks
+                ],
+                dim=0,
+            )
             human_or_mixed = torch.logical_or(source_chunk == 2, source_chunk == 3)
             human_chunk_rate = float(human_or_mixed.any(dim=-1).float().mean().item())
         return {

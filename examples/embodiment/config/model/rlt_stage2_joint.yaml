@@ -29,5 +29,8 @@ rlt_stage2:
   mlp_num_hidden_layers: 2
   actor_noise_sigma: 0.1
   ref_action_dropout: 0.0
+  online_gate_updates: ${algorithm.warmup_post_collect_updates}
+  intervention_enabled: ${algorithm.intervention.enable}
+  intervention_mode: ${algorithm.intervention.mode}
   target_noise_sigma: 0.2
   target_noise_clip: 0.5

@@ -37,6 +37,7 @@ from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from .components import DirectGaussianActor, TwinQCritic, compute_td_target
 from .proprio import resolve_proprio_dim
 from .rl_token import RLTokenModel
+from .rollout import RLTStage2RolloutRouteConfig, route_rlt_stage2_rollout
 from .vla_wrapper import Stage2VLAWrapper
 
 
@@ -71,6 +72,34 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self.load_rl_token_model = bool(
             stage2_cfg.get("load_rl_token_model", self.load_feature_backbones)
         )
+        self.global_step = 0
+        for required_key in (
+            "online_gate_updates",
+            "intervention_enabled",
+            "intervention_mode",
+        ):
+            if required_key not in stage2_cfg:
+                raise ValueError(
+                    "RLT Stage2 config requires "
+                    f"rlt_stage2.{required_key}; do not rely on implicit rollout "
+                    "defaults."
+                )
+        self.online_gate_updates = int(stage2_cfg.online_gate_updates)
+        if self.online_gate_updates < 0:
+            raise ValueError(
+                "rlt_stage2.online_gate_updates must be >= 0, got "
+                f"{self.online_gate_updates}."
+            )
+        self.intervention_enabled = bool(stage2_cfg.intervention_enabled)
+        self.intervention_mode = str(stage2_cfg.intervention_mode)
+        if self.intervention_enabled and self.intervention_mode not in {
+            "local_correction",
+            "human_override",
+        }:
+            raise ValueError(
+                "rlt_stage2.intervention_mode must be 'local_correction' or "
+                f"'human_override', got {self.intervention_mode!r}."
+            )
 
         self.vla = None
         self.rl_token_model = None
@@ -164,6 +193,9 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
 
     def rollout_state_dict(self) -> dict[str, Any]:
         return self.filter_rollout_state_dict(self.state_dict())
+
+    def set_global_step(self, global_step: int) -> None:
+        self.global_step = int(global_step)
 
     def _require_feature_backbones(self, caller: str) -> None:
         if self.vla is None or self.rl_token_model is None:
@@ -359,8 +391,14 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self,
         env_obs,
         mode: Literal["train", "eval"] = "train",
+        env_infos: dict[str, Any] | None = None,
+        allow_expert: bool = True,
+        expert_model_getter=None,
+        enable_rlt_route: bool = True,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        del kwargs
+
         x, a_tilde, processed_obs = self._prepare_features(env_obs)
         deterministic = mode == "eval"
         if deterministic or self.act_as_vla_reference:
@@ -393,4 +431,33 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"].detach(),
             },
         }
-        return actions, result
+        if not enable_rlt_route:
+            return actions, result
+
+        policy_info = None
+        if isinstance(env_infos, dict) and isinstance(env_infos.get("policy_info"), dict):
+            policy_info = env_infos["policy_info"]
+        ready_for_online = self.global_step >= self.online_gate_updates
+        route = route_rlt_stage2_rollout(
+            env_obs=env_obs,
+            policy_info=policy_info,
+            student_model=self,
+            expert_model_getter=expert_model_getter,
+            model_kwargs={"mode": mode, "enable_rlt_route": False},
+            cfg=RLTStage2RolloutRouteConfig(
+                ready_for_online=ready_for_online,
+                online_gate_step=self.online_gate_updates,
+                intervention_enabled=self.intervention_enabled,
+                allow_expert=(
+                    mode == "train"
+                    and allow_expert
+                    and expert_model_getter is not None
+                    and self.intervention_enabled
+                ),
+                chunk_length=self.chunk_length,
+                action_dim=self.action_dim,
+            ),
+            student_prediction=(actions, result),
+        )
+        route.result["expert_label_flag"] = route.expert_label_flag
+        return route.actions, route.result

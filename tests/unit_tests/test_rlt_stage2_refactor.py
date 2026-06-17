@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 try:
@@ -34,6 +36,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 if torch is not None and _HAS_NUMPY:
+    from omegaconf import OmegaConf
     from torch.utils.data import DataLoader
 
     from rlinf.data.embodied_buffer_dataset import (
@@ -42,21 +45,28 @@ if torch is not None and _HAS_NUMPY:
     )
     from rlinf.data.embodied_io_struct import Trajectory
     from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+    from rlinf.envs.maniskill.rlt_intervention import (
+        ManiSkillLocalCorrectionController,
+    )
     from rlinf.models.embodiment.rlt_stage2.rollout import (
         COLLECTION_PHASE_ONLINE,
         COLLECTION_PHASE_WARMUP,
-        RLTStage2RolloutAdapter,
+        RLTStage2RolloutRouteConfig,
         TransitionSource,
+        route_rlt_stage2_rollout,
     )
+    from rlinf.models.embodiment.rlt_stage2.rlt_stage2_policy import RLTStage2Policy
     from rlinf.models.embodiment.rlt_stage2.trajectory_adapter import (
         RLTStage2TrajectoryReplayAdapter,
     )
     from rlinf.workers.actor.fsdp_rlt_stage2_policy_worker import (
         RLTStage2FSDPPolicyWorker,
     )
-    from rlinf.workers.env.policy_info_adapter import build_policy_info_adapter
-    from rlinf.workers.rollout.hf.huggingface_worker import _build_rollout_adapter
+    from rlinf.workers.env.env_worker import EnvWorker
+    from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
     from toolkits.rlt import inspect_rlt_replay
+else:
+    RLTStage2Policy = object
 
 
 class AttrDict(dict):
@@ -68,6 +78,15 @@ class AttrDict(dict):
 
     def __setattr__(self, key, value):
         self[key] = value
+
+
+ROOT = Path(__file__).resolve().parents[2]
+MANISKILL_STAGE2_CONFIG = (
+    ROOT / "examples/embodiment/config/rlt_stage2_maniskill_joint.yaml"
+)
+RLT_STAGE2_MODEL_CONFIG = (
+    ROOT / "examples/embodiment/config/model/rlt_stage2_joint.yaml"
+)
 
 
 def _cfg(
@@ -116,6 +135,107 @@ def _cfg(
             expert_model=AttrDict(act_as_vla_reference=False),
         ),
     )
+
+
+def test_maniskill_rlt_intervention_config_remains_user_tunable():
+    cfg = OmegaConf.load(MANISKILL_STAGE2_CONFIG)
+    model_cfg = OmegaConf.load(RLT_STAGE2_MODEL_CONFIG)
+    cfg = OmegaConf.merge(
+        OmegaConf.create({"actor": {"model": model_cfg}}),
+        cfg,
+    )
+
+    intervention = cfg.algorithm.intervention
+    expected_keys = {
+        "enable",
+        "mode",
+        "deviation_patience",
+        "takeover_chunks",
+        "takeover_max_chunks",
+        "safe_yz_margin",
+        "progress_eps",
+        "yz_error_eps",
+        "near_hole_x_min",
+        "near_hole_yz_margin",
+        "exit_hole_x_min",
+        "fallback_hole_radius",
+    }
+    assert expected_keys.issubset(set(intervention.keys()))
+    assert cfg.env.train.rlt_intervention is not None
+    assert OmegaConf.to_container(
+        cfg.env.train.rlt_intervention,
+        resolve=True,
+    ) == OmegaConf.to_container(intervention, resolve=True)
+    assert cfg.env.eval.rlt_intervention.enable is False
+
+    stage2_cfg = cfg.actor.model.rlt_stage2
+    assert stage2_cfg.online_gate_updates == cfg.algorithm.warmup_post_collect_updates
+    assert stage2_cfg.intervention_enabled is True
+    assert stage2_cfg.intervention_mode == "local_correction"
+
+    removed_grasp_phase_keys = {
+        "enable_grasp_phase",
+        "grasp_near_peg_dist",
+        "grasp_deviation_patience",
+        "grasp_takeover_chunks",
+        "grasp_takeover_max_chunks",
+    }
+    assert removed_grasp_phase_keys.isdisjoint(set(intervention.keys()))
+
+
+def test_maniskill_local_correction_uses_intervention_takeover_knobs():
+    controller = ManiSkillLocalCorrectionController(
+        cfg=OmegaConf.create(
+            {
+                "algorithm": {
+                    "intervention": {
+                        "enable": True,
+                        "mode": "local_correction",
+                        "deviation_patience": 1,
+                        "takeover_chunks": 2,
+                        "takeover_max_chunks": 3,
+                        "safe_yz_margin": 2.0,
+                        "progress_eps": 0.01,
+                        "yz_error_eps": 0.01,
+                        "near_hole_x_min": -0.03,
+                        "near_hole_yz_margin": 1.5,
+                        "exit_hole_x_min": -0.10,
+                        "fallback_hole_radius": 0.035,
+                    }
+                }
+            }
+        ),
+        batch_size=1,
+        mode="train",
+    )
+    infos = {
+        "consecutive_grasp_current": torch.tensor([True]),
+        "prealigned_current": torch.tensor([True]),
+        "partial_insert_current": torch.tensor([False]),
+        "success_current": torch.tensor([False]),
+        "peg_head_goal_yz_dist": torch.tensor([0.0]),
+        "peg_body_goal_yz_dist": torch.tensor([0.0]),
+        "peg_head_hole_x": torch.tensor([0.0]),
+        "peg_head_hole_abs_y": torch.tensor([0.0]),
+        "peg_head_hole_abs_z": torch.tensor([0.0]),
+    }
+    chunk_dones = torch.zeros((1, 2), dtype=torch.bool)
+
+    first = controller.update(
+        infos=infos,
+        chunk_dones=chunk_dones,
+        intervention_enabled=True,
+    )
+    second = controller.update(
+        infos=infos,
+        chunk_dones=chunk_dones,
+        intervention_enabled=True,
+    )
+
+    assert bool(first["expert_takeover"].item()) is False
+    assert bool(second["expert_takeover"].item()) is True
+    assert second["intervention_phase"].item() == controller.INSERT_PHASE
+    assert second["takeover_left"].item() == 2.0
 
 
 def _synthetic_rollout_trajectory() -> Trajectory:
@@ -253,29 +373,6 @@ def _synthetic_stride_rollout_trajectory() -> Trajectory:
             ),
             "record_transition": torch.ones((2, 1, 1), dtype=torch.bool),
         },
-        step_trace={
-            "anchor_offsets": torch.tensor(
-                [
-                    [[1]],
-                    [[1]],
-                ],
-                dtype=torch.long,
-            ),
-            "x": torch.tensor(
-                [
-                    [[[1.0, 1.1, 1.2]]],
-                    [[[11.0, 11.1, 11.2]]],
-                ],
-                dtype=torch.float32,
-            ),
-            "a_tilde": torch.tensor(
-                [
-                    [[[1.0, 1.0, 1.0, 1.0]]],
-                    [[[1.1, 1.1, 1.1, 1.1]]],
-                ],
-                dtype=torch.float32,
-            ),
-        },
     )
 
 
@@ -335,51 +432,45 @@ def test_trajectory_adapter_emits_standard_replay_trajectories():
     )
 
 
-def test_trajectory_adapter_builds_sparse_stride_transitions_from_step_trace():
+def test_trajectory_adapter_marks_env_side_override_as_human_source():
+    traj = _synthetic_rollout_trajectory()
+    traj.forward_inputs["source_chunk"] = torch.tensor(
+        [
+            [[int(TransitionSource.RL), int(TransitionSource.RL)]],
+            [[int(TransitionSource.RL), int(TransitionSource.RL)]],
+        ],
+        dtype=torch.uint8,
+    )
+    traj.forward_inputs["intervention_flags"] = torch.tensor(
+        [
+            [[False, False]],
+            [[False, True]],
+        ],
+        dtype=torch.bool,
+    )
+
+    adapter = RLTStage2TrajectoryReplayAdapter(_cfg())
+    replay_trajectories, _ = adapter.build_replay_trajectories(traj)
+    second_inputs = replay_trajectories[1].forward_inputs
+
+    assert second_inputs["source"].item() == TransitionSource.MIXED
+    assert (
+        second_inputs["source_chunk"].reshape(-1)
+        == torch.tensor(
+            [int(TransitionSource.RL), int(TransitionSource.HUMAN)],
+            dtype=torch.uint8,
+        )
+    ).all()
+    assert bool(second_inputs["intervention_flag"].item()) is True
+
+
+def test_trajectory_adapter_rejects_legacy_worker_step_trace_stride():
     adapter = RLTStage2TrajectoryReplayAdapter(
         _cfg(replay_subsample_stride=1),
     )
 
-    replay_trajectories, completed_episodes = adapter.build_replay_trajectories(
-        _synthetic_stride_rollout_trajectory()
-    )
-
-    assert completed_episodes == 1
-    assert len(replay_trajectories) == 4
-    first_inputs = replay_trajectories[0].forward_inputs
-    second_inputs = replay_trajectories[1].forward_inputs
-    terminal_inputs = replay_trajectories[-1].forward_inputs
-
-    torch.testing.assert_close(
-        first_inputs["x"].reshape(-1),
-        torch.tensor([0.0, 0.1, 0.2], dtype=torch.float32),
-    )
-    torch.testing.assert_close(
-        first_inputs["next_x"].reshape(-1),
-        torch.tensor([10.0, 10.1, 10.2], dtype=torch.float32),
-    )
-    assert first_inputs["source"].item() == TransitionSource.RL
-    assert first_inputs["dones"].item() == 0.0
-    assert first_inputs["step_id"].item() == 0
-
-    torch.testing.assert_close(
-        second_inputs["x"].reshape(-1),
-        torch.tensor([1.0, 1.1, 1.2], dtype=torch.float32),
-    )
-    torch.testing.assert_close(
-        second_inputs["next_x"].reshape(-1),
-        torch.tensor([11.0, 11.1, 11.2], dtype=torch.float32),
-    )
-    assert second_inputs["step_id"].item() == 1
-
-    assert terminal_inputs["source"].item() == TransitionSource.MIXED
-    assert bool(terminal_inputs["intervention_flag"].item()) is True
-    assert terminal_inputs["dones"].item() == 1.0
-    assert terminal_inputs["step_id"].item() == 3
-    torch.testing.assert_close(
-        terminal_inputs["next_x"].reshape(-1),
-        torch.tensor([20.0, 20.1, 20.2], dtype=torch.float32),
-    )
+    with pytest.raises(ValueError, match="generic env/rollout worker hooks"):
+        adapter.build_replay_trajectories(_synthetic_stride_rollout_trajectory())
 
 
 def test_rlt_replay_buffer_roundtrip_uses_rlinf_trajectory_format(tmp_path):
@@ -441,6 +532,153 @@ def test_rlt_replay_buffer_roundtrip_uses_rlinf_trajectory_format(tmp_path):
             "step_id",
         }
     )
+
+
+def test_rlt_replay_buffer_caps_active_samples_like_legacy_ring_buffer(tmp_path):
+    replay_trajectories = _build_replay_trajectories()
+    buffer = TrajectoryReplayBuffer(
+        seed=8,
+        enable_cache=True,
+        cache_size=8,
+        sample_window_size=8,
+        max_num_samples=3,
+        auto_save=False,
+        auto_save_path=str(tmp_path),
+        trajectory_format="pt",
+    )
+
+    buffer.add_trajectories(replay_trajectories)
+    buffer.add_trajectories(replay_trajectories)
+    first_active_ids = list(buffer._trajectory_id_list)
+    buffer.add_trajectories(replay_trajectories)
+    buffer.save_checkpoint(str(tmp_path / "checkpoint"))
+
+    assert buffer.total_samples == 3
+    assert buffer.is_ready(3)
+    assert not buffer.is_ready(4)
+    assert len(buffer) == 3
+    assert list(buffer._trajectory_id_list) == [3, 4, 5]
+    assert all(
+        trajectory_id not in buffer._trajectory_index
+        for trajectory_id in first_active_ids
+    )
+
+    batch = buffer.sample(3)
+    source_values = batch["forward_inputs"]["source"].reshape(-1).tolist()
+    assert all(
+        value in (int(TransitionSource.RL), int(TransitionSource.MIXED))
+        for value in source_values
+    )
+    buffer.close(wait=True)
+
+    loaded = TrajectoryReplayBuffer(
+        seed=8,
+        enable_cache=True,
+        cache_size=8,
+        sample_window_size=8,
+        max_num_samples=3,
+        auto_save=False,
+        auto_save_path=str(tmp_path / "loaded"),
+        trajectory_format="pt",
+    )
+    loaded.load_checkpoint(str(tmp_path / "checkpoint"))
+    assert loaded.total_samples == 3
+    assert len(loaded) == 3
+    assert list(loaded._trajectory_id_list) == [3, 4, 5]
+    loaded.close(wait=True)
+
+
+def test_rlt_replay_buffer_autosave_checkpoint_preserves_active_cap(tmp_path):
+    replay_trajectories = _build_replay_trajectories()
+    buffer = TrajectoryReplayBuffer(
+        seed=18,
+        enable_cache=True,
+        cache_size=2,
+        sample_window_size=8,
+        max_num_samples=3,
+        auto_save=True,
+        auto_save_path=str(tmp_path / "autosave"),
+        trajectory_format="pt",
+    )
+
+    buffer.add_trajectories(replay_trajectories)
+    buffer.add_trajectories(replay_trajectories)
+    buffer.add_trajectories(replay_trajectories)
+    buffer._save_executor.shutdown(wait=True)
+    buffer.save_checkpoint(str(tmp_path / "checkpoint"))
+
+    saved_files = sorted((tmp_path / "checkpoint").glob("trajectory_*.pt"))
+    assert len(saved_files) == 3
+
+    loaded = TrajectoryReplayBuffer(
+        seed=18,
+        enable_cache=True,
+        cache_size=2,
+        sample_window_size=8,
+        max_num_samples=3,
+        auto_save=False,
+        auto_save_path=str(tmp_path / "loaded"),
+        trajectory_format="pt",
+    )
+    loaded.load_checkpoint(str(tmp_path / "checkpoint"))
+
+    assert loaded.total_samples == 3
+    assert len(loaded) == 3
+    assert list(loaded._trajectory_id_list) == [3, 4, 5]
+    buffer.close(wait=True)
+    loaded.close(wait=True)
+
+
+def test_rlt_worker_replay_builder_uses_buffer_capacity_for_active_samples():
+    worker = object.__new__(RLTStage2FSDPPolicyWorker)
+    worker.cfg = AttrDict(
+        runner=AttrDict(
+            logger=AttrDict(
+                log_path="/tmp/rlinf-rlt-test",
+            ),
+        ),
+    )
+    worker._rank = 0
+
+    replay_buffer = RLTStage2FSDPPolicyWorker._build_trajectory_replay_buffer(
+        worker,
+        AttrDict(
+            enable_cache=True,
+            cache_size=2,
+            sample_window_size=1,
+            auto_save=False,
+            trajectory_format="pt",
+        ),
+        seed=9,
+        default_subdir="replay_buffer",
+        capacity=5,
+    )
+
+    assert replay_buffer.max_num_samples == 5
+    assert replay_buffer.sample_window_size == 5
+    replay_buffer.close(wait=True)
+
+
+def test_rlt_replay_stats_only_use_active_capped_samples(tmp_path):
+    replay_trajectories = _build_replay_trajectories()
+    buffer = TrajectoryReplayBuffer(
+        seed=10,
+        enable_cache=True,
+        cache_size=8,
+        sample_window_size=8,
+        max_num_samples=1,
+        auto_save=False,
+        auto_save_path=str(tmp_path),
+        trajectory_format="pt",
+    )
+    buffer.add_trajectories(replay_trajectories)
+
+    stats = RLTStage2FSDPPolicyWorker._rlt_replay_stats(buffer)
+
+    assert buffer.total_samples == 1
+    assert stats["intervention_rate"] == 0.5
+    assert stats["human_chunk_rate"] == 1.0
+    buffer.close(wait=True)
 
 
 def test_rlt_worker_training_batch_uses_replay_buffer_dataset():
@@ -610,114 +848,100 @@ def test_inspect_rlt_replay_reads_standard_replay_directory(tmp_path):
     assert summary["intervention_flag_rate"] == 0.5
 
 
-def test_realworld_policy_info_is_available_without_intervention():
-    adapter = build_policy_info_adapter(
-        _cfg(
-            env_type="realworld",
-            task_mode="full_task",
-            intervention_enable=False,
+def test_hf_rollout_predict_kwargs_only_use_declared_model_context():
+    class PlainKwargsModel:
+        def predict_action_batch(self, env_obs, mode="train", **kwargs):
+            del env_obs, mode
+            return kwargs
+
+    class ContextAwareModel:
+        def predict_action_batch(
+            self,
+            env_obs,
+            mode="train",
+            env_infos=None,
+            allow_expert=True,
+        ):
+            del env_obs, mode
+            return {"env_infos": env_infos, "allow_expert": allow_expert}
+
+    context = {
+        "env_infos": {"policy_info": {"expert_takeover": torch.ones(1, 1)}},
+        "allow_expert": False,
+        "expert_model_getter": lambda: None,
+    }
+    assert (
+        MultiStepRolloutWorker._filter_predict_kwargs(
+            PlainKwargsModel().predict_action_batch,
+            context,
+        )
+        == {}
+    )
+    filtered = MultiStepRolloutWorker._filter_predict_kwargs(
+        ContextAwareModel().predict_action_batch,
+        context,
+    )
+    assert set(filtered) == {"env_infos", "allow_expert"}
+    assert filtered["allow_expert"] is False
+
+
+def test_hf_rollout_predict_kwargs_can_pass_mode_without_model_type_hook():
+    class ModeAwareModel:
+        def predict_action_batch(self, env_obs, mode="train"):
+            del env_obs
+            return {"mode": mode}
+
+    filtered = MultiStepRolloutWorker._filter_predict_kwargs(
+        ModeAwareModel().predict_action_batch,
+        {"mode": "eval", "env_infos": {}, "allow_expert": False},
+    )
+    assert filtered == {"mode": "eval"}
+
+
+def test_env_worker_auto_reset_bootstrap_preserves_env_infos():
+    worker = object.__new__(EnvWorker)
+    worker.cfg = AttrDict(
+        env=AttrDict(
+            train=AttrDict(
+                auto_reset=True,
+            ),
         ),
-        train_batch_size=2,
-        eval_batch_size=2,
-    )
-
-    initial = adapter.init_stage(stage_id=0, mode="train", env=None)
-    assert initial is not None
-    assert initial["in_critical_phase"].tolist() == [[False], [False]]
-    assert initial["record_transition"].tolist() == [[False], [False]]
-
-    updated = adapter.update_stage(
-        infos={
-            "policy_info": {
-                "in_critical_phase": torch.tensor([[True], [False]]),
-                "record_transition": torch.tensor([[True], [False]]),
-            }
-        },
-        chunk_dones=torch.tensor([[False, False], [True, False]]),
-        stage_id=0,
-        mode="train",
-        env=None,
-    )
-    assert updated["in_critical_phase"].tolist() == [[True], [False]]
-    assert updated["record_transition"].tolist() == [[True], [False]]
-    assert "grasp_deviation_count" not in updated
-
-
-def test_rlt_stage2_policy_info_drops_grasp_intervention_residue():
-    adapter = build_policy_info_adapter(
-        _cfg(
-            env_type="realworld",
-            task_mode="critical_phase",
-            intervention_enable=True,
+        actor=AttrDict(
+            model=AttrDict(
+                num_action_chunks=2,
+            ),
         ),
-        train_batch_size=1,
-        eval_batch_size=1,
     )
-
-    initial = adapter.init_stage(stage_id=0, mode="train", env=None)
-    assert initial is not None
-    assert "grasp_deviation_count" not in initial
-
-    updated = adapter.update_stage(
-        infos={
+    worker.train_num_envs_per_stage = 1
+    worker.stage_num = 1
+    worker.last_obs_list = [
+        {
+            "states": torch.zeros((1, 3), dtype=torch.float32),
+            "main_images": None,
+            "wrist_images": None,
+            "extra_view_images": None,
+            "task_descriptions": ["insert"],
+        }
+    ]
+    worker.last_env_infos_list = [
+        {
             "policy_info": {
-                "expert_takeover": torch.tensor([[False]]),
-                "deviation": torch.tensor([[True]]),
-                "deviation_count": torch.tensor([[2.0]]),
-                "intervention_phase": torch.tensor([[2.0]]),
-                "takeover_left": torch.tensor([[1.0]]),
-                "takeover_used": torch.tensor([[3.0]]),
-                "in_critical_phase": torch.tensor([[True]]),
-                "record_transition": torch.tensor([[True]]),
-                "grasp_deviation_count": torch.tensor([[7.0]]),
+                "in_critical_phase": torch.tensor([[False]]),
+                "record_transition": torch.tensor([[False]]),
             }
-        },
-        chunk_dones=torch.tensor([[False, False]]),
-        stage_id=0,
-        mode="train",
-        env=None,
-    )
-    assert "grasp_deviation_count" not in updated
+        }
+    ]
+    worker.last_intervened_info_list = [(None, None)]
 
-    env_metrics = {}
-    adapter.collect_rollout_metrics(
-        env_metrics=env_metrics,
-        rollout_result=type(
-            "FakeRolloutResult",
-            (),
-            {
-                "forward_inputs": {
-                    "intervention_flags": torch.tensor([[True, False]]),
-                    "intervention_phase": torch.tensor([[2.0]]),
-                    "intervention_requested": torch.tensor([[True]]),
-                    "ready_for_online": torch.tensor([[True]]),
-                    "in_critical_phase": torch.tensor([[True]]),
-                    "record_transition": torch.tensor([[True]]),
-                    "student_control": torch.tensor([[True]]),
-                }
-            },
-        )(),
-    )
-    assert "grasp_intervention_rate" not in env_metrics
-    assert "insert_intervention_rate" in env_metrics
+    env_outputs = EnvWorker.bootstrap_step(worker)
 
-
-def test_policy_info_adapter_factory_uses_model_plugin_discovery():
-    rlt_adapter = build_policy_info_adapter(
-        _cfg(env_type="realworld"),
-        train_batch_size=2,
-        eval_batch_size=2,
-    )
-    assert rlt_adapter.__class__.__name__ == "RLTStage2PolicyInfoAdapter"
-
-    cfg = _cfg(env_type="realworld", warmup_updates=0)
-    cfg.actor.model.model_type = "openpi"
-    noop_adapter = build_policy_info_adapter(
-        cfg,
-        train_batch_size=2,
-        eval_batch_size=2,
-    )
-    assert noop_adapter.__class__.__name__ == "NoopPolicyInfoAdapter"
+    assert len(env_outputs) == 1
+    assert env_outputs[0].env_infos is not None
+    policy_info = env_outputs[0].env_infos["policy_info"]
+    assert policy_info["in_critical_phase"].shape == (1, 1)
+    assert policy_info["record_transition"].shape == (1, 1)
+    assert bool(policy_info["in_critical_phase"].item()) is False
+    assert bool(policy_info["record_transition"].item()) is False
 
 
 class _FakeStudentModel:
@@ -753,19 +977,103 @@ class _FakeExpertModel:
         return torch.full((1, 2, 2), 9.0), {}
 
 
-def test_rollout_adapter_routes_warmup_base_then_online_human_override():
+class _FakeRLTStage2Policy(RLTStage2Policy):
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+        self.chunk_length = 2
+        self.action_dim = 2
+        self.action_chunk_dim = 4
+        self.global_step = 0
+        self.online_gate_updates = 5
+        self.intervention_enabled = True
+        self.intervention_mode = "human_override"
+        self.act_as_vla_reference = False
+
+    def _prepare_features(self, env_obs):
+        del env_obs
+        x = torch.ones((1, 3), dtype=torch.float32)
+        a_tilde = torch.tensor([[0.1, 0.2, 0.3, 0.4]], dtype=torch.float32)
+        processed_obs = {
+            "tokenized_prompt": torch.ones((1, 2), dtype=torch.int64),
+            "tokenized_prompt_mask": torch.ones((1, 2), dtype=torch.bool),
+        }
+        return x, a_tilde, processed_obs
+
+    def actor_forward(
+        self,
+        x,
+        a_tilde,
+        *,
+        deterministic=False,
+        apply_ref_dropout=None,
+        apply_action_noise=None,
+    ):
+        del x, a_tilde, deterministic, apply_ref_dropout, apply_action_noise
+        return torch.tensor([[1.0, 1.0, 2.0, 2.0]], dtype=torch.float32)
+
+
+def test_rlt_stage2_policy_predict_action_batch_owns_online_route():
+    policy = _FakeRLTStage2Policy()
     expert = _FakeExpertModel()
-    adapter = RLTStage2RolloutAdapter(
-        cfg=_cfg(
-            env_type="realworld",
-            intervention_enable=True,
-            intervention_mode="human_override",
-            warmup_updates=5,
-        ),
-        student_model=_FakeStudentModel(),
+    env_infos = {
+        "policy_info": {
+            "expert_takeover": torch.tensor([[True]]),
+            "in_critical_phase": torch.tensor([[True]]),
+            "record_transition": torch.tensor([[True]]),
+            "intervention_phase": torch.tensor([[2.0]]),
+        }
+    }
+
+    warmup_actions, warmup_result = policy.predict_action_batch(
+        env_obs={"states": torch.zeros((1, 3))},
+        mode="train",
+        env_infos=env_infos,
         expert_model_getter=lambda: expert,
-        has_expert_model_config=True,
     )
+    torch.testing.assert_close(
+        warmup_actions,
+        torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+    )
+    assert bool(warmup_result["forward_inputs"]["ready_for_online"].item()) is False
+    assert warmup_result["expert_label_flag"] is False
+
+    policy.set_global_step(5)
+    online_actions, online_result = policy.predict_action_batch(
+        env_obs={"states": torch.zeros((1, 3))},
+        mode="train",
+        env_infos=env_infos,
+        expert_model_getter=lambda: expert,
+    )
+    torch.testing.assert_close(online_actions, torch.full((1, 2, 2), 9.0))
+    assert bool(online_result["forward_inputs"]["ready_for_online"].item()) is True
+    assert online_result["expert_label_flag"] is True
+
+
+def _route(
+    *,
+    ready_for_online: bool,
+    policy_info: dict[str, torch.Tensor],
+    expert_model_getter,
+):
+    return route_rlt_stage2_rollout(
+        env_obs={"states": torch.zeros((1, 3))},
+        policy_info=policy_info,
+        student_model=_FakeStudentModel(),
+        expert_model_getter=expert_model_getter,
+        model_kwargs={"mode": "train"},
+        cfg=RLTStage2RolloutRouteConfig(
+            ready_for_online=ready_for_online,
+            online_gate_step=5,
+            intervention_enabled=True,
+            allow_expert=True,
+            chunk_length=2,
+            action_dim=2,
+        ),
+    )
+
+
+def test_rlt_stage2_route_warmup_base_then_online_human_override():
+    expert = _FakeExpertModel()
     policy_info = {
         "expert_takeover": torch.tensor([[True]]),
         "in_critical_phase": torch.tensor([[True]]),
@@ -773,13 +1081,10 @@ def test_rollout_adapter_routes_warmup_base_then_online_human_override():
         "intervention_phase": torch.tensor([[2.0]]),
     }
 
-    warmup = adapter.predict(
-        env_obs={"states": torch.zeros((1, 3))},
+    warmup = _route(
+        ready_for_online=False,
         policy_info=policy_info,
-        model_kwargs={"mode": "train"},
-        mode="train",
-        allow_expert=True,
-        update_version=4,
+        expert_model_getter=lambda: expert,
     )
     torch.testing.assert_close(
         warmup.actions,
@@ -792,13 +1097,10 @@ def test_rollout_adapter_routes_warmup_base_then_online_human_override():
         == int(TransitionSource.BASE)
     ).all()
 
-    online = adapter.predict(
-        env_obs={"states": torch.zeros((1, 3))},
+    online = _route(
+        ready_for_online=True,
         policy_info=policy_info,
-        model_kwargs={"mode": "train"},
-        mode="train",
-        allow_expert=True,
-        update_version=5,
+        expert_model_getter=lambda: expert,
     )
     torch.testing.assert_close(
         online.actions,
@@ -817,18 +1119,15 @@ def test_rollout_adapter_routes_warmup_base_then_online_human_override():
         == COLLECTION_PHASE_ONLINE
     )
 
-    autonomous_online = adapter.predict(
-        env_obs={"states": torch.zeros((1, 3))},
+    autonomous_online = _route(
+        ready_for_online=True,
         policy_info={
             "expert_takeover": torch.tensor([[False]]),
             "in_critical_phase": torch.tensor([[True]]),
             "record_transition": torch.tensor([[True]]),
             "intervention_phase": torch.tensor([[0.0]]),
         },
-        model_kwargs={"mode": "train"},
-        mode="train",
-        allow_expert=True,
-        update_version=5,
+        expert_model_getter=lambda: expert,
     )
     torch.testing.assert_close(
         autonomous_online.actions,
@@ -841,18 +1140,15 @@ def test_rollout_adapter_routes_warmup_base_then_online_human_override():
         == int(TransitionSource.RL)
     ).all()
 
-    online_before_critical_phase = adapter.predict(
-        env_obs={"states": torch.zeros((1, 3))},
+    online_before_critical_phase = _route(
+        ready_for_online=True,
         policy_info={
             "expert_takeover": torch.tensor([[False]]),
             "in_critical_phase": torch.tensor([[False]]),
             "record_transition": torch.tensor([[False]]),
             "intervention_phase": torch.tensor([[0.0]]),
         },
-        model_kwargs={"mode": "train"},
-        mode="train",
-        allow_expert=True,
-        update_version=5,
+        expert_model_getter=lambda: expert,
     )
     torch.testing.assert_close(
         online_before_critical_phase.actions,
@@ -874,68 +1170,3 @@ def test_rollout_adapter_routes_warmup_base_then_online_human_override():
         ].item()
         is False
     )
-
-
-def test_hf_rollout_adapter_factory_keeps_rlt_out_of_generic_worker():
-    noop_cfg = _cfg()
-    noop_cfg.algorithm.loss_type = "embodied_dagger"
-    noop_cfg.actor.model.model_type = "openpi"
-    noop_adapter = _build_rollout_adapter(
-        cfg=noop_cfg,
-        student_model=_FakeStudentModel(),
-        expert_model_getter=lambda: _FakeExpertModel(),
-        has_expert_model_config=False,
-    )
-    assert noop_adapter.enabled is False
-    assert noop_adapter.predict(
-        env_obs={"states": torch.zeros((1, 3))},
-        policy_info=None,
-        model_kwargs={"mode": "train"},
-        mode="train",
-        allow_expert=True,
-        update_version=0,
-    ) is None
-    assert noop_adapter.final_forward_inputs({"forward_inputs": {"x": 1}}) == {}
-
-    rlt_adapter = _build_rollout_adapter(
-        cfg=_cfg(env_type="realworld", warmup_updates=0),
-        student_model=_FakeStudentModel(),
-        expert_model_getter=lambda: _FakeExpertModel(),
-        has_expert_model_config=False,
-    )
-    assert rlt_adapter.enabled is True
-    assert rlt_adapter.use_dagger_beta() is False
-    assert rlt_adapter.allow_bootstrap_values() is False
-
-
-def test_rollout_adapter_encodes_sparse_step_trace_without_env_dependencies():
-    adapter = RLTStage2RolloutAdapter(
-        cfg=_cfg(
-            env_type="realworld",
-            intervention_enable=False,
-            warmup_updates=0,
-            replay_subsample_stride=1,
-        ),
-        student_model=_FakeStudentModel(),
-        expert_model_getter=lambda: _FakeExpertModel(),
-        has_expert_model_config=False,
-    )
-
-    trace = adapter.encode_step_trace(
-        {
-            "states": torch.tensor(
-                [
-                    [[2.0, 2.1, 2.2]],
-                ],
-                dtype=torch.float32,
-            ),
-            "_rlt_step_offsets": torch.tensor([[1]], dtype=torch.long),
-        }
-    )
-
-    assert trace["anchor_offsets"].tolist() == [[1]]
-    torch.testing.assert_close(
-        trace["x"],
-        torch.tensor([[[2.0, 2.1, 2.2]]], dtype=torch.float32),
-    )
-    assert trace["a_tilde"].shape == (1, 1, 4)
