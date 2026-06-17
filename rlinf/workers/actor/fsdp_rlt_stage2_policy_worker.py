@@ -31,11 +31,12 @@ from rlinf.data.embodied_buffer_dataset import (
 )
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
-from rlinf.scheduler import Worker
+from rlinf.scheduler import Channel, Worker
 from rlinf.utils.distributed import all_reduce_dict
-from rlinf.utils.metric_utils import append_to_dict
-from rlinf.utils.nested_dict_process import put_tensor_device
-from rlinf.utils.utils import collect_param_names_need_sync
+from rlinf.utils.metric_utils import append_to_dict, compute_split_num
+from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
+from rlinf.utils.utils import clear_memory, collect_param_names_need_sync
+from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 from ...models.embodiment.rlt_stage2.components import actor_loss, critic_loss
 from ...models.embodiment.rlt_stage2.schedule import (
@@ -47,14 +48,16 @@ from ...models.embodiment.rlt_stage2.schedule import (
 from ...models.embodiment.rlt_stage2.trajectory_adapter import (
     RLTStage2TrajectoryReplayAdapter,
 )
-from .embodied_offpolicy_worker import EmbodiedOffPolicyFSDPActor
 
 
-class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
+class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
 
+        self.replay_buffer: TrajectoryReplayBuffer | None = None
+        self.demo_buffer: TrajectoryReplayBuffer | None = None
         self.trajectory_adapter: RLTStage2TrajectoryReplayAdapter | None = None
+        self.update_step = 0
         self.qf_optimizer = None
         self.qf_lr_scheduler = None
         self.training_scheduler = RLTStage2TrainingScheduler()
@@ -147,14 +150,28 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
         demo_capacity = (
             None if demo_cfg is None else int(demo_cfg.get("capacity", capacity))
         )
-        self.init_trajectory_replay_buffers(
-            replay_cfg=replay_cfg,
-            replay_seed=int(self.cfg.actor.get("seed", 1234)) + self._rank,
-            replay_capacity=capacity,
-            demo_cfg=demo_cfg,
-            demo_seed=int(self.cfg.actor.get("seed", 1234)) + self._rank + 17,
-            demo_capacity=demo_capacity,
+        self.replay_buffer = self._build_trajectory_replay_buffer(
+            replay_cfg,
+            seed=int(self.cfg.actor.get("seed", 1234)) + self._rank,
+            default_subdir="replay_buffer",
+            capacity=capacity,
         )
+        if demo_cfg is None:
+            self.demo_buffer = None
+        else:
+            self.demo_buffer = self._build_trajectory_replay_buffer(
+                demo_cfg,
+                seed=int(self.cfg.actor.get("seed", 1234)) + self._rank + 17,
+                default_subdir="demo_buffer",
+                capacity=demo_capacity,
+            )
+            if demo_cfg.get("load_path", None) is not None:
+                self.demo_buffer.load_checkpoint(
+                    demo_cfg.load_path,
+                    is_distributed=True,
+                    local_rank=self._rank,
+                    world_size=self._world_size,
+                )
         if self.replay_buffer is None:
             raise RuntimeError("RLT Stage2 replay buffer failed to initialize.")
 
@@ -207,6 +224,35 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
         )
         self.buffer_dataloader_iter = iter(self.buffer_dataloader)
 
+    def _build_trajectory_replay_buffer(
+        self,
+        buffer_cfg: Any,
+        *,
+        seed: int,
+        default_subdir: str,
+        capacity: int | None = None,
+    ) -> TrajectoryReplayBuffer:
+        auto_save_path = buffer_cfg.get("auto_save_path", None)
+        if auto_save_path is None:
+            auto_save_path = buffer_cfg.get("auto_save_dir", None)
+        if auto_save_path is None:
+            auto_save_path = os.path.join(
+                self.cfg.runner.logger.log_path,
+                default_subdir,
+            )
+        fallback_capacity = 5 if capacity is None else int(capacity)
+        return TrajectoryReplayBuffer(
+            seed=int(seed),
+            enable_cache=bool(buffer_cfg.get("enable_cache", True)),
+            cache_size=int(buffer_cfg.get("cache_size", fallback_capacity)),
+            sample_window_size=int(
+                buffer_cfg.get("sample_window_size", fallback_capacity)
+            ),
+            auto_save=bool(buffer_cfg.get("auto_save", False)),
+            auto_save_path=os.path.join(str(auto_save_path), f"rank_{self._rank}"),
+            trajectory_format=buffer_cfg.get("trajectory_format", "pt"),
+        )
+
     def _replay_dataset_min_sizes(self, batch_size: int) -> tuple[int, int]:
         replay_cfg = self.cfg.algorithm.get("replay_buffer", {})
         demo_cfg = self.cfg.algorithm.get("demo_buffer", None)
@@ -249,6 +295,72 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
         # gates open before any actor/critic update has actually happened.
         return int(self.update_step)
 
+    @Worker.timer("actor/sync_model_to_rollout")
+    async def sync_model_to_rollout(self) -> None:
+        if self.enable_offload:
+            if not self.is_optimizer_offloaded:
+                self.offload_optimizer()
+            if self.is_weight_offloaded:
+                self.load_param_and_grad(self.device, False)
+
+        state_dict = self.get_rollout_state_dict()
+
+        async def send_func(data):
+            if not self._is_weight_sender:
+                return
+            await self.broadcast(
+                data,
+                groups=[
+                    (self._group_name, 0),
+                    (self._rollout_group_name, self._rollout_all_ranks),
+                ],
+                src=(self._group_name, 0),
+                async_op=True,
+                options=self._sync_weight_comm_options,
+            ).async_wait()
+
+        async def recv_func():
+            return await self.recv(
+                src_group_name=self._rollout_group_name,
+                src_rank=0,
+                async_op=True,
+                options=self._sync_weight_comm_options,
+            ).async_wait()
+
+        if not self.weight_syncer.sender_initialized():
+            await self.weight_syncer.init_sender(
+                state_dict=state_dict,
+                send=send_func,
+                recv=recv_func,
+                param_names_need_sync=self.get_rollout_sync_param_names(state_dict),
+            )
+
+        await self.weight_syncer.sync(
+            state_dict,
+            send_func,
+            version=self.get_rollout_sync_version(),
+        )
+
+        if self.enable_offload:
+            assert not self.is_weight_offloaded, (
+                "weight should be offloaded in sync_model_to_rollout"
+            )
+            self.offload_param_and_grad(True)
+
+    @Worker.timer("actor/recv_traj")
+    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
+        clear_memory(sync=False)
+
+        send_num = self._component_placement.get_world_size("env") * self.stage_num
+        recv_num = self._component_placement.get_world_size("actor")
+        split_num = compute_split_num(send_num, recv_num)
+
+        trajectories = []
+        for _ in range(split_num):
+            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
+            trajectories.append(trajectory)
+        self.add_rollout_trajectories(trajectories)
+
     def add_rollout_trajectories(self, trajectories: list[Trajectory]) -> None:
         if self.trajectory_adapter is None or self.replay_buffer is None:
             raise RuntimeError("RLT Stage2 replay path is not initialized.")
@@ -270,6 +382,10 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
         self.episodes_since_train += completed_episodes
         self.total_transitions_added += added
         self.total_episodes_added += completed_episodes
+
+    @Worker.timer("actor/compute_adv")
+    def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+        return {}
 
     def _global_rollout_counters(self) -> dict[str, float]:
         return all_reduce_dict(
@@ -331,6 +447,51 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
                 "Check replay readiness and actor.global_batch_size."
             )
         return put_tensor_device(batch, self.device)
+
+    def _prepare_micro_batches(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        global_batch_size_per_rank: int,
+    ) -> list[dict[str, torch.Tensor]]:
+        assert global_batch_size_per_rank % self.cfg.actor.micro_batch_size == 0, (
+            "global batch per rank must be divisible by micro_batch_size"
+        )
+        micro_batch_count = (
+            global_batch_size_per_rank // self.cfg.actor.micro_batch_size
+        )
+        self.gradient_accumulation = micro_batch_count
+        return split_dict_to_chunk(batch, micro_batch_count)
+
+    def _average_metrics(self, metrics: dict[str, Any]) -> dict[str, float]:
+        mean_metric_dict: dict[str, float] = {}
+        for key, value in metrics.items():
+            if isinstance(value, list):
+                if not value:
+                    continue
+                mean_metric_dict[key] = float(
+                    np.mean(
+                        [
+                            item.detach().cpu().item()
+                            if isinstance(item, torch.Tensor)
+                            else item
+                            for item in value
+                        ]
+                    )
+                )
+            elif isinstance(value, torch.Tensor):
+                mean_metric_dict[key] = float(value.detach().cpu().item())
+            else:
+                mean_metric_dict[key] = float(value)
+        return all_reduce_dict(mean_metric_dict, op=torch.distributed.ReduceOp.AVG)
+
+    def _ensure_training_state_loaded(self) -> None:
+        if not self.enable_offload:
+            return
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+        if self.is_optimizer_offloaded:
+            self.load_optimizer(self.device)
 
     def _append_training_plan_metrics(
         self,
@@ -506,9 +667,9 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
                 should_train=False,
                 skip_reason=schedule.skip_reason,
             )
-            return self.average_metrics(metrics)
+            return self._average_metrics(metrics)
 
-        self.ensure_training_state_loaded()
+        self._ensure_training_state_loaded()
 
         self.model.train()
         critic_updates_run = 0
@@ -517,7 +678,7 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
             batch_dict = self._next_rlt_replay_batch(
                 global_batch_size_per_rank,
             )
-            micro_batches = self.prepare_micro_batches(
+            micro_batches = self._prepare_micro_batches(
                 batch_dict,
                 global_batch_size_per_rank=global_batch_size_per_rank,
             )
@@ -546,7 +707,7 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
         )
         self.transitions_since_train = 0
         self.episodes_since_train = 0
-        return self.average_metrics(metrics)
+        return self._average_metrics(metrics)
 
     def _update_one_epoch(
         self,
@@ -734,11 +895,21 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
         return os.path.join(base_path, "rlt_stage2_components")
 
     def save_checkpoint(self, save_base_path, step):
-        self.ensure_checkpoint_state_loaded()
-        self.save_model_checkpoint(
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+            self.is_weight_offloaded = False
+        if self.is_optimizer_offloaded:
+            self.load_optimizer(self.device)
+            self.is_optimizer_offloaded = False
+
+        self._strategy.save_checkpoint(
+            model=self.model,
             save_path=save_base_path,
             optimizers=[self.optimizer, self.qf_optimizer],
             lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
+            checkpoint_format="local_shard"
+            if self.cfg.actor.fsdp_config.use_orig_params
+            else "dcp",
         )
 
         stage2_save_path = self._stage2_component_dir(save_base_path)
@@ -762,13 +933,17 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
             },
             os.path.join(stage2_save_path, f"checkpoint_rank_{self._rank}.pt"),
         )
-        self.save_replay_checkpoints(stage2_save_path)
+        self._save_replay_checkpoints(stage2_save_path)
 
     def load_checkpoint(self, load_base_path):
-        self.load_model_checkpoint(
+        self._strategy.load_checkpoint(
+            model=self.model,
             load_path=load_base_path,
             optimizers=[self.optimizer, self.qf_optimizer],
             lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
+            checkpoint_format="local_shard"
+            if self.cfg.actor.fsdp_config.use_orig_params
+            else "dcp",
         )
 
         stage2_load_path = os.path.join(
@@ -797,7 +972,29 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
                     "after the refactor or restart replay collection."
                 )
 
-        self.load_replay_checkpoints(self._stage2_component_dir(load_base_path))
+        self._load_replay_checkpoints(self._stage2_component_dir(load_base_path))
+
+    def _replay_checkpoint_path(self, component_dir: str, name: str) -> str:
+        return os.path.join(component_dir, name, f"rank_{self._rank}")
+
+    def _save_replay_checkpoints(self, component_dir: str) -> None:
+        if self.replay_buffer is not None:
+            self.replay_buffer.save_checkpoint(
+                self._replay_checkpoint_path(component_dir, "replay_buffer")
+            )
+        if self.demo_buffer is not None:
+            self.demo_buffer.save_checkpoint(
+                self._replay_checkpoint_path(component_dir, "demo_buffer")
+            )
+
+    def _load_replay_checkpoints(self, component_dir: str) -> None:
+        replay_load_path = self._replay_checkpoint_path(component_dir, "replay_buffer")
+        if self.replay_buffer is not None and os.path.exists(replay_load_path):
+            self.replay_buffer.load_checkpoint(replay_load_path)
+
+        demo_load_path = self._replay_checkpoint_path(component_dir, "demo_buffer")
+        if self.demo_buffer is not None and os.path.exists(demo_load_path):
+            self.demo_buffer.load_checkpoint(demo_load_path)
 
     def set_global_step(self, global_step: int) -> None:
         self.version = global_step

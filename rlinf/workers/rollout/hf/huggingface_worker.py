@@ -32,7 +32,70 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.workers.rollout.hf.rollout_adapter import build_hf_rollout_adapter
+
+
+class _NoopRolloutHooks:
+    """Default hooks for standard HuggingFace embodied rollout."""
+
+    enabled = False
+
+    def __init__(self, student_model):
+        self.student_model = student_model
+
+    def expert_model_path(
+        self,
+        configured_path: str,
+        expert_ckpt_path: str | None,
+    ) -> str:
+        del expert_ckpt_path
+        return configured_path
+
+    def configure_expert_model(self, expert_model_config) -> None:
+        del expert_model_config
+
+    def rollout_state_dict(self) -> dict[str, torch.Tensor]:
+        return self.student_model.state_dict()
+
+    def use_dagger_beta(self) -> bool:
+        return True
+
+    def allow_bootstrap_values(self) -> bool:
+        return True
+
+    def predict(self, **kwargs):
+        del kwargs
+        return None
+
+    def encode_step_trace(
+        self,
+        step_obs: dict[str, Any] | None,
+    ) -> dict[str, torch.Tensor]:
+        del step_obs
+        return {}
+
+    def final_forward_inputs(self, result: dict[str, Any]) -> dict[str, Any]:
+        del result
+        return {}
+
+
+def _build_rollout_adapter(
+    *,
+    cfg,
+    student_model,
+    expert_model_getter,
+    has_expert_model_config: bool,
+):
+    from rlinf.models.embodiment.rlt_stage2.rollout import RLTStage2RolloutAdapter
+
+    if not RLTStage2RolloutAdapter.is_enabled_cfg(cfg):
+        del expert_model_getter, has_expert_model_config
+        return _NoopRolloutHooks(student_model)
+    return RLTStage2RolloutAdapter(
+        cfg=cfg,
+        student_model=student_model,
+        expert_model_getter=expert_model_getter,
+        has_expert_model_config=has_expert_model_config,
+    )
 
 
 class MultiStepRolloutWorker(Worker):
@@ -127,7 +190,7 @@ class MultiStepRolloutWorker(Worker):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             self.hf_model.load_state_dict(model_dict)
 
-        self.rollout_adapter = build_hf_rollout_adapter(
+        self.rollout_adapter = _build_rollout_adapter(
             cfg=self.cfg,
             student_model=self.hf_model,
             expert_model_getter=self._ensure_expert_model_loaded,

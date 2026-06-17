@@ -51,14 +51,11 @@ if torch is not None and _HAS_NUMPY:
     from rlinf.models.embodiment.rlt_stage2.trajectory_adapter import (
         RLTStage2TrajectoryReplayAdapter,
     )
-    from rlinf.workers.actor.embodied_offpolicy_worker import (
-        EmbodiedOffPolicyFSDPActor,
-    )
     from rlinf.workers.actor.fsdp_rlt_stage2_policy_worker import (
         RLTStage2FSDPPolicyWorker,
     )
     from rlinf.workers.env.policy_info_adapter import build_policy_info_adapter
-    from rlinf.workers.rollout.hf.rollout_adapter import build_hf_rollout_adapter
+    from rlinf.workers.rollout.hf.huggingface_worker import _build_rollout_adapter
     from toolkits.rlt import inspect_rlt_replay
 
 
@@ -517,10 +514,10 @@ def test_rlt_worker_rollout_sync_keeps_update_step_gate_version():
     assert worker._rollout_sync_key_count == 1
 
 
-def test_offpolicy_replay_checkpoint_helper_uses_standard_rank_paths(tmp_path):
+def test_rlt_replay_checkpoint_helpers_use_standard_rank_paths(tmp_path):
     replay_trajectories = _build_replay_trajectories()
     component_dir = tmp_path / "components"
-    worker = object.__new__(EmbodiedOffPolicyFSDPActor)
+    worker = object.__new__(RLTStage2FSDPPolicyWorker)
     worker._rank = 3
     worker.replay_buffer = TrajectoryReplayBuffer(
         seed=21,
@@ -543,7 +540,7 @@ def test_offpolicy_replay_checkpoint_helper_uses_standard_rank_paths(tmp_path):
     worker.replay_buffer.add_trajectories(replay_trajectories)
     worker.demo_buffer.add_trajectories(replay_trajectories[:1])
 
-    EmbodiedOffPolicyFSDPActor.save_replay_checkpoints(worker, str(component_dir))
+    RLTStage2FSDPPolicyWorker._save_replay_checkpoints(worker, str(component_dir))
     worker.replay_buffer.close(wait=True)
     worker.demo_buffer.close(wait=True)
 
@@ -552,7 +549,7 @@ def test_offpolicy_replay_checkpoint_helper_uses_standard_rank_paths(tmp_path):
     assert (replay_path / "metadata.json").is_file()
     assert (demo_path / "metadata.json").is_file()
 
-    loaded = object.__new__(EmbodiedOffPolicyFSDPActor)
+    loaded = object.__new__(RLTStage2FSDPPolicyWorker)
     loaded._rank = 3
     loaded.replay_buffer = TrajectoryReplayBuffer(
         seed=21,
@@ -573,7 +570,7 @@ def test_offpolicy_replay_checkpoint_helper_uses_standard_rank_paths(tmp_path):
         trajectory_format="pt",
     )
 
-    EmbodiedOffPolicyFSDPActor.load_replay_checkpoints(loaded, str(component_dir))
+    RLTStage2FSDPPolicyWorker._load_replay_checkpoints(loaded, str(component_dir))
 
     assert loaded.replay_buffer.total_samples == 2
     assert loaded.demo_buffer.total_samples == 1
@@ -883,7 +880,7 @@ def test_hf_rollout_adapter_factory_keeps_rlt_out_of_generic_worker():
     noop_cfg = _cfg()
     noop_cfg.algorithm.loss_type = "embodied_dagger"
     noop_cfg.actor.model.model_type = "openpi"
-    noop_adapter = build_hf_rollout_adapter(
+    noop_adapter = _build_rollout_adapter(
         cfg=noop_cfg,
         student_model=_FakeStudentModel(),
         expert_model_getter=lambda: _FakeExpertModel(),
@@ -900,7 +897,7 @@ def test_hf_rollout_adapter_factory_keeps_rlt_out_of_generic_worker():
     ) is None
     assert noop_adapter.final_forward_inputs({"forward_inputs": {"x": 1}}) == {}
 
-    rlt_adapter = build_hf_rollout_adapter(
+    rlt_adapter = _build_rollout_adapter(
         cfg=_cfg(env_type="realworld", warmup_updates=0),
         student_model=_FakeStudentModel(),
         expert_model_getter=lambda: _FakeExpertModel(),
