@@ -155,7 +155,10 @@ def _assert_stage2_dimension_contract(
     proprio_dim,
     proprio_mode=None,
 ):
-    assert cfg.actor.model.rlt_stage2.config_name == config_name
+    if isinstance(config_name, tuple):
+        assert cfg.actor.model.rlt_stage2.config_name in config_name
+    else:
+        assert cfg.actor.model.rlt_stage2.config_name == config_name
     assert cfg.actor.model.num_action_chunks == action_horizon
     assert cfg.actor.model.action_dim == action_dim
     assert cfg.actor.model.rlt_stage2.num_images_in_input == num_images
@@ -209,7 +212,7 @@ def test_rlt_maniskill_stage2_yaml_dimension_contract():
     assert cfg.env.train.init_params.sensor_configs.height == 384
     _assert_stage2_dimension_contract(
         cfg,
-        config_name="pi05_rlt_joint",
+        config_name=("pi05_rlt_joint", "pi05_rlt_maniskill_joint"),
         action_dim=8,
         action_horizon=10,
         num_images=2,

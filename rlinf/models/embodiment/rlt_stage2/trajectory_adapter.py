@@ -175,12 +175,46 @@ class RLTStage2TrajectoryReplayAdapter:
             },
         )
 
+    @staticmethod
+    def _normalize_intervention_mask(
+        intervention: torch.Tensor,
+        *,
+        action: torch.Tensor,
+        chunk_len: int,
+        action_dim: int,
+    ) -> torch.Tensor:
+        """Return an action-level flat intervention mask for one chunk."""
+
+        mask = (
+            intervention.detach()
+            .to(device=action.device, dtype=torch.bool)
+            .reshape(-1)
+        )
+        action_numel = int(action.numel())
+        if mask.numel() == action_numel:
+            return mask.reshape_as(action)
+        if mask.numel() == chunk_len:
+            return (
+                mask.reshape(chunk_len, 1)
+                .expand(chunk_len, action_dim)
+                .reshape_as(action)
+            )
+        if mask.numel() == 1:
+            return torch.full_like(action, bool(mask.item()), dtype=torch.bool)
+        raise ValueError(
+            "RLT intervention mask must be scalar, chunk_length, or action_chunk_dim, "
+            f"got {tuple(intervention.shape)} for chunk_len={chunk_len}, "
+            f"action_dim={action_dim}."
+        )
+
     def _chunk_trajectory_to_transitions(self, traj: Trajectory) -> tuple[list[Trajectory], int]:
         if traj.actions is None or not traj.forward_inputs:
             return [], 0
 
         traj_len = traj.actions.shape[0]
         bsz = traj.actions.shape[1]
+        chunk_len = int(self.cfg.actor.model.num_action_chunks)
+        action_dim = int(self.cfg.actor.model.action_dim)
         replay_trajectories: list[Trajectory] = []
         completed_episodes = 0
 
@@ -215,9 +249,15 @@ class RLTStage2TrajectoryReplayAdapter:
                 done_idx = min(t + 1, dones_all.shape[0] - 1)
                 env_done = float(dones_all[done_idx, env_idx].any().item())
                 done = float(env_done > 0.0)
-                intervention_mask = torch.zeros_like(traj.actions[t, env_idx])
+                action = traj.actions[t, env_idx].detach()
+                intervention_mask = torch.zeros_like(action, dtype=torch.bool)
                 if intervention_flags_all is not None:
-                    intervention_mask = intervention_flags_all[t, env_idx].detach()
+                    intervention_mask = self._normalize_intervention_mask(
+                        intervention_flags_all[t, env_idx],
+                        action=action,
+                        chunk_len=chunk_len,
+                        action_dim=action_dim,
+                    )
                 source_chunk = None
                 source = None
                 if source_chunk_all is not None:
@@ -234,7 +274,6 @@ class RLTStage2TrajectoryReplayAdapter:
 
                 x = x_all[t, env_idx].detach()
                 a_tilde = a_tilde_all[t, env_idx].detach()
-                action = traj.actions[t, env_idx].detach()
                 rewards = rewards_all[t, env_idx].detach()
 
                 if done > 0.0:
@@ -255,8 +294,6 @@ class RLTStage2TrajectoryReplayAdapter:
                     next_a_tilde = a_tilde_all[t + 1, env_idx].detach()
 
                 if source_chunk is None:
-                    chunk_len = int(self.cfg.actor.model.num_action_chunks)
-                    action_dim = int(self.cfg.actor.model.action_dim)
                     step_intervention = intervention_mask.reshape(
                         chunk_len,
                         action_dim,
@@ -278,8 +315,6 @@ class RLTStage2TrajectoryReplayAdapter:
                     )
                     source = resolve_chunk_source(source_chunk.cpu().numpy())
                 else:
-                    chunk_len = int(self.cfg.actor.model.num_action_chunks)
-                    action_dim = int(self.cfg.actor.model.action_dim)
                     step_intervention = intervention_mask.reshape(
                         chunk_len,
                         action_dim,

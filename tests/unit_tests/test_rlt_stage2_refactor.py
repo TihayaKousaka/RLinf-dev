@@ -932,6 +932,7 @@ def test_env_worker_auto_reset_bootstrap_preserves_env_infos():
         }
     ]
     worker.last_intervened_info_list = [(None, None)]
+    worker._timer_metrics = {}
 
     env_outputs = EnvWorker.bootstrap_step(worker)
 
