@@ -34,18 +34,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 if torch is not None and _HAS_NUMPY:
+    from torch.utils.data import DataLoader
+
+    from rlinf.data.embodied_buffer_dataset import (
+        ReplayBufferDataset,
+        replay_buffer_collate_fn,
+    )
     from rlinf.data.embodied_io_struct import Trajectory
     from rlinf.data.replay_buffer import TrajectoryReplayBuffer
-    from rlinf.models.embodiment.rlt_stage2.rollout_adapter import (
+    from rlinf.models.embodiment.rlt_stage2.rollout import (
+        COLLECTION_PHASE_ONLINE,
+        COLLECTION_PHASE_WARMUP,
         RLTStage2RolloutAdapter,
+        TransitionSource,
     )
     from rlinf.models.embodiment.rlt_stage2.trajectory_adapter import (
         RLTStage2TrajectoryReplayAdapter,
-    )
-    from rlinf.models.embodiment.rlt_stage2.transition import (
-        COLLECTION_PHASE_ONLINE,
-        COLLECTION_PHASE_WARMUP,
-        TransitionSource,
     )
     from rlinf.workers.actor.embodied_offpolicy_worker import (
         EmbodiedOffPolicyFSDPActor,
@@ -252,7 +256,7 @@ def _synthetic_stride_rollout_trajectory() -> Trajectory:
             ),
             "record_transition": torch.ones((2, 1, 1), dtype=torch.bool),
         },
-        rlt_step_trace={
+        step_trace={
             "anchor_offsets": torch.tensor(
                 [
                     [[1]],
@@ -442,6 +446,49 @@ def test_rlt_replay_buffer_roundtrip_uses_rlinf_trajectory_format(tmp_path):
     )
 
 
+def test_rlt_worker_training_batch_uses_replay_buffer_dataset():
+    replay_trajectories = _build_replay_trajectories()
+    replay_buffer = TrajectoryReplayBuffer(
+        seed=13,
+        enable_cache=True,
+        cache_size=4,
+        sample_window_size=4,
+        auto_save=False,
+        auto_save_path="",
+        trajectory_format="pt",
+    )
+    replay_buffer.add_trajectories(replay_trajectories)
+    dataset = ReplayBufferDataset(
+        replay_buffer=replay_buffer,
+        demo_buffer=None,
+        batch_size=2,
+        min_replay_buffer_size=2,
+        min_demo_buffer_size=0,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        num_workers=0,
+        drop_last=True,
+        collate_fn=replay_buffer_collate_fn,
+    )
+
+    worker = object.__new__(RLTStage2FSDPPolicyWorker)
+    worker.buffer_dataloader_iter = iter(dataloader)
+    worker.device = torch.device("cpu")
+
+    batch = RLTStage2FSDPPolicyWorker._next_rlt_replay_batch(worker, 2)
+    replay_buffer.close(wait=True)
+
+    assert "forward_inputs" not in batch
+    assert batch["x"].shape == (2, 3)
+    assert batch["a"].shape == (2, 4)
+    assert batch["a_tilde"].shape == (2, 4)
+    assert batch["action_chunk"].shape == (2, 4)
+    assert batch["source_chunk"].shape == (2, 2)
+    assert batch["rewards"].shape == (2, 2)
+
+
 class _FakeRLTWorkerModel:
     def filter_rollout_state_dict(self, state_dict):
         return {
@@ -596,6 +643,24 @@ def test_realworld_policy_info_is_available_without_intervention():
     )
     assert updated["in_critical_phase"].tolist() == [[True], [False]]
     assert updated["record_transition"].tolist() == [[True], [False]]
+
+
+def test_policy_info_adapter_factory_uses_model_plugin_discovery():
+    rlt_adapter = build_policy_info_adapter(
+        _cfg(env_type="realworld"),
+        train_batch_size=2,
+        eval_batch_size=2,
+    )
+    assert rlt_adapter.__class__.__name__ == "RLTStage2PolicyInfoAdapter"
+
+    cfg = _cfg(env_type="realworld", warmup_updates=0)
+    cfg.actor.model.model_type = "openpi"
+    noop_adapter = build_policy_info_adapter(
+        cfg,
+        train_batch_size=2,
+        eval_batch_size=2,
+    )
+    assert noop_adapter.__class__.__name__ == "NoopPolicyInfoAdapter"
 
 
 class _FakeStudentModel:

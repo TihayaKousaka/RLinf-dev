@@ -22,7 +22,13 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import DictConfig
+from torch.utils.data import DataLoader
 
+from rlinf.data.embodied_buffer_dataset import (
+    PreloadReplayBufferDataset,
+    ReplayBufferDataset,
+    replay_buffer_collate_fn,
+)
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.scheduler import Worker
@@ -32,11 +38,11 @@ from rlinf.utils.nested_dict_process import put_tensor_device
 from rlinf.utils.utils import collect_param_names_need_sync
 
 from ...models.embodiment.rlt_stage2.components import actor_loss, critic_loss
-from ...models.embodiment.rlt_stage2.status import write_status_json
-from ...models.embodiment.rlt_stage2.training_schedule import (
+from ...models.embodiment.rlt_stage2.schedule import (
     RLTStage2TrainingScheduler,
     RLTTrainingPlan,
     resolve_actor_loss_weights,
+    write_status_json,
 )
 from ...models.embodiment.rlt_stage2.trajectory_adapter import (
     RLTStage2TrajectoryReplayAdapter,
@@ -61,6 +67,9 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
         self.total_transitions_added = 0
         self.total_episodes_added = 0
         self._last_logged_status_phase: str | None = None
+        self.buffer_dataset = None
+        self.buffer_dataloader = None
+        self.buffer_dataloader_iter = None
 
     def init_worker(self):
         self.setup_model_and_optimizer()
@@ -146,6 +155,78 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
             demo_seed=int(self.cfg.actor.get("seed", 1234)) + self._rank + 17,
             demo_capacity=demo_capacity,
         )
+        if self.replay_buffer is None:
+            raise RuntimeError("RLT Stage2 replay buffer failed to initialize.")
+
+        batch_size = int(self.cfg.actor.global_batch_size // self._world_size)
+        if demo_cfg is not None and batch_size % 2 != 0:
+            raise ValueError(
+                "RLT Stage2 demo replay sampling requires an even per-rank "
+                f"global batch size, got {batch_size}."
+            )
+        replay_sample_size = batch_size if demo_cfg is None else batch_size // 2
+        replay_window_size = int(replay_cfg.get("sample_window_size", capacity))
+        if 0 < replay_window_size < replay_sample_size:
+            raise ValueError(
+                "RLT Stage2 replay sample_window_size must be 0 or at least the "
+                f"per-update replay sample count, got {replay_window_size} < "
+                f"{replay_sample_size}."
+            )
+        if demo_cfg is not None:
+            demo_sample_size = batch_size // 2
+            demo_window_size = int(demo_cfg.get("sample_window_size", demo_capacity))
+            if 0 < demo_window_size < demo_sample_size:
+                raise ValueError(
+                    "RLT Stage2 demo sample_window_size must be 0 or at least the "
+                    f"per-update demo sample count, got {demo_window_size} < "
+                    f"{demo_sample_size}."
+                )
+        min_replay_buffer_size, min_demo_buffer_size = (
+            self._replay_dataset_min_sizes(batch_size)
+        )
+
+        buffer_dataset_cls = (
+            PreloadReplayBufferDataset
+            if bool(replay_cfg.get("enable_preload", False))
+            else ReplayBufferDataset
+        )
+        self.buffer_dataset = buffer_dataset_cls(
+            replay_buffer=self.replay_buffer,
+            demo_buffer=self.demo_buffer,
+            batch_size=batch_size,
+            min_replay_buffer_size=min_replay_buffer_size,
+            min_demo_buffer_size=min_demo_buffer_size,
+            prefetch_size=int(replay_cfg.get("prefetch_size", 10)),
+        )
+        self.buffer_dataloader = DataLoader(
+            self.buffer_dataset,
+            batch_size=1,
+            num_workers=0,
+            drop_last=True,
+            collate_fn=replay_buffer_collate_fn,
+        )
+        self.buffer_dataloader_iter = iter(self.buffer_dataloader)
+
+    def _replay_dataset_min_sizes(self, batch_size: int) -> tuple[int, int]:
+        replay_cfg = self.cfg.algorithm.get("replay_buffer", {})
+        demo_cfg = self.cfg.algorithm.get("demo_buffer", None)
+        replay_sample_size = int(batch_size) if demo_cfg is None else int(batch_size) // 2
+        min_replay_buffer_size = max(
+            int(
+                replay_cfg.get(
+                    "min_buffer_size",
+                    self.cfg.algorithm.get("warmup_min_size", 1),
+                )
+            ),
+            replay_sample_size,
+        )
+        min_demo_buffer_size = 0
+        if demo_cfg is not None:
+            min_demo_buffer_size = max(
+                int(demo_cfg.get("min_buffer_size", 0)),
+                int(batch_size) // 2,
+            )
+        return min_replay_buffer_size, min_demo_buffer_size
 
     def soft_update_target_model(self, tau: float | None = None) -> None:
         if tau is None:
@@ -219,56 +300,6 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
         )
         return int(reduced["min_demo_size"])
 
-    def _sample_training_batch(
-        self,
-        batch_size: int,
-        *,
-        use_demo: bool,
-    ) -> dict[str, torch.Tensor]:
-        assert self.replay_buffer is not None
-        if not use_demo or self.demo_buffer is None:
-            return self._sample_buffer_batch(self.replay_buffer, batch_size)
-
-        replay_batch_size = batch_size - batch_size // 2
-        demo_batch_size = batch_size - replay_batch_size
-        replay_batch = self._sample_buffer_batch(
-            self.replay_buffer,
-            replay_batch_size,
-        )
-        demo_batch = self._sample_buffer_batch(self.demo_buffer, demo_batch_size)
-        return {
-            key: torch.cat([replay_batch[key], demo_batch[key]], dim=0)
-            for key in replay_batch
-        }
-
-    def _sample_buffer_batch(
-        self,
-        replay_buffer: TrajectoryReplayBuffer,
-        batch_size: int,
-    ) -> dict[str, torch.Tensor]:
-        sample_dicts = []
-        remaining = int(batch_size)
-        while remaining > 0:
-            batch = replay_buffer.sample(remaining)
-            if not batch:
-                raise RuntimeError("RLT Stage2 replay sample returned an empty batch.")
-            sampled = self._unwrap_rlt_forward_inputs(batch)
-            sample_dicts.append(sampled)
-            first_tensor = next(
-                value for value in sampled.values() if isinstance(value, torch.Tensor)
-            )
-            sampled_size = int(first_tensor.shape[0])
-            if sampled_size <= 0:
-                raise RuntimeError("RLT Stage2 replay sample has zero tensor rows.")
-            remaining -= sampled_size
-        merged = {
-            key: torch.cat([sample[key] for sample in sample_dicts], dim=0)[
-                :batch_size
-            ]
-            for key in sample_dicts[0]
-        }
-        return put_tensor_device(merged, self.device)
-
     @staticmethod
     def _unwrap_rlt_forward_inputs(
         batch: dict[str, Any],
@@ -281,6 +312,25 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
                 "RLTStage2TrajectoryReplayAdapter are supported."
             )
         return forward_inputs
+
+    def _next_rlt_replay_batch(
+        self,
+        expected_batch_size: int,
+    ) -> dict[str, torch.Tensor]:
+        if self.buffer_dataloader_iter is None:
+            raise RuntimeError("RLT Stage2 replay DataLoader is not initialized.")
+        batch = self._unwrap_rlt_forward_inputs(next(self.buffer_dataloader_iter))
+        first_tensor = next(
+            value for value in batch.values() if isinstance(value, torch.Tensor)
+        )
+        actual_batch_size = int(first_tensor.shape[0])
+        if actual_batch_size != int(expected_batch_size):
+            raise RuntimeError(
+                "RLT Stage2 replay DataLoader returned an unexpected batch size: "
+                f"expected {expected_batch_size}, got {actual_batch_size}. "
+                "Check replay readiness and actor.global_batch_size."
+            )
+        return put_tensor_device(batch, self.device)
 
     def _append_training_plan_metrics(
         self,
@@ -427,6 +477,12 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
         global_counters = self._global_rollout_counters()
         global_min_replay_size = self._global_min_replay_size()
         global_min_demo_size = self._global_min_demo_size()
+        global_batch_size_per_rank = (
+            self.cfg.actor.global_batch_size // self._world_size
+        )
+        min_replay_buffer_size, min_demo_buffer_size = (
+            self._replay_dataset_min_sizes(global_batch_size_per_rank)
+        )
         plan = self.training_scheduler.plan(
             self.cfg,
             update_step=self.update_step,
@@ -434,6 +490,8 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
             global_counters=global_counters,
             global_min_replay_size=global_min_replay_size,
             global_min_demo_size=global_min_demo_size,
+            min_replay_buffer_size=min_replay_buffer_size,
+            min_demo_buffer_size=min_demo_buffer_size,
         )
         schedule = plan.schedule
 
@@ -452,17 +510,12 @@ class RLTStage2FSDPPolicyWorker(EmbodiedOffPolicyFSDPActor):
 
         self.ensure_training_state_loaded()
 
-        global_batch_size_per_rank = (
-            self.cfg.actor.global_batch_size // self._world_size
-        )
-
         self.model.train()
         critic_updates_run = 0
         actor_updates_run = 0
         for _ in range(schedule.updates_to_run):
-            batch_dict = self._sample_training_batch(
+            batch_dict = self._next_rlt_replay_batch(
                 global_batch_size_per_rank,
-                use_demo=plan.readiness.use_demo,
             )
             micro_batches = self.prepare_micro_batches(
                 batch_dict,

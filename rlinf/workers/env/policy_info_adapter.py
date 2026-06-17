@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib
 from typing import Any
 
 import torch
@@ -69,20 +70,28 @@ class NoopPolicyInfoAdapter:
 
 
 def build_policy_info_adapter(cfg, train_batch_size, eval_batch_size):
-    """Build an env-side policy_info adapter for algorithms that need one."""
-    is_rlt_stage2 = (
-        cfg.algorithm.get("loss_type", None) == "rlt_td3"
-        and cfg.actor.model.get("model_type", None) == "rlt_stage2"
-    )
-    if not is_rlt_stage2:
+    """Build an env-side policy_info adapter for the configured model."""
+    model_type = str(cfg.actor.model.get("model_type", ""))
+    if not model_type:
         return NoopPolicyInfoAdapter()
 
-    from rlinf.models.embodiment.rlt_stage2.policy_info_adapter import (
-        RLTStage2PolicyInfoAdapter,
-    )
+    module_name = f"rlinf.models.embodiment.{model_type}.env_policy_info"
+    try:
+        adapter_module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == module_name or module_name.startswith(f"{exc.name}."):
+            return NoopPolicyInfoAdapter()
+        raise
 
-    return RLTStage2PolicyInfoAdapter(
+    adapter_builder = getattr(adapter_module, "build_policy_info_adapter", None)
+    if adapter_builder is None:
+        return NoopPolicyInfoAdapter()
+
+    adapter = adapter_builder(
         cfg=cfg,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
     )
+    if adapter is None:
+        return NoopPolicyInfoAdapter()
+    return adapter

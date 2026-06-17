@@ -17,31 +17,16 @@ import importlib.util
 import sys
 from pathlib import Path
 
-STATUS_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "rlinf"
-    / "models"
-    / "embodiment"
-    / "rlt_stage2"
-    / "status.py"
-)
-STATUS_MODULE_NAME = "rlinf.models.embodiment.rlt_stage2.status"
-SPEC = importlib.util.spec_from_file_location(STATUS_MODULE_NAME, STATUS_PATH)
-assert SPEC is not None and SPEC.loader is not None
-status = importlib.util.module_from_spec(SPEC)
-sys.modules[STATUS_MODULE_NAME] = status
-SPEC.loader.exec_module(status)
-
 SCHEDULE_PATH = (
     Path(__file__).resolve().parents[2]
     / "rlinf"
     / "models"
     / "embodiment"
     / "rlt_stage2"
-    / "training_schedule.py"
+    / "schedule.py"
 )
 SCHEDULE_SPEC = importlib.util.spec_from_file_location(
-    "rlinf.models.embodiment.rlt_stage2.training_schedule",
+    "rlinf.models.embodiment.rlt_stage2.schedule",
     SCHEDULE_PATH,
 )
 assert SCHEDULE_SPEC is not None and SCHEDULE_SPEC.loader is not None
@@ -49,14 +34,13 @@ schedule = importlib.util.module_from_spec(SCHEDULE_SPEC)
 sys.modules[SCHEDULE_SPEC.name] = schedule
 SCHEDULE_SPEC.loader.exec_module(schedule)
 
-PHASE_ONLINE = status.PHASE_ONLINE
-PHASE_WARMUP = status.PHASE_WARMUP
-PHASE_WARMUP_WAIT_ONLINE = status.PHASE_WARMUP_WAIT_ONLINE
-phase_id = status.phase_id
-resolve_rollout_phase = status.resolve_rollout_phase
-resolve_training_phase = status.resolve_training_phase
-write_status_json = status.write_status_json
-
+PHASE_ONLINE = schedule.PHASE_ONLINE
+PHASE_WARMUP = schedule.PHASE_WARMUP
+PHASE_WARMUP_WAIT_ONLINE = schedule.PHASE_WARMUP_WAIT_ONLINE
+phase_id = schedule.phase_id
+resolve_rollout_phase = schedule.resolve_rollout_phase
+resolve_training_phase = schedule.resolve_training_phase
+write_status_json = schedule.write_status_json
 RLTStage2TrainingScheduler = schedule.RLTStage2TrainingScheduler
 SKIP_REASON_BUFFER_NOT_READY = schedule.SKIP_REASON_BUFFER_NOT_READY
 SKIP_REASON_NO_PENDING_UPDATES = schedule.SKIP_REASON_NO_PENDING_UPDATES
@@ -220,3 +204,43 @@ def test_rlt_training_scheduler_owns_warmup_budget_and_status_metrics():
         global_min_demo_size=0,
     )
     assert no_pending.schedule.skip_reason == SKIP_REASON_NO_PENDING_UPDATES
+
+
+def test_rlt_training_scheduler_readiness_respects_dataset_batch_gate():
+    scheduler = RLTStage2TrainingScheduler()
+    cfg = _scheduler_cfg()
+
+    not_ready = scheduler.plan(
+        cfg,
+        update_step=0,
+        has_demo_buffer=False,
+        global_counters={
+            "transitions_since_train": 3.0,
+            "episodes_since_train": 0.0,
+            "total_transitions_added": 3.0,
+            "total_episodes_added": 0.0,
+        },
+        global_min_replay_size=3,
+        global_min_demo_size=0,
+        min_replay_buffer_size=4,
+    )
+    assert not_ready.readiness.warmup_min_size == 4
+    assert not_ready.readiness.buffer_ready is False
+    assert not_ready.schedule.skip_reason == SKIP_REASON_BUFFER_NOT_READY
+
+    ready = scheduler.plan(
+        cfg,
+        update_step=0,
+        has_demo_buffer=False,
+        global_counters={
+            "transitions_since_train": 4.0,
+            "episodes_since_train": 0.0,
+            "total_transitions_added": 4.0,
+            "total_episodes_added": 0.0,
+        },
+        global_min_replay_size=4,
+        global_min_demo_size=0,
+        min_replay_buffer_size=4,
+    )
+    assert ready.readiness.buffer_ready is True
+    assert ready.schedule.skip_reason == 0

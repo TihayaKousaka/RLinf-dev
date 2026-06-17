@@ -22,7 +22,7 @@ from rlinf.models.embodiment.rlt_stage2.components import (
     actor_loss,
     compute_td_target,
 )
-from rlinf.models.embodiment.rlt_stage2.transition import TransitionSource
+from rlinf.models.embodiment.rlt_stage2.rollout import TransitionSource
 
 
 def test_direct_gaussian_actor_conditions_on_reference_and_uses_fixed_noise():

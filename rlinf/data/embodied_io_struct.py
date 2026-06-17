@@ -269,7 +269,7 @@ class EnvOutput:
         if any(step_obs is not None for step_obs in step_obs_list):
             if any(step_obs is None for step_obs in step_obs_list):
                 raise ValueError(
-                    "Inconsistent RLT step_obs: some shards are None while others are present."
+                    "Inconsistent step_obs: some shards are None while others are present."
                 )
             merged_step_obs = {}
             assert step_obs_list[0] is not None
@@ -384,7 +384,7 @@ class RolloutResult:
     bootstrap_values: torch.Tensor = None  # [B, 1]
     save_flags: torch.Tensor = None  # [B, num_action_chunks]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
-    rlt_step_trace: dict[str, torch.Tensor] = field(default_factory=dict)
+    step_trace: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
 
     def __post_init__(self):
@@ -400,8 +400,8 @@ class RolloutResult:
             self.save_flags = self.save_flags.cpu().contiguous()
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
-        if self.rlt_step_trace:
-            self.rlt_step_trace = put_tensor_device(self.rlt_step_trace, "cpu")
+        if self.step_trace:
+            self.step_trace = put_tensor_device(self.step_trace, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
 
@@ -436,20 +436,20 @@ class RolloutResult:
             merged_forward_inputs = {}
         else:
             merged_forward_inputs = cat_list_of_dict_tensor(forward_inputs_list)
-        rlt_step_trace_list = [
-            rollout_result.rlt_step_trace for rollout_result in rollout_results
+        step_trace_list = [
+            rollout_result.step_trace for rollout_result in rollout_results
         ]
-        if all(not rlt_step_trace for rlt_step_trace in rlt_step_trace_list):
+        if all(not step_trace for step_trace in step_trace_list):
             merged_step_trace = {}
         else:
             merged_step_trace = {}
             keys = set()
-            for step_trace in rlt_step_trace_list:
+            for step_trace in step_trace_list:
                 keys.update(step_trace.keys())
             for key in keys:
                 tensors = [
                     step_trace[key]
-                    for step_trace in rlt_step_trace_list
+                    for step_trace in step_trace_list
                     if key in step_trace
                 ]
                 if tensors:
@@ -461,7 +461,7 @@ class RolloutResult:
             bootstrap_values=merged_bootstrap_values,
             save_flags=merged_save_flags,
             forward_inputs=merged_forward_inputs,
-            rlt_step_trace=merged_step_trace,
+            step_trace=merged_step_trace,
             versions=merged_versions,
         )
 
@@ -478,7 +478,7 @@ class ChunkStepResult:
     terminations: torch.Tensor = None  # [B, 1]
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
-    rlt_step_trace: dict[str, torch.Tensor] = field(default_factory=dict)
+    step_trace: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
 
     def __post_init__(self):
@@ -498,8 +498,8 @@ class ChunkStepResult:
             self.rewards = self.rewards.cpu().contiguous()
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
-        if self.rlt_step_trace:
-            self.rlt_step_trace = put_tensor_device(self.rlt_step_trace, "cpu")
+        if self.step_trace:
+            self.step_trace = put_tensor_device(self.step_trace, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
 
@@ -522,7 +522,7 @@ class Trajectory:
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
     forward_inputs: dict[str, Any] = field(default_factory=dict)
-    rlt_step_trace: dict[str, Any] = field(default_factory=dict)
+    step_trace: dict[str, Any] = field(default_factory=dict)
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
@@ -670,7 +670,7 @@ class EmbodiedRolloutResult:
     forward_inputs: list[dict[str, Any]] = field(
         default_factory=list
     )  # trajectory_length
-    rlt_step_trace: list[dict[str, Any]] = field(default_factory=list)
+    step_trace: list[dict[str, Any]] = field(default_factory=list)
 
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
@@ -697,17 +697,17 @@ class EmbodiedRolloutResult:
             self.versions.append(result.versions)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
-        if result.rlt_step_trace:
-            self.append_rlt_step_trace(result.rlt_step_trace)
+        if result.step_trace:
+            self.append_step_trace(result.step_trace)
 
-    def append_rlt_step_trace(self, step_trace: dict[str, Any] | None):
+    def append_step_trace(self, step_trace: dict[str, Any] | None):
         if step_trace:
-            if len(self.rlt_step_trace) >= len(self.actions):
+            if len(self.step_trace) >= len(self.actions):
                 raise ValueError(
-                    "Cannot append an RLT step trace without a matching action chunk. "
-                    f"Got {len(self.rlt_step_trace)=} and {len(self.actions)=}."
+                    "Cannot append a step_trace without a matching action chunk. "
+                    f"Got {len(self.step_trace)=} and {len(self.actions)=}."
                 )
-            self.rlt_step_trace.append(step_trace)
+            self.step_trace.append(step_trace)
 
     def mark_last_step_with_flags(self, save_flags: torch.Tensor):
         if not self.intervene_flags:
@@ -818,7 +818,7 @@ class EmbodiedRolloutResult:
         self.prev_values.clear()
         self.versions.clear()
         self.forward_inputs.clear()
-        self.rlt_step_trace.clear()
+        self.step_trace.clear()
         self.curr_obs.clear()
         self.next_obs.clear()
 
@@ -862,20 +862,20 @@ class EmbodiedRolloutResult:
                     trajectory.forward_inputs[key].cpu().contiguous()
                 )
 
-        if len(self.rlt_step_trace) > 0:
-            if len(self.actions) > 0 and len(self.rlt_step_trace) != len(self.actions):
+        if len(self.step_trace) > 0:
+            if len(self.actions) > 0 and len(self.step_trace) != len(self.actions):
                 raise ValueError(
-                    "RLT step trace length must match action trajectory length, got "
-                    f"{len(self.rlt_step_trace)=} and {len(self.actions)=}."
+                    "step_trace length must match action trajectory length, got "
+                    f"{len(self.step_trace)=} and {len(self.actions)=}."
                 )
             if len(self.actions) == 0:
                 raise ValueError(
-                    "RLT step trace cannot be serialized without action chunks."
+                    "step_trace cannot be serialized without action chunks."
                 )
-            trajectory.rlt_step_trace = stack_list_of_dict_tensor(self.rlt_step_trace)
-            for key in trajectory.rlt_step_trace.keys():
-                trajectory.rlt_step_trace[key] = (
-                    trajectory.rlt_step_trace[key].cpu().contiguous()
+            trajectory.step_trace = stack_list_of_dict_tensor(self.step_trace)
+            for key in trajectory.step_trace.keys():
+                trajectory.step_trace[key] = (
+                    trajectory.step_trace[key].cpu().contiguous()
                 )
 
         if len(self.curr_obs) > 0:
@@ -925,14 +925,14 @@ class EmbodiedRolloutResult:
                 splited_trajectories[i].forward_inputs = splited_forward_inputs[i]
 
         if (
-            all_trajectory.rlt_step_trace is not None
-            and len(all_trajectory.rlt_step_trace) > 0
+            all_trajectory.step_trace is not None
+            and len(all_trajectory.step_trace) > 0
         ):
             splited_step_trace = split_dict_to_chunk(
-                all_trajectory.rlt_step_trace, split_size, dim=2
+                all_trajectory.step_trace, split_size, dim=2
             )
             for i in range(split_size):
-                splited_trajectories[i].rlt_step_trace = splited_step_trace[i]
+                splited_trajectories[i].step_trace = splited_step_trace[i]
 
         for field_name in all_trajectory.__dataclass_fields__.keys():
             value = getattr(all_trajectory, field_name)
@@ -1007,19 +1007,19 @@ def convert_trajectories_to_batch(
             if tensors:
                 batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
 
-    if trajectories[0].rlt_step_trace:
+    if trajectories[0].step_trace:
         all_keys: set[str] = set()
         for traj in trajectories:
-            all_keys.update(traj.rlt_step_trace.keys())
-        batch["rlt_step_trace"] = {}
+            all_keys.update(traj.step_trace.keys())
+        batch["step_trace"] = {}
         for key in all_keys:
             tensors = [
-                traj.rlt_step_trace[key]
+                traj.step_trace[key]
                 for traj in trajectories
-                if key in traj.rlt_step_trace
+                if key in traj.step_trace
             ]
             if tensors:
-                batch["rlt_step_trace"][key] = torch.cat(tensors, dim=2)
+                batch["step_trace"][key] = torch.cat(tensors, dim=2)
 
     # -------- tensor fields --------
     reference_trajectory = trajectories[0]

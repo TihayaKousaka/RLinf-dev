@@ -90,7 +90,7 @@ def build_hf_rollout_adapter(
     has_expert_model_config: bool,
 ):
     """Build the optional rollout adapter for the configured algorithm."""
-    from rlinf.models.embodiment.rlt_stage2.rollout_adapter import (
+    from rlinf.models.embodiment.rlt_stage2.rollout import (
         RLTStage2RolloutAdapter,
     )
 

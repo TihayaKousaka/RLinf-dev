@@ -16,16 +16,117 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
-
-from .status import phase_id, resolve_training_phase, utc_timestamp
 
 
 SKIP_REASON_NONE = 0
 SKIP_REASON_BUFFER_NOT_READY = 1
 SKIP_REASON_NO_PENDING_UPDATES = 2
 SKIP_REASON_UPDATE_RATIO_DISABLED = 3
+
+PHASE_WARMUP = "warmup"
+PHASE_WARMUP_WAIT_ONLINE = "warmup_wait_online"
+PHASE_ONLINE = "online"
+
+PHASE_TO_ID = {
+    PHASE_WARMUP: 0,
+    PHASE_WARMUP_WAIT_ONLINE: 1,
+    PHASE_ONLINE: 2,
+}
+
+
+def utc_timestamp() -> str:
+    """Return an ISO-8601 UTC timestamp for status payloads."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def resolve_training_phase(
+    *,
+    buffer_ready: bool,
+    ready_for_online: bool,
+) -> str:
+    """Resolve the actor-side training phase."""
+    if not buffer_ready:
+        return PHASE_WARMUP
+    if not ready_for_online:
+        return PHASE_WARMUP_WAIT_ONLINE
+    return PHASE_ONLINE
+
+
+def resolve_rollout_phase(
+    *,
+    ready_for_online: bool,
+    student_control_rate: float,
+) -> str:
+    """Resolve the env-side rollout phase from rollout forward inputs."""
+    if not ready_for_online:
+        return PHASE_WARMUP
+    if float(student_control_rate) > 0.0:
+        return PHASE_ONLINE
+    return PHASE_WARMUP_WAIT_ONLINE
+
+
+def phase_id(phase: str) -> int:
+    """Return the stable numeric id for a phase string."""
+    return PHASE_TO_ID.get(phase, -1)
+
+
+def metric_mean(
+    metrics: dict[str, Any],
+    key: str,
+    *,
+    default: float | None = None,
+) -> float | None:
+    """Return a float mean for a tensor/list/scalar metric."""
+    if key not in metrics:
+        return default
+    value = metrics[key]
+    try:
+        import torch
+    except ModuleNotFoundError:
+        torch = None
+
+    if torch is None:
+        if value is None:
+            return default
+        if isinstance(value, list):
+            if not value:
+                return default
+            return float(sum(float(item) for item in value) / len(value))
+        return float(value)
+
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return default
+        return float(value.detach().float().mean().cpu().item())
+    if isinstance(value, list):
+        tensors = [
+            item.detach().float().reshape(-1).cpu()
+            if isinstance(item, torch.Tensor)
+            else torch.as_tensor(item, dtype=torch.float32).reshape(-1)
+            for item in value
+        ]
+        tensors = [tensor for tensor in tensors if tensor.numel() > 0]
+        if not tensors:
+            return default
+        return float(torch.cat(tensors).mean().item())
+    if value is None:
+        return default
+    return float(value)
+
+
+def write_status_json(path: str, payload: dict[str, Any]) -> None:
+    """Atomically write a small JSON status payload."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2, sort_keys=True)
+        file.write("\n")
+    os.replace(tmp_path, path)
 
 
 @dataclass(frozen=True)
@@ -256,6 +357,8 @@ def resolve_replay_readiness(
     has_demo_buffer: bool,
     global_min_replay_size: int,
     global_min_demo_size: int,
+    min_replay_buffer_size: int = 0,
+    min_demo_buffer_size: int = 0,
 ) -> RLTReplayReadiness:
     """Resolve whether replay/demo buffers are ready for RLT updates."""
     replay_cfg = cfg.algorithm.get("replay_buffer", {})
@@ -265,9 +368,13 @@ def resolve_replay_readiness(
             cfg.algorithm.get("warmup_min_size", 1),
         )
     )
-    min_demo_buffer_size = int(
-        cfg.algorithm.get("demo_buffer", {}).get("min_buffer_size", 0)
+    warmup_min_size = max(warmup_min_size, int(min_replay_buffer_size))
+    configured_min_demo_size = (
+        int(cfg.algorithm.get("demo_buffer", {}).get("min_buffer_size", 0))
+        if has_demo_buffer
+        else 0
     )
+    min_demo_buffer_size = max(configured_min_demo_size, int(min_demo_buffer_size))
     if has_demo_buffer:
         min_demo_buffer_size = max(min_demo_buffer_size, 1)
     demo_ready = (not has_demo_buffer) or global_min_demo_size >= min_demo_buffer_size
@@ -303,6 +410,8 @@ class RLTStage2TrainingScheduler:
         global_counters: dict[str, float],
         global_min_replay_size: int,
         global_min_demo_size: int,
+        min_replay_buffer_size: int = 0,
+        min_demo_buffer_size: int = 0,
     ) -> RLTTrainingPlan:
         """Resolve the current RLT training plan from distributed counters."""
         readiness = resolve_replay_readiness(
@@ -310,6 +419,8 @@ class RLTStage2TrainingScheduler:
             has_demo_buffer=has_demo_buffer,
             global_min_replay_size=global_min_replay_size,
             global_min_demo_size=global_min_demo_size,
+            min_replay_buffer_size=min_replay_buffer_size,
+            min_demo_buffer_size=min_demo_buffer_size,
         )
         global_total_transitions_added = int(
             global_counters["total_transitions_added"]

@@ -32,7 +32,7 @@ from torch import Tensor, nn
 
 from rlinf.models.embodiment.modules.utils import make_mlp
 
-from .transition import TransitionSource
+from .rollout import TransitionSource
 
 
 def _make_mlp(

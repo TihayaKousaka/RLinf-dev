@@ -513,7 +513,7 @@ class MultiStepRolloutWorker(Worker):
                         env_output.get("final_obs", None)
                     ),
                     save_flags=save_flags,
-                    rlt_step_trace=step_trace,
+                    step_trace=step_trace,
                     forward_inputs=result["forward_inputs"],
                     versions=torch.full_like(
                         result["prev_logprobs"],
@@ -540,7 +540,7 @@ class MultiStepRolloutWorker(Worker):
                 bootstrap_values=self.get_bootstrap_values(
                     env_output.get("final_obs", None)
                 ),
-                rlt_step_trace=step_trace,
+                step_trace=step_trace,
                 forward_inputs=forward_inputs,
             )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
@@ -709,7 +709,7 @@ class MultiStepRolloutWorker(Worker):
         if any(step_obs is not None for step_obs in step_obs_list):
             if any(step_obs is None for step_obs in step_obs_list):
                 raise ValueError(
-                    "Inconsistent RLT step_obs: some env shards are None while others are present."
+                    "Inconsistent step_obs: some env shards are None while others are present."
                 )
             assert step_obs_list[0] is not None
             merged_step_obs = {}
@@ -831,13 +831,13 @@ class MultiStepRolloutWorker(Worker):
                 for idx in range(len(sizes))
             ]
         )
-        split_rlt_step_trace = (
+        split_step_trace = (
             [{} for _ in sizes]
-            if not rollout_result.rlt_step_trace
+            if not rollout_result.step_trace
             else [
                 {
                     key: torch.split(value, sizes, dim=1)[idx]
-                    for key, value in rollout_result.rlt_step_trace.items()
+                    for key, value in rollout_result.step_trace.items()
                 }
                 for idx in range(len(sizes))
             ]
@@ -851,7 +851,7 @@ class MultiStepRolloutWorker(Worker):
                 bootstrap_values=split_bootstrap_values[idx],
                 save_flags=split_save_flags[idx],
                 forward_inputs=split_forward_inputs[idx],
-                rlt_step_trace=split_rlt_step_trace[idx],
+                step_trace=split_step_trace[idx],
                 versions=split_versions[idx],
             )
             for idx in range(len(sizes))

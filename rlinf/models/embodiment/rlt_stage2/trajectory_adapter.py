@@ -21,7 +21,7 @@ from omegaconf import DictConfig
 
 from rlinf.data.embodied_io_struct import Trajectory
 
-from .transition import (
+from .rollout import (
     COLLECTION_PHASE_UNKNOWN,
     TransitionSource,
     resolve_chunk_source,
@@ -43,10 +43,10 @@ class RLTStage2TrajectoryReplayAdapter:
 
         stride = int(self.cfg.actor.model.rlt_stage2.get("replay_subsample_stride", 0))
         if stride > 0:
-            if not traj.rlt_step_trace:
+            if not traj.step_trace:
                 raise RuntimeError(
                     "RLT Stage2 stride replay is enabled but trajectory has no "
-                    "rlt_step_trace. Refusing to fall back to chunk-boundary replay."
+                    "step_trace. Refusing to fall back to chunk-boundary replay."
                 )
             return self._step_trace_to_transitions(traj)
         return self._chunk_trajectory_to_transitions(traj)
@@ -181,7 +181,7 @@ class RLTStage2TrajectoryReplayAdapter:
             traj.actions is None
             or traj.rewards is None
             or traj.dones is None
-            or not traj.rlt_step_trace
+            or not traj.step_trace
         ):
             return [], 0
 
@@ -196,13 +196,13 @@ class RLTStage2TrajectoryReplayAdapter:
                 "cache policy-call features instead of forcing actor-side VLA encoding."
             )
 
-        anchor_offsets = traj.rlt_step_trace.get("anchor_offsets")
-        x_trace = traj.rlt_step_trace.get("x")
-        a_tilde_trace = traj.rlt_step_trace.get("a_tilde")
+        anchor_offsets = traj.step_trace.get("anchor_offsets")
+        x_trace = traj.step_trace.get("x")
+        a_tilde_trace = traj.step_trace.get("a_tilde")
         if anchor_offsets is None:
             raise RuntimeError(
                 "RLT Stage2 stride replay requires sparse "
-                "rlt_step_trace['anchor_offsets']; refusing to fall back to "
+                "step_trace['anchor_offsets']; refusing to fall back to "
                 "chunk-boundary replay."
             )
 
@@ -247,7 +247,7 @@ class RLTStage2TrajectoryReplayAdapter:
             if x_trace is None or a_tilde_trace is None:
                 raise RuntimeError(
                     "RLT sparse anchor trace has non-boundary offsets but is missing "
-                    "rlt_step_trace['x'] or rlt_step_trace['a_tilde']."
+                    "step_trace['x'] or step_trace['a_tilde']."
                 )
             if (
                 x_trace.shape[0] != chunk_steps
