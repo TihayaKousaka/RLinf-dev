@@ -352,9 +352,6 @@ class RLTStage2PolicyInfoAdapter:
             if intervention_phase is not None:
                 phase = intervention_phase.detach().float().reshape(-1).cpu()
                 if phase.numel() == actual_intervention.numel():
-                    env_metrics["grasp_intervention_rate"].append(
-                        actual_intervention * (phase == 1).float()
-                    )
                     env_metrics["insert_intervention_rate"].append(
                         actual_intervention * (phase == 2).float()
                     )
@@ -482,7 +479,6 @@ class RLTStage2PolicyInfoAdapter:
             "expert_takeover": torch.zeros(batch_size, dtype=torch.bool),
             "deviation": torch.zeros(batch_size, dtype=torch.bool),
             "deviation_count": torch.zeros(batch_size, dtype=torch.int64),
-            "grasp_deviation_count": torch.zeros(batch_size, dtype=torch.int64),
             "takeover_left": torch.zeros(batch_size, dtype=torch.int64),
             "takeover_used": torch.zeros(batch_size, dtype=torch.int64),
             "prev_yz_error": torch.full((batch_size,), float("nan"), dtype=torch.float32),
@@ -564,7 +560,6 @@ class RLTStage2PolicyInfoAdapter:
             state[key] = torch.where(done_any, default_tensor, current_value)
         for key in (
             "deviation_count",
-            "grasp_deviation_count",
             "takeover_left",
             "takeover_used",
         ):
@@ -662,10 +657,6 @@ class RLTStage2PolicyInfoAdapter:
             "in_critical_phase": state["in_critical_phase"].to(torch.bool)[:, None],
             "record_transition": state["record_transition"].to(torch.bool)[:, None],
         }
-        if "grasp_deviation_count" in state:
-            policy_info["grasp_deviation_count"] = state[
-                "grasp_deviation_count"
-            ].to(torch.float32)[:, None]
         if "critical_phase_started" in state:
             policy_info["critical_phase_started"] = state[
                 "critical_phase_started"

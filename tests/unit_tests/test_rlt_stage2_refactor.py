@@ -643,6 +643,66 @@ def test_realworld_policy_info_is_available_without_intervention():
     )
     assert updated["in_critical_phase"].tolist() == [[True], [False]]
     assert updated["record_transition"].tolist() == [[True], [False]]
+    assert "grasp_deviation_count" not in updated
+
+
+def test_rlt_stage2_policy_info_drops_grasp_intervention_residue():
+    adapter = build_policy_info_adapter(
+        _cfg(
+            env_type="realworld",
+            task_mode="critical_phase",
+            intervention_enable=True,
+        ),
+        train_batch_size=1,
+        eval_batch_size=1,
+    )
+
+    initial = adapter.init_stage(stage_id=0, mode="train", env=None)
+    assert initial is not None
+    assert "grasp_deviation_count" not in initial
+
+    updated = adapter.update_stage(
+        infos={
+            "policy_info": {
+                "expert_takeover": torch.tensor([[False]]),
+                "deviation": torch.tensor([[True]]),
+                "deviation_count": torch.tensor([[2.0]]),
+                "intervention_phase": torch.tensor([[2.0]]),
+                "takeover_left": torch.tensor([[1.0]]),
+                "takeover_used": torch.tensor([[3.0]]),
+                "in_critical_phase": torch.tensor([[True]]),
+                "record_transition": torch.tensor([[True]]),
+                "grasp_deviation_count": torch.tensor([[7.0]]),
+            }
+        },
+        chunk_dones=torch.tensor([[False, False]]),
+        stage_id=0,
+        mode="train",
+        env=None,
+    )
+    assert "grasp_deviation_count" not in updated
+
+    env_metrics = {}
+    adapter.collect_rollout_metrics(
+        env_metrics=env_metrics,
+        rollout_result=type(
+            "FakeRolloutResult",
+            (),
+            {
+                "forward_inputs": {
+                    "intervention_flags": torch.tensor([[True, False]]),
+                    "intervention_phase": torch.tensor([[2.0]]),
+                    "intervention_requested": torch.tensor([[True]]),
+                    "ready_for_online": torch.tensor([[True]]),
+                    "in_critical_phase": torch.tensor([[True]]),
+                    "record_transition": torch.tensor([[True]]),
+                    "student_control": torch.tensor([[True]]),
+                }
+            },
+        )(),
+    )
+    assert "grasp_intervention_rate" not in env_metrics
+    assert "insert_intervention_rate" in env_metrics
 
 
 def test_policy_info_adapter_factory_uses_model_plugin_discovery():
