@@ -38,6 +38,9 @@ MANISKILL_STAGE2_CONFIG = (
 REALWORLD_STAGE2_CONFIG = (
     ROOT / "examples/embodiment/config/rlt_stage2_realworld_joint.yaml"
 )
+REALWORLD_ENV_CONFIG = (
+    ROOT / "examples/embodiment/config/env/realworld_rlt_joint_peg_insertion.yaml"
+)
 
 
 def _load_yaml_config(path: Path):
@@ -244,26 +247,7 @@ def test_rlt_realworld_joint_dataconfig_contract():
 
 def test_rlt_realworld_stage2_yaml_dimension_contract():
     cfg = _load_yaml_config(REALWORLD_STAGE2_CONFIG)
-    raw_cfg = OmegaConf.to_container(cfg, resolve=False)
 
-    assert cfg.env.train.use_rlt_joint_obs is True
-    assert (
-        raw_cfg["env"]["train"]["main_image_key"]
-        == "${oc.env:RLT_REALWORLD_MAIN_IMAGE_KEY,main_camera}"
-    )
-    assert (
-        raw_cfg["env"]["train"]["wrist_image_key"]
-        == "${oc.env:RLT_REALWORLD_WRIST_IMAGE_KEY,wrist_camera}"
-    )
-    assert list(cfg.env.train.state_key_order) == [
-        "gripper",
-        "joint_pos",
-        "joint_vel",
-        "tcp_force",
-        "tcp_pose",
-        "tcp_torque",
-        "tcp_vel",
-    ]
     _assert_stage2_dimension_contract(
         cfg,
         config_name="pi05_rlt_realworld_joint",
@@ -273,3 +257,29 @@ def test_rlt_realworld_stage2_yaml_dimension_contract():
         proprio_dim=8,
         proprio_mode="joint_pos_gripper",
     )
+
+
+def test_rlt_realworld_env_yaml_observation_contract():
+    cfg = _load_yaml_config(REALWORLD_ENV_CONFIG)
+    raw_cfg = OmegaConf.to_container(cfg, resolve=False)
+
+    assert cfg.use_rlt_joint_obs is True
+    assert raw_cfg["main_image_key"] == (
+        "${oc.env:RLT_REALWORLD_MAIN_IMAGE_KEY,main_camera}"
+    )
+    assert raw_cfg["wrist_image_key"] == (
+        "${oc.env:RLT_REALWORLD_WRIST_IMAGE_KEY,wrist_camera}"
+    )
+    assert cfg.gello_action_mode == "joint_target"
+    assert raw_cfg["init_params"]["id"] == (
+        "${oc.env:RLT_REALWORLD_JOINT_ENV_ID,FrankaJointPegInsertionEnv-v1}"
+    )
+    assert list(cfg.state_key_order) == [
+        "gripper",
+        "joint_pos",
+        "joint_vel",
+        "tcp_force",
+        "tcp_pose",
+        "tcp_torque",
+        "tcp_vel",
+    ]
