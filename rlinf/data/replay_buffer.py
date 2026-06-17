@@ -959,10 +959,17 @@ class TrajectoryReplayBuffer:
 
     def get_stats(self) -> dict[str, float]:
         """Get buffer statistics."""
+        max_num_samples = float(self.max_num_samples or 0)
+        fill_ratio = (
+            min(float(self._total_samples) / max_num_samples, 1.0)
+            if max_num_samples > 0
+            else 0.0
+        )
         stats = {
             "num_trajectories": self.size,
             "total_samples": self._total_samples,
-            "max_num_samples": float(self.max_num_samples or 0),
+            "max_num_samples": max_num_samples,
+            "fill_ratio": fill_ratio,
             "cache_size": len(self._flat_trajectory_cache.cache)
             if self._flat_trajectory_cache
             else 0,

@@ -572,6 +572,14 @@ class EnvWorker(Worker):
                 intervene_actions = final_info["intervene_action"]
                 intervene_flags = final_info["intervene_flag"]
 
+        policy_info = infos.get("policy_info") if isinstance(infos, dict) else None
+        if isinstance(policy_info, dict):
+            deviation = policy_info.get("deviation")
+            if isinstance(deviation, torch.Tensor):
+                env_info["deviation_rate"] = (
+                    deviation.detach().float().mean().reshape(1).cpu()
+                )
+
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
@@ -1135,6 +1143,30 @@ class EnvWorker(Worker):
             else:
                 env_metrics[key].append(value)
 
+    @staticmethod
+    def append_rlt_forward_metrics(
+        env_metrics: dict[str, list],
+        forward_inputs: dict[str, Any],
+    ) -> None:
+        """Record RLT route/status tensors emitted by rollout policy."""
+        if not isinstance(forward_inputs, dict):
+            return
+
+        metric_keys = (
+            ("intervention_flags", "expert_intervention_actual_rate"),
+            ("intervention_requested", "expert_intervention_requested_rate"),
+            ("ready_for_online", "rlt_ready_for_online"),
+            ("in_critical_phase", "rlt_in_critical_phase"),
+            ("record_transition", "rlt_record_transition"),
+            ("student_control", "student_control_rate"),
+        )
+        for forward_key, metric_key in metric_keys:
+            value = forward_inputs.get(forward_key)
+            if isinstance(value, torch.Tensor):
+                env_metrics[metric_key].append(
+                    value.detach().float().reshape(-1).cpu()
+                )
+
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
         self.last_env_infos_list = [
@@ -1211,6 +1243,10 @@ class EnvWorker(Worker):
 
                     rollout_result = self.recv_rollout_results(
                         input_channel, mode="train"
+                    )
+                    self.append_rlt_forward_metrics(
+                        env_metrics,
+                        rollout_result.forward_inputs,
                     )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
