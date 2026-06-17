@@ -64,6 +64,7 @@ if torch is not None and _HAS_NUMPY:
     )
     from rlinf.workers.env.env_worker import EnvWorker
     from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+    from rlinf.scheduler import Worker
     from toolkits.rlt import inspect_rlt_replay
 else:
     RLTStage2Policy = object
@@ -558,9 +559,10 @@ def test_rlt_replay_buffer_caps_active_samples_like_legacy_ring_buffer(tmp_path)
     assert not buffer.is_ready(4)
     assert len(buffer) == 3
     assert list(buffer._trajectory_id_list) == [3, 4, 5]
+    assert first_active_ids == [1, 2, 3]
     assert all(
         trajectory_id not in buffer._trajectory_index
-        for trajectory_id in first_active_ids
+        for trajectory_id in [0, 1, 2]
     )
 
     batch = buffer.sample(3)
@@ -933,6 +935,7 @@ def test_env_worker_auto_reset_bootstrap_preserves_env_infos():
     ]
     worker.last_intervened_info_list = [(None, None)]
     worker._timer_metrics = {}
+    worker._accelerator_type = Worker.accelerator_type
 
     env_outputs = EnvWorker.bootstrap_step(worker)
 
