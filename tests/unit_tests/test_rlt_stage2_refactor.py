@@ -184,6 +184,27 @@ def test_maniskill_rlt_intervention_config_remains_user_tunable():
     assert removed_grasp_phase_keys.isdisjoint(set(intervention.keys()))
 
 
+def test_rlt_expert_model_override_fits_structured_stage2_schema():
+    model_cfg = OmegaConf.load(RLT_STAGE2_MODEL_CONFIG)
+    OmegaConf.set_struct(model_cfg, True)
+
+    expert_overrides = OmegaConf.create(
+        {
+            "rlt_stage2": {
+                "act_as_vla_reference": True,
+                "load_feature_backbones": True,
+                "load_rl_token_model": False,
+            }
+        }
+    )
+
+    merged = OmegaConf.merge(model_cfg, expert_overrides)
+
+    assert merged.rlt_stage2.act_as_vla_reference is True
+    assert merged.rlt_stage2.load_feature_backbones is True
+    assert merged.rlt_stage2.load_rl_token_model is False
+
+
 def test_maniskill_local_correction_uses_intervention_takeover_knobs():
     controller = ManiSkillLocalCorrectionController(
         cfg=OmegaConf.create(
