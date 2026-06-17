@@ -1143,8 +1143,8 @@ class EnvWorker(Worker):
             else:
                 env_metrics[key].append(value)
 
-    @staticmethod
     def append_rlt_forward_metrics(
+        self,
         env_metrics: dict[str, list],
         forward_inputs: dict[str, Any],
     ) -> None:
