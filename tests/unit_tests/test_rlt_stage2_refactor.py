@@ -1226,11 +1226,12 @@ class _FakeRLTStage2Policy(RLTStage2Policy):
         apply_ref_dropout=None,
         apply_action_noise=None,
     ):
+        batch_size = int(x.shape[0])
         del x, a_tilde, deterministic, apply_ref_dropout, apply_action_noise
         return torch.tensor(
             [[1.0, 1.0, 2.0, 2.0]],
             dtype=torch.float32,
-        ).expand(x.shape[0], -1)
+        ).expand(batch_size, -1)
 
 
 def test_rlt_stage2_policy_predict_action_batch_owns_online_route():
