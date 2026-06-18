@@ -58,15 +58,6 @@ init_params:
 override_cfg:
   is_dummy: false
   task_description: "insert the peg in the hole"
-  joint_command_topic: "${oc.env:RLT_REALWORLD_JOINT_COMMAND_TOPIC,/joint_states_gripper}"
-  joint_command_joint_names:
-    - panda_joint1
-    - panda_joint2
-    - panda_joint3
-    - panda_joint4
-    - panda_joint5
-    - panda_joint6
-    - panda_joint7
   # Replace placeholders with calibrated realworld joint-task values before running hardware.
   target_ee_pose: TARGET_EE_POSE
   joint_reset_qpos: RESET_JOINT_QPOS

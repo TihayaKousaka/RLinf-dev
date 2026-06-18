@@ -45,6 +45,23 @@ def _select_task_mode_reset_qpos(
     env_cfg: Mapping[str, Any],
 ) -> dict[str, Any]:
     selected_cfg = dict(override_cfg)
+    stale_keys = [
+        key
+        for key in (
+            "reset_joint_qpos",
+            "joint_move_timeout",
+            "reset_gripper_action",
+            "joint_command_topic",
+            "joint_command_joint_names",
+        )
+        if key in selected_cfg
+    ]
+    if stale_keys:
+        raise ValueError(
+            "FrankaJointPegInsertionEnv no longer accepts stale joint-RLT "
+            f"override keys: {stale_keys}. Use joint_reset_qpos and the "
+            "built-in Franka/PegInsertion reset path."
+        )
     task_mode = str(env_cfg.get("task_mode", "critical_phase"))
     reset_key = (
         "full_task_reset_joint_qpos"
