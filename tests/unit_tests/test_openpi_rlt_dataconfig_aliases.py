@@ -260,6 +260,8 @@ def test_rlt_realworld_stage2_yaml_dimension_contract():
         proprio_dim=8,
         proprio_mode="joint_pos_gripper",
     )
+    assert cfg.env.train.keyboard_reward_wrapper is None
+    assert cfg.env.eval.keyboard_reward_wrapper is None
 
 
 def test_rlt_realworld_env_yaml_observation_contract():
@@ -277,6 +279,8 @@ def test_rlt_realworld_env_yaml_observation_contract():
     assert raw_cfg["init_params"]["id"] == (
         "${oc.env:RLT_REALWORLD_JOINT_ENV_ID,FrankaJointPegInsertionEnv-v1}"
     )
+    assert "target_ee_pose" in raw_cfg["override_cfg"]
+    assert "target_pos" not in raw_cfg["override_cfg"]
     assert list(cfg.state_key_order) == [
         "gripper",
         "joint_pos",

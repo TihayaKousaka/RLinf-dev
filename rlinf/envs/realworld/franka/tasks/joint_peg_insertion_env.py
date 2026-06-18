@@ -18,15 +18,14 @@ from __future__ import annotations
 
 import copy
 import time
-import warnings
 from dataclasses import dataclass, field
 
 import gymnasium as gym
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 
-from rlinf.envs.realworld.franka.franka_env import FrankaEnv, FrankaRobotConfig
+from rlinf.envs.realworld.franka.franka_env import FrankaEnv
 from rlinf.envs.realworld.franka.franka_robot_state import FrankaRobotState
+from rlinf.envs.realworld.franka.tasks.peg_insertion_env import PegInsertionConfig
 
 _FRANKA_JOINT_LIMIT_LOW = np.array(
     [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
@@ -48,17 +47,13 @@ _DEFAULT_FRANKA_JOINT_NAMES = [
 
 
 @dataclass
-class FrankaJointPegInsertionConfig(FrankaRobotConfig):
+class FrankaJointPegInsertionConfig(PegInsertionConfig):
     """Configuration for 8D realworld RLT joint-control peg insertion."""
 
     task_description: str = "insert the peg in the hole"
     target_ee_pose: np.ndarray = field(
         default_factory=lambda: np.array([0.5, 0.0, 0.1, -3.14, 0.0, 0.0])
     )
-    reset_ee_pose: np.ndarray = field(
-        default_factory=lambda: np.array([0.5, 0.0, 0.2, -3.14, 0.0, 0.0])
-    )
-    target_pos: list[float] | np.ndarray | None = None
     reward_threshold: np.ndarray = field(
         default_factory=lambda: np.array([0.015, 0.015, 0.03, 0.2, 0.2, 0.2])
     )
@@ -76,7 +71,6 @@ class FrankaJointPegInsertionConfig(FrankaRobotConfig):
     max_joint_delta: float | list[float] = 0.08
     joint_move_timeout: float = 1.5
     reset_gripper_action: float = -1.0
-    check_orientation_success: bool = False
     joint_command_topic: str | None = "/joint_states_gripper"
     joint_command_joint_names: list[str] | None = field(
         default_factory=lambda: _DEFAULT_FRANKA_JOINT_NAMES.copy()
@@ -85,7 +79,6 @@ class FrankaJointPegInsertionConfig(FrankaRobotConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        self.target_pos = self._normalize_target_pos(self.target_pos)
         self.joint_limit_low = np.asarray(self.joint_limit_low, dtype=np.float64)
         self.joint_limit_high = np.asarray(self.joint_limit_high, dtype=np.float64)
         if self.joint_limit_low.shape != (7,) or self.joint_limit_high.shape != (7,):
@@ -104,40 +97,6 @@ class FrankaJointPegInsertionConfig(FrankaRobotConfig):
         self.full_task_reset_joint_qpos = self._normalize_optional_joint_qpos(
             self.full_task_reset_joint_qpos,
             field_name="full_task_reset_joint_qpos",
-        )
-
-    @staticmethod
-    def _normalize_target_pos(
-        value: list[float] | np.ndarray | None,
-    ) -> np.ndarray | None:
-        """Normalize RLT's xyz success target.
-
-        Some Franka examples use a 6D end-effector target pose. This joint-control
-        task only consumes xyz for automatic success checks, so a pasted 6D value
-        is treated as xyz plus ignored orientation.
-        """
-        if value is None:
-            return None
-        try:
-            vector = np.asarray(value, dtype=np.float64).reshape(-1)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "target_pos must be a numeric xyz target for RLT joint control; "
-                "replace any placeholder with calibrated realworld values."
-            ) from exc
-        if vector.shape == (3,):
-            return vector
-        if vector.shape == (6,):
-            warnings.warn(
-                "FrankaJointPegInsertionConfig.target_pos received 6 values. "
-                "RLT joint control uses only xyz; orientation values are ignored.",
-                stacklevel=2,
-            )
-            return vector[:3].copy()
-        raise ValueError(
-            "target_pos must be 3D xyz for RLT joint control, got "
-            f"{len(vector)}; replace any placeholder with calibrated realworld "
-            "values."
         )
 
     @classmethod
@@ -370,55 +329,6 @@ class FrankaJointPegInsertionEnv(FrankaEnv):
             upper[finite_delta] += max_delta[finite_delta]
             q_target = np.clip(q_target, lower, upper)
         return np.clip(q_target, self._joint_limit_low, self._joint_limit_high)
-
-    def _calc_step_reward(
-        self,
-        observation: dict[str, np.ndarray | FrankaRobotState],
-        is_gripper_action_effective: bool = False,
-    ) -> float:
-        """Sparse success reward for realworld peg insertion."""
-        if self.config.use_reward_model:
-            reward = self._compute_reward_model(observation)
-            if reward >= 1.0:
-                self._success_hold_counter += 1
-            else:
-                self._success_hold_counter = 0
-            return reward
-
-        if self.config.is_dummy:
-            return 0.0
-
-        euler_angles = np.abs(
-            R.from_quat(self._franka_state.tcp_pose[3:].copy()).as_euler("xyz")
-        )
-        target_pos = (
-            self.config.target_pos
-            if self.config.target_pos is not None
-            else self.config.target_ee_pose[:3]
-        )
-        position = np.hstack([self._franka_state.tcp_pose[:3], euler_angles])
-        target_pose = np.hstack([target_pos, self.config.target_ee_pose[3:]])
-        target_delta = np.abs(position - target_pose)
-        success_mask = target_delta <= self.config.reward_threshold
-        is_success = bool(
-            success_mask.all()
-            if self.config.check_orientation_success
-            else success_mask[:3].all()
-        )
-
-        if is_success:
-            self._success_hold_counter += 1
-            reward = 1.0
-        else:
-            self._success_hold_counter = 0
-            if self.config.use_dense_reward:
-                reward = float(np.exp(-500 * np.sum(np.square(target_delta[:3]))))
-            else:
-                reward = 0.0
-
-        if self.config.enable_gripper_penalty and is_gripper_action_effective:
-            reward -= self.config.gripper_penalty
-        return reward
 
     def _get_observation(self) -> dict:
         observation = super()._get_observation()

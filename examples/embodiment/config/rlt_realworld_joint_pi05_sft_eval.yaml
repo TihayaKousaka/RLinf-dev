@@ -134,7 +134,7 @@ env:
     use_spacemouse: False
     override_cfg:
       # Replace placeholders with calibrated realworld joint-task values before running hardware.
-      target_pos: TARGET_POS
+      target_ee_pose: TARGET_EE_POSE
       reset_joint_qpos: RESET_JOINT_QPOS
       critical_phase_reset_joint_qpos: CRITICAL_PHASE_RESET_JOINT_QPOS
       full_task_reset_joint_qpos: FULL_TASK_RESET_JOINT_QPOS

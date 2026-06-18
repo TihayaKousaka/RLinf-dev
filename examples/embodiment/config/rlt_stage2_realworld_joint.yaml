@@ -116,7 +116,7 @@ env:
     auto_reset: True
     ignore_terminations: False
     reward_mode: raw
-    keyboard_reward_wrapper: single_stage
+    keyboard_reward_wrapper: null
     max_episode_steps: 100
     max_steps_per_rollout_epoch: 100
     # Teleoperation backend for human_override intervention.
@@ -136,7 +136,7 @@ env:
     auto_reset: True
     ignore_terminations: False
     reward_mode: raw
-    keyboard_reward_wrapper: single_stage
+    keyboard_reward_wrapper: null
     max_episode_steps: 100
     max_steps_per_rollout_epoch: 100
     policy_mode: eval
