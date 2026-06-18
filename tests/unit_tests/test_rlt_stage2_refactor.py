@@ -527,7 +527,7 @@ def test_trajectory_adapter_builds_step_stride_windows_from_trace():
     )
 
     assert completed_episodes == 1
-    assert len(replay_trajectories) == 4
+    assert len(replay_trajectories) == 3
     inputs = [trajectory.forward_inputs for trajectory in replay_trajectories]
 
     torch.testing.assert_close(
@@ -537,7 +537,6 @@ def test_trajectory_adapter_builds_step_stride_windows_from_trace():
                 [0.0, 0.1, 0.2],
                 [1.0, 1.1, 1.2],
                 [2.0, 2.1, 2.2],
-                [3.0, 3.1, 3.2],
             ],
             dtype=torch.float32,
         ),
@@ -548,7 +547,6 @@ def test_trajectory_adapter_builds_step_stride_windows_from_trace():
             [
                 [2.0, 2.1, 2.2],
                 [3.0, 3.1, 3.2],
-                [4.0, 4.1, 4.2],
                 [4.0, 4.1, 4.2],
             ],
             dtype=torch.float32,
@@ -561,7 +559,6 @@ def test_trajectory_adapter_builds_step_stride_windows_from_trace():
                 [1.0, 1.1, 2.0, 2.1],
                 [2.0, 2.1, 3.0, 3.1],
                 [3.0, 3.1, 4.0, 4.1],
-                [4.0, 4.1, 0.0, 0.0],
             ],
             dtype=torch.float32,
         ),
@@ -573,25 +570,18 @@ def test_trajectory_adapter_builds_step_stride_windows_from_trace():
                 [10.0, 10.1, 10.2, 10.3],
                 [20.0, 20.1, 20.2, 20.3],
                 [30.0, 30.1, 30.2, 30.3],
-                [40.0, 40.1, 40.2, 40.3],
             ],
             dtype=torch.float32,
         ),
     )
-    assert [item["step_id"].item() for item in inputs] == [0, 1, 2, 3]
+    assert [item["step_id"].item() for item in inputs] == [0, 1, 2]
     assert [bool(item["dones"].item()) for item in inputs] == [
         False,
         False,
         True,
-        True,
     ]
     assert inputs[2]["source"].item() == TransitionSource.MIXED
     assert bool(inputs[2]["intervention_flag"].item()) is True
-    assert inputs[3]["source_chunk"].reshape(-1).tolist() == [
-        int(TransitionSource.HUMAN),
-        int(TransitionSource.BASE),
-    ]
-    assert inputs[3]["source"].item() == TransitionSource.HUMAN
 
 
 def test_trajectory_adapter_rejects_stride_without_step_trace():
@@ -1232,10 +1222,30 @@ class _FakeRLTStage2Policy(RLTStage2Policy):
         self.intervention_mode = "human_override"
         self.act_as_vla_reference = False
         self.replay_subsample_stride = 0
+        self.replay_feature_batch_size = 0
+        self.prepare_features_calls = []
 
     def _prepare_features(self, env_obs):
         batch_size = int(env_obs["states"].shape[0])
-        x = torch.ones((batch_size, 3), dtype=torch.float32)
+        tokenized_prompt = env_obs.get("tokenized_prompt")
+        tokenized_prompt_mask = env_obs.get("tokenized_prompt_mask")
+        self.prepare_features_calls.append(
+            {
+                "batch_size": batch_size,
+                "states": env_obs["states"].clone(),
+                "task_descriptions": env_obs.get("task_descriptions"),
+                "has_tokenized_prompt": isinstance(tokenized_prompt, torch.Tensor),
+                "tokenized_prompt_shape": (
+                    tuple(tokenized_prompt.shape)
+                    if isinstance(tokenized_prompt, torch.Tensor)
+                    else None
+                ),
+                "has_tokenized_prompt_mask": isinstance(
+                    tokenized_prompt_mask, torch.Tensor
+                ),
+            }
+        )
+        x = env_obs["states"].reshape(batch_size, -1).to(torch.float32)
         a_tilde = torch.tensor(
             [[0.1, 0.2, 0.3, 0.4]],
             dtype=torch.float32,
@@ -1336,6 +1346,60 @@ def test_rlt_stage2_policy_emits_step_trace_schema_when_stride_enabled():
     ]
     assert record_trace.shape == (1, 2, 1)
     assert record_trace.reshape(1, 2).tolist() == [[False, True]]
+
+    assert len(policy.prepare_features_calls) == 2
+    assert policy.prepare_features_calls[1]["has_tokenized_prompt"] is True
+    assert policy.prepare_features_calls[1]["has_tokenized_prompt_mask"] is True
+    assert policy.prepare_features_calls[1]["tokenized_prompt_shape"] == (2, 2)
+
+
+def test_rlt_stage2_policy_step_trace_micro_batches_feature_encoding():
+    policy = _FakeRLTStage2Policy()
+    policy.replay_subsample_stride = 1
+    policy.replay_feature_batch_size = 2
+    trace_states = torch.tensor(
+        [
+            [[0.0, 0.1, 0.2], [1.0, 1.1, 1.2]],
+            [[2.0, 2.1, 2.2], [3.0, 3.1, 3.2]],
+            [[4.0, 4.1, 4.2], [5.0, 5.1, 5.2]],
+        ],
+        dtype=torch.float32,
+    )
+    env_infos = {
+        "policy_info": {
+            "expert_takeover": torch.zeros((3, 1), dtype=torch.bool),
+            "in_critical_phase": torch.ones((3, 1), dtype=torch.bool),
+            "record_transition": torch.ones((3, 1), dtype=torch.bool),
+            "intervention_phase": torch.zeros((3, 1), dtype=torch.float32),
+        },
+        "rlt_step_trace_obs": {
+            "states": trace_states,
+            "task_descriptions": ["insert", "insert", "insert"],
+        },
+        "rlt_step_trace_infos": {
+            "policy_info": {
+                "record_transition": torch.tensor(
+                    [[False, True], [True, True], [False, False]]
+                ),
+            },
+        },
+    }
+
+    _, result = policy.predict_action_batch(
+        env_obs={"states": torch.zeros((3, 3), dtype=torch.float32)},
+        mode="train",
+        env_infos=env_infos,
+    )
+
+    forward_inputs = result["forward_inputs"]
+    torch.testing.assert_close(
+        forward_inputs["rlt_step_trace"]["x"],
+        trace_states,
+    )
+    assert [call["batch_size"] for call in policy.prepare_features_calls] == [3, 2, 2, 2]
+    for call in policy.prepare_features_calls[1:]:
+        assert call["has_tokenized_prompt"] is True
+        assert call["tokenized_prompt_shape"] == (2, 2)
 
 
 def _route(

@@ -359,9 +359,6 @@ class RLTStage2TrajectoryReplayAdapter:
 
         chunk_len = int(self.cfg.actor.model.num_action_chunks)
         action_dim = int(self.cfg.actor.model.action_dim)
-        allow_terminal_partial = bool(
-            self.cfg.actor.model.rlt_stage2.get("replay_allow_terminal_partial", True)
-        )
         traj_len = int(traj.actions.shape[0])
         bsz = int(traj.actions.shape[1])
         replay_trajectories: list[Trajectory] = []
@@ -609,86 +606,48 @@ class RLTStage2TrajectoryReplayAdapter:
             phase_steps = torch.stack(flat_phase, dim=0).to(torch.uint8)
 
             total_steps = int(action_steps.shape[0])
-            segment_start = 0
-            while segment_start < total_steps:
-                done_indices = torch.nonzero(
-                    done_steps[segment_start:],
-                    as_tuple=False,
-                ).reshape(-1)
-                if done_indices.numel() > 0:
-                    segment_end = segment_start + int(done_indices[0].item()) + 1
-                    completed_episodes += 1
-                    is_terminal_segment = True
-                else:
-                    segment_end = total_steps
-                    is_terminal_segment = False
+            cursor = 0
+            while cursor < total_steps:
+                while cursor < total_steps and not bool(record_steps[cursor].item()):
+                    cursor += 1
+                if cursor >= total_steps:
+                    break
 
-                for start in range(segment_start, segment_end, stride):
-                    if not bool(record_steps[start].item()):
-                        continue
-                    end = start + chunk_len
-                    is_partial = end > segment_end
-                    if is_partial and not (
-                        allow_terminal_partial and is_terminal_segment
-                    ):
+                segment_start = cursor
+                segment_end = segment_start
+                is_terminal_segment = False
+                while segment_end < total_steps:
+                    if not bool(record_steps[segment_end].item()):
                         break
-                    valid_end = min(end, segment_end)
-                    pad_count = end - valid_end
+                    segment_end += 1
+                    if bool(done_steps[segment_end - 1].item()):
+                        completed_episodes += 1
+                        is_terminal_segment = True
+                        break
 
-                    action_chunk = action_steps[start:valid_end]
-                    rewards = reward_steps[start:valid_end]
-                    source_chunk = source_steps[start:valid_end]
-                    intervention = intervention_steps[start:valid_end]
+                segment_len = segment_end - segment_start
+                if segment_len < chunk_len:
+                    cursor = segment_end
+                    continue
+
+                window_starts = list(
+                    range(segment_start, segment_end - chunk_len + 1, stride)
+                )
+                if is_terminal_segment:
+                    terminal_start = segment_end - chunk_len
+                    if terminal_start not in window_starts:
+                        window_starts.append(terminal_start)
+
+                for start in window_starts:
+                    end = start + chunk_len
+                    action_chunk = action_steps[start:end]
+                    rewards = reward_steps[start:end]
+                    source_chunk = source_steps[start:end]
+                    intervention = intervention_steps[start:end]
                     source = resolve_chunk_source(source_chunk.cpu().numpy())
-                    if pad_count > 0:
-                        action_chunk = torch.cat(
-                            [
-                                action_chunk,
-                                torch.zeros(
-                                    (pad_count, action_dim),
-                                    dtype=action_chunk.dtype,
-                                    device=action_chunk.device,
-                                ),
-                            ],
-                            dim=0,
-                        )
-                        rewards = torch.cat(
-                            [
-                                rewards,
-                                torch.zeros(
-                                    pad_count,
-                                    dtype=rewards.dtype,
-                                    device=rewards.device,
-                                ),
-                            ],
-                            dim=0,
-                        )
-                        source_chunk = torch.cat(
-                            [
-                                source_chunk,
-                                torch.full(
-                                    (pad_count,),
-                                    int(TransitionSource.BASE),
-                                    dtype=torch.uint8,
-                                    device=source_chunk.device,
-                                ),
-                            ],
-                            dim=0,
-                        )
-                        intervention = torch.cat(
-                            [
-                                intervention,
-                                torch.zeros(
-                                    (pad_count, action_dim),
-                                    dtype=torch.bool,
-                                    device=intervention.device,
-                                ),
-                            ],
-                            dim=0,
-                        )
 
-                    done = bool(done_steps[start:valid_end].any().item())
-                    next_index = valid_end
+                    done = bool(done_steps[start:end].any().item())
+                    next_index = end
                     next_x = state_steps[next_index]
                     next_ref_chunk = ref_chunks_by_step[next_index]
                     ref_chunk = ref_chunks_by_step[start].reshape(
@@ -716,11 +675,6 @@ class RLTStage2TrajectoryReplayAdapter:
                         )
                     )
 
-                if is_terminal_segment:
-                    segment_start = (
-                        (segment_end + chunk_len - 1) // chunk_len
-                    ) * chunk_len
-                else:
-                    break
+                cursor = segment_end
 
         return replay_trajectories, completed_episodes

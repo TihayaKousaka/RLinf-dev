@@ -89,7 +89,7 @@ algorithm:
   replay_buffer:
     enable_cache: True
     cache_size: 10000
-    sample_window_size: 10000
+    sample_window_size: ${actor.model.rlt_stage2.buffer_capacity}  # Sample from the full active replay buffer.
     min_buffer_size: 100
     # Debug-only replay snapshot. Keep disabled in normal runs; enable when
     # inspecting whether realworld collection wrote reward/source/phase fields correctly.

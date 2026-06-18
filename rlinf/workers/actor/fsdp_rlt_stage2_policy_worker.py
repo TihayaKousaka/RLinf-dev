@@ -247,8 +247,6 @@ class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
                 fallback_capacity,
             )
         )
-        if capacity is not None:
-            sample_window_size = max(sample_window_size, int(capacity))
         return TrajectoryReplayBuffer(
             seed=int(seed),
             enable_cache=bool(buffer_cfg.get("enable_cache", True)),
@@ -301,58 +299,6 @@ class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
         # Do not send runner global_step here, otherwise warmup/intervention
         # gates open before any actor/critic update has actually happened.
         return int(self.update_step)
-
-    @Worker.timer("actor/sync_model_to_rollout")
-    async def sync_model_to_rollout(self) -> None:
-        if self.enable_offload:
-            if not self.is_optimizer_offloaded:
-                self.offload_optimizer()
-            if self.is_weight_offloaded:
-                self.load_param_and_grad(self.device, False)
-
-        state_dict = self.get_rollout_state_dict()
-
-        async def send_func(data):
-            if not self._is_weight_sender:
-                return
-            await self.broadcast(
-                data,
-                groups=[
-                    (self._group_name, 0),
-                    (self._rollout_group_name, self._rollout_all_ranks),
-                ],
-                src=(self._group_name, 0),
-                async_op=True,
-                options=self._sync_weight_comm_options,
-            ).async_wait()
-
-        async def recv_func():
-            return await self.recv(
-                src_group_name=self._rollout_group_name,
-                src_rank=0,
-                async_op=True,
-                options=self._sync_weight_comm_options,
-            ).async_wait()
-
-        if not self.weight_syncer.sender_initialized():
-            await self.weight_syncer.init_sender(
-                state_dict=state_dict,
-                send=send_func,
-                recv=recv_func,
-                param_names_need_sync=self.get_rollout_sync_param_names(state_dict),
-            )
-
-        await self.weight_syncer.sync(
-            state_dict,
-            send_func,
-            version=self.get_rollout_sync_version(),
-        )
-
-        if self.enable_offload:
-            assert not self.is_weight_offloaded, (
-                "weight should be offloaded in sync_model_to_rollout"
-            )
-            self.offload_param_and_grad(True)
 
     @Worker.timer("actor/recv_traj")
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
