@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import time
+import warnings
 from dataclasses import dataclass, field
 
 import gymnasium as gym
@@ -84,11 +85,7 @@ class FrankaJointPegInsertionConfig(FrankaRobotConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        self.target_pos = self._normalize_optional_vector(
-            self.target_pos,
-            field_name="target_pos",
-            length=3,
-        )
+        self.target_pos = self._normalize_target_pos(self.target_pos)
         self.joint_limit_low = np.asarray(self.joint_limit_low, dtype=np.float64)
         self.joint_limit_high = np.asarray(self.joint_limit_high, dtype=np.float64)
         if self.joint_limit_low.shape != (7,) or self.joint_limit_high.shape != (7,):
@@ -110,27 +107,38 @@ class FrankaJointPegInsertionConfig(FrankaRobotConfig):
         )
 
     @staticmethod
-    def _normalize_optional_vector(
+    def _normalize_target_pos(
         value: list[float] | np.ndarray | None,
-        *,
-        field_name: str,
-        length: int,
     ) -> np.ndarray | None:
+        """Normalize RLT's xyz success target.
+
+        Some Franka examples use a 6D end-effector target pose. This joint-control
+        task only consumes xyz for automatic success checks, so a pasted 6D value
+        is treated as xyz plus ignored orientation.
+        """
         if value is None:
             return None
         try:
             vector = np.asarray(value, dtype=np.float64).reshape(-1)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"{field_name} must be a {length}D numeric list; "
-                f"replace any placeholder with calibrated realworld values."
+                "target_pos must be a numeric xyz target for RLT joint control; "
+                "replace any placeholder with calibrated realworld values."
             ) from exc
-        if vector.shape != (length,):
-            raise ValueError(
-                f"{field_name} must be {length}D, got {len(vector)}; "
-                f"replace any placeholder with calibrated realworld values."
+        if vector.shape == (3,):
+            return vector
+        if vector.shape == (6,):
+            warnings.warn(
+                "FrankaJointPegInsertionConfig.target_pos received 6 values. "
+                "RLT joint control uses only xyz; orientation values are ignored.",
+                stacklevel=2,
             )
-        return vector
+            return vector[:3].copy()
+        raise ValueError(
+            "target_pos must be 3D xyz for RLT joint control, got "
+            f"{len(vector)}; replace any placeholder with calibrated realworld "
+            "values."
+        )
 
     @classmethod
     def _normalize_joint_qpos(
