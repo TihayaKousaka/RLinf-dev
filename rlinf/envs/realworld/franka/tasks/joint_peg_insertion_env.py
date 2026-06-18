@@ -23,9 +23,10 @@ from dataclasses import dataclass, field
 import gymnasium as gym
 import numpy as np
 
-from rlinf.envs.realworld.franka.franka_env import FrankaEnv
-from rlinf.envs.realworld.franka.franka_robot_state import FrankaRobotState
-from rlinf.envs.realworld.franka.tasks.peg_insertion_env import PegInsertionConfig
+from rlinf.envs.realworld.franka.tasks.peg_insertion_env import (
+    PegInsertionConfig,
+    PegInsertionEnv,
+)
 
 _FRANKA_JOINT_LIMIT_LOW = np.array(
     [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
@@ -63,14 +64,9 @@ class FrankaJointPegInsertionConfig(PegInsertionConfig):
     joint_limit_high: np.ndarray = field(
         default_factory=lambda: _FRANKA_JOINT_LIMIT_HIGH.copy()
     )
-    reset_joint_qpos: list[float] = field(
-        default_factory=lambda: [0.0, -0.785, 0.0, -2.35, 0.0, 1.57, 0.785]
-    )
     critical_phase_reset_joint_qpos: list[float] | None = None
     full_task_reset_joint_qpos: list[float] | None = None
     max_joint_delta: float | list[float] = 0.08
-    joint_move_timeout: float = 1.5
-    reset_gripper_action: float = -1.0
     joint_command_topic: str | None = "/joint_states_gripper"
     joint_command_joint_names: list[str] | None = field(
         default_factory=lambda: _DEFAULT_FRANKA_JOINT_NAMES.copy()
@@ -86,9 +82,9 @@ class FrankaJointPegInsertionConfig(PegInsertionConfig):
                 "Franka joint limits must both be 7D, got "
                 f"{self.joint_limit_low.shape=} and {self.joint_limit_high.shape=}."
             )
-        self.reset_joint_qpos = self._normalize_joint_qpos(
-            self.reset_joint_qpos,
-            field_name="reset_joint_qpos",
+        self.joint_reset_qpos = self._normalize_joint_qpos(
+            self.joint_reset_qpos,
+            field_name="joint_reset_qpos",
         )
         self.critical_phase_reset_joint_qpos = self._normalize_optional_joint_qpos(
             self.critical_phase_reset_joint_qpos,
@@ -138,7 +134,7 @@ class FrankaJointPegInsertionConfig(PegInsertionConfig):
         return cls._normalize_joint_qpos(qpos, field_name=field_name)
 
 
-class FrankaJointPegInsertionEnv(FrankaEnv):
+class FrankaJointPegInsertionEnv(PegInsertionEnv):
     """Single Franka peg insertion task with 8D absolute joint-target actions.
 
     Action layout:
@@ -254,52 +250,6 @@ class FrankaJointPegInsertionEnv(FrankaEnv):
         reward *= self.config.reward_scale
         info = {"executed_action": executed_action.astype(np.float32)}
         return observation, reward, terminated, truncated, info
-
-    def go_to_rest(self, joint_reset=False):
-        """Reset using joint-space targets instead of Cartesian EE deltas."""
-        if self.config.is_dummy:
-            q_target = np.asarray(self.config.reset_joint_qpos, dtype=np.float64)
-            self._franka_state.arm_joint_position = q_target
-            self._franka_state.arm_joint_velocity = np.zeros(7)
-            self._num_steps = 0
-            return
-
-        if joint_reset:
-            self._controller.reset_joint(self.config.joint_reset_qpos).wait()
-            time.sleep(0.5)
-
-        self._interpolate_joint_move(
-            np.asarray(self.config.reset_joint_qpos, dtype=np.float64),
-            timeout=float(self.config.joint_move_timeout),
-        )
-        if not self._is_hand:
-            self._end_effector_action(
-                np.array([float(self.config.reset_gripper_action)], dtype=np.float64)
-            )
-
-    def _interpolate_move(self, pose: np.ndarray, timeout: float = 1.5):
-        """Use joint reset during base ``FrankaEnv`` initialization."""
-        del pose
-        if self.config.is_dummy:
-            return
-        self._interpolate_joint_move(
-            np.asarray(self.config.reset_joint_qpos, dtype=np.float64),
-            timeout=timeout,
-        )
-
-    def _interpolate_joint_move(self, q_target: np.ndarray, timeout: float = 1.5):
-        q_target = np.clip(q_target, self._joint_limit_low, self._joint_limit_high)
-        if self.config.joint_command_topic is None:
-            self._controller.reset_joint(q_target.astype(float).tolist()).wait()
-            return
-
-        self._franka_state: FrankaRobotState = self._controller.get_state().wait()[0]
-        current_q = np.asarray(self._franka_state.arm_joint_position, dtype=np.float64)
-        num_steps = max(1, int(timeout * self.config.step_frequency))
-        for q in np.linspace(current_q, q_target, num_steps + 1)[1:]:
-            self._move_joint_action(q)
-            time.sleep(1.0 / self.config.step_frequency)
-        self._franka_state = self._controller.get_state().wait()[0]
 
     def _move_joint_action(self, q_target: np.ndarray):
         self._clear_error()

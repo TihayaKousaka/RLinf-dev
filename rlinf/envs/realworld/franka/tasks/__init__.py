@@ -53,7 +53,7 @@ def _select_task_mode_reset_qpos(
     )
     reset_qpos = selected_cfg.get(reset_key, None)
     if reset_qpos is not None:
-        selected_cfg["reset_joint_qpos"] = reset_qpos
+        selected_cfg["joint_reset_qpos"] = reset_qpos
     selected_cfg.pop("critical_phase_reset_joint_qpos", None)
     selected_cfg.pop("full_task_reset_joint_qpos", None)
     return selected_cfg

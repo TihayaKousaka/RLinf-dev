@@ -69,15 +69,12 @@ override_cfg:
     - panda_joint7
   # Replace placeholders with calibrated realworld joint-task values before running hardware.
   target_ee_pose: TARGET_EE_POSE
-  reset_joint_qpos: RESET_JOINT_QPOS
+  joint_reset_qpos: RESET_JOINT_QPOS
   critical_phase_reset_joint_qpos: CRITICAL_PHASE_RESET_JOINT_QPOS
   full_task_reset_joint_qpos: FULL_TASK_RESET_JOINT_QPOS
-  joint_reset_qpos: [0.0, 0.0, 0.0, -1.9, 0.0, 2.0, 0.0]
   joint_limit_low: [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
   joint_limit_high: [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
   max_joint_delta: 0.08
-  joint_move_timeout: 1.5
-  reset_gripper_action: -1.0
   reward_threshold: [0.015, 0.015, 0.03, 0.2, 0.2, 0.2]
   use_dense_reward: false
   reward_scale: 1.0
