@@ -724,19 +724,17 @@ class EmbodiedRolloutResult:
             trajectory.versions = torch.stack(self.versions, dim=0).cpu().contiguous()
         if len(self.forward_inputs) > 0:
             trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
-            for key in trajectory.forward_inputs.keys():
-                trajectory.forward_inputs[key] = (
-                    trajectory.forward_inputs[key].cpu().contiguous()
-                )
+            trajectory.forward_inputs = put_tensor_device(
+                trajectory.forward_inputs,
+                "cpu",
+            )
 
         if len(self.curr_obs) > 0:
             trajectory.curr_obs = stack_list_of_dict_tensor(self.curr_obs)
-            for key in trajectory.curr_obs.keys():
-                trajectory.curr_obs[key] = trajectory.curr_obs[key].cpu().contiguous()
+            trajectory.curr_obs = put_tensor_device(trajectory.curr_obs, "cpu")
         if len(self.next_obs) > 0:
             trajectory.next_obs = stack_list_of_dict_tensor(self.next_obs)
-            for key in trajectory.next_obs.keys():
-                trajectory.next_obs[key] = trajectory.next_obs[key].cpu().contiguous()
+            trajectory.next_obs = put_tensor_device(trajectory.next_obs, "cpu")
 
         trajectory.model_weights_id = get_model_weights_id(
             trajectory.versions

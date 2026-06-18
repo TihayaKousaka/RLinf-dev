@@ -33,6 +33,7 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
+from rlinf.utils.nested_dict_process import split_dict
 from rlinf.utils.placement import HybridComponentPlacement
 
 
@@ -773,13 +774,7 @@ class MultiStepRolloutWorker(Worker):
         split_forward_inputs = (
             [{} for _ in sizes]
             if not rollout_result.forward_inputs
-            else [
-                {
-                    key: torch.split(value, sizes, dim=0)[idx]
-                    for key, value in rollout_result.forward_inputs.items()
-                }
-                for idx in range(len(sizes))
-            ]
+            else split_dict(rollout_result.forward_inputs, sizes)
         )
 
         return [

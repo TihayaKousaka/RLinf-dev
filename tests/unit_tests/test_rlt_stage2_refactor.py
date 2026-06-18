@@ -43,7 +43,12 @@ if torch is not None and _HAS_NUMPY:
         ReplayBufferDataset,
         replay_buffer_collate_fn,
     )
-    from rlinf.data.embodied_io_struct import Trajectory
+    from rlinf.data.embodied_io_struct import (
+        ChunkStepResult,
+        EmbodiedRolloutResult,
+        RolloutResult,
+        Trajectory,
+    )
     from rlinf.data.replay_buffer import TrajectoryReplayBuffer
     from rlinf.envs.maniskill.rlt_intervention import (
         ManiSkillLocalCorrectionController,
@@ -366,18 +371,44 @@ def _synthetic_stride_rollout_trajectory() -> Trajectory:
             "x": torch.tensor(
                 [
                     [[0.0, 0.1, 0.2]],
-                    [[10.0, 10.1, 10.2]],
-                    [[20.0, 20.1, 20.2]],
+                    [[2.0, 2.1, 2.2]],
+                    [[4.0, 4.1, 4.2]],
                 ],
                 dtype=torch.float32,
             ),
             "a_tilde": torch.tensor(
                 [
-                    [[0.0, 0.0, 0.0, 0.0]],
-                    [[0.1, 0.1, 0.1, 0.1]],
-                    [[0.2, 0.2, 0.2, 0.2]],
+                    [[10.0, 10.1, 10.2, 10.3]],
+                    [[30.0, 30.1, 30.2, 30.3]],
+                    [[50.0, 50.1, 50.2, 50.3]],
                 ],
                 dtype=torch.float32,
+            ),
+            "rlt_step_trace": {
+                "x": torch.tensor(
+                    [
+                        [[[0.0, 0.1, 0.2], [0.0, 0.1, 0.2]]],
+                        [[[1.0, 1.1, 1.2], [2.0, 2.1, 2.2]]],
+                        [[[3.0, 3.1, 3.2], [4.0, 4.1, 4.2]]],
+                    ],
+                    dtype=torch.float32,
+                ),
+                "a_tilde": torch.tensor(
+                    [
+                        [[[10.0, 10.1, 10.2, 10.3], [10.0, 10.1, 10.2, 10.3]]],
+                        [[[20.0, 20.1, 20.2, 20.3], [30.0, 30.1, 30.2, 30.3]]],
+                        [[[40.0, 40.1, 40.2, 40.3], [50.0, 50.1, 50.2, 50.3]]],
+                    ],
+                    dtype=torch.float32,
+                ),
+            },
+            "rlt_step_trace_valid": torch.tensor(
+                [
+                    [[False]],
+                    [[True]],
+                    [[True]],
+                ],
+                dtype=torch.bool,
             ),
             "source_chunk": torch.tensor(
                 [
@@ -486,13 +517,136 @@ def test_trajectory_adapter_marks_env_side_override_as_human_source():
     assert bool(second_inputs["intervention_flag"].item()) is True
 
 
-def test_trajectory_adapter_rejects_legacy_worker_step_trace_stride():
+def test_trajectory_adapter_builds_step_stride_windows_from_trace():
     adapter = RLTStage2TrajectoryReplayAdapter(
         _cfg(replay_subsample_stride=1),
     )
 
-    with pytest.raises(ValueError, match="generic env/rollout worker hooks"):
-        adapter.build_replay_trajectories(_synthetic_stride_rollout_trajectory())
+    replay_trajectories, completed_episodes = adapter.build_replay_trajectories(
+        _synthetic_stride_rollout_trajectory()
+    )
+
+    assert completed_episodes == 1
+    assert len(replay_trajectories) == 4
+    inputs = [trajectory.forward_inputs for trajectory in replay_trajectories]
+
+    torch.testing.assert_close(
+        torch.stack([item["x"].reshape(-1) for item in inputs]),
+        torch.tensor(
+            [
+                [0.0, 0.1, 0.2],
+                [1.0, 1.1, 1.2],
+                [2.0, 2.1, 2.2],
+                [3.0, 3.1, 3.2],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+    torch.testing.assert_close(
+        torch.stack([item["next_x"].reshape(-1) for item in inputs]),
+        torch.tensor(
+            [
+                [2.0, 2.1, 2.2],
+                [3.0, 3.1, 3.2],
+                [4.0, 4.1, 4.2],
+                [4.0, 4.1, 4.2],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+    torch.testing.assert_close(
+        torch.stack([item["action_chunk"].reshape(-1) for item in inputs]),
+        torch.tensor(
+            [
+                [1.0, 1.1, 2.0, 2.1],
+                [2.0, 2.1, 3.0, 3.1],
+                [3.0, 3.1, 4.0, 4.1],
+                [4.0, 4.1, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+    torch.testing.assert_close(
+        torch.stack([item["ref_chunk"].reshape(-1) for item in inputs]),
+        torch.tensor(
+            [
+                [10.0, 10.1, 10.2, 10.3],
+                [20.0, 20.1, 20.2, 20.3],
+                [30.0, 30.1, 30.2, 30.3],
+                [40.0, 40.1, 40.2, 40.3],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+    assert [item["step_id"].item() for item in inputs] == [0, 1, 2, 3]
+    assert [bool(item["dones"].item()) for item in inputs] == [
+        False,
+        False,
+        True,
+        True,
+    ]
+    assert inputs[2]["source"].item() == TransitionSource.MIXED
+    assert bool(inputs[2]["intervention_flag"].item()) is True
+    assert inputs[3]["source_chunk"].reshape(-1).tolist() == [
+        int(TransitionSource.HUMAN),
+        int(TransitionSource.BASE),
+    ]
+    assert inputs[3]["source"].item() == TransitionSource.HUMAN
+
+
+def test_trajectory_adapter_rejects_stride_without_step_trace():
+    adapter = RLTStage2TrajectoryReplayAdapter(
+        _cfg(replay_subsample_stride=1),
+    )
+    traj = _synthetic_stride_rollout_trajectory()
+    traj.forward_inputs.pop("rlt_step_trace")
+
+    with pytest.raises(RuntimeError, match="rlt_step_trace"):
+        adapter.build_replay_trajectories(traj)
+
+
+def test_rollout_pipeline_preserves_nested_rlt_step_trace_forward_inputs():
+    rollout_result = RolloutResult(
+        actions=torch.arange(8, dtype=torch.float32).reshape(2, 4),
+        forward_inputs={
+            "x": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+            "rlt_step_trace": {
+                "x": torch.arange(12, dtype=torch.float32).reshape(2, 2, 3),
+                "a_tilde": torch.arange(16, dtype=torch.float32).reshape(2, 2, 4),
+            },
+            "rlt_step_trace_valid": torch.ones((2, 1), dtype=torch.bool),
+        },
+    )
+
+    worker = object.__new__(MultiStepRolloutWorker)
+    split_results = MultiStepRolloutWorker._split_rollout_result(
+        worker,
+        rollout_result,
+        [1, 1],
+    )
+
+    assert len(split_results) == 2
+    assert split_results[0].forward_inputs["rlt_step_trace"]["x"].shape == (1, 2, 3)
+    torch.testing.assert_close(
+        split_results[1].forward_inputs["rlt_step_trace"]["a_tilde"].reshape(-1),
+        torch.arange(8, 16, dtype=torch.float32),
+    )
+
+    builder = EmbodiedRolloutResult(max_episode_length=2)
+    for split_result in split_results:
+        builder.append_step_result(
+            ChunkStepResult(
+                actions=split_result.actions,
+                forward_inputs=split_result.forward_inputs,
+            )
+        )
+
+    trajectory = builder.to_trajectory()
+    assert trajectory.forward_inputs["rlt_step_trace"]["x"].shape == (2, 1, 2, 3)
+    torch.testing.assert_close(
+        trajectory.forward_inputs["rlt_step_trace"]["x"][:, 0],
+        rollout_result.forward_inputs["rlt_step_trace"]["x"],
+    )
 
 
 def test_rlt_replay_buffer_roundtrip_uses_rlinf_trajectory_format(tmp_path):
@@ -969,6 +1123,41 @@ def test_env_worker_auto_reset_bootstrap_preserves_env_infos():
     assert bool(policy_info["record_transition"].item()) is False
 
 
+def test_env_worker_rlt_step_trace_infos_accepts_prestacked_policy_info():
+    stacked = EnvWorker._stack_rlt_step_trace_infos(
+        [
+            {"policy_info": {"record_transition": torch.tensor([[False]])}},
+            {
+                "policy_info": {
+                    "record_transition": torch.tensor([[False, True]]),
+                    "in_critical_phase": torch.tensor([[False, True]]),
+                }
+            },
+        ],
+        expected_trace_len=2,
+    )
+
+    assert stacked is not None
+    policy_info = stacked["policy_info"]
+    assert policy_info["record_transition"].shape == (1, 2)
+    assert policy_info["record_transition"].tolist() == [[False, True]]
+
+
+def test_env_worker_rlt_step_trace_infos_stacks_per_step_policy_info():
+    stacked = EnvWorker._stack_rlt_step_trace_infos(
+        [
+            {"policy_info": {"record_transition": torch.tensor([[False]])}},
+            {"policy_info": {"record_transition": torch.tensor([[True]])}},
+        ],
+        expected_trace_len=2,
+    )
+
+    assert stacked is not None
+    policy_info = stacked["policy_info"]
+    assert policy_info["record_transition"].shape == (1, 2, 1)
+    assert policy_info["record_transition"].reshape(1, 2).tolist() == [[False, True]]
+
+
 class _FakeStudentModel:
     def __init__(self):
         self.base = torch.tensor([[0.1, 0.2, 0.3, 0.4]], dtype=torch.float32)
@@ -1013,6 +1202,7 @@ class _FakeRLTStage2Policy(RLTStage2Policy):
         self.intervention_enabled = True
         self.intervention_mode = "human_override"
         self.act_as_vla_reference = False
+        self.replay_subsample_stride = 0
 
     def _prepare_features(self, env_obs):
         del env_obs
@@ -1072,6 +1262,44 @@ def test_rlt_stage2_policy_predict_action_batch_owns_online_route():
     torch.testing.assert_close(online_actions, torch.full((1, 2, 2), 9.0))
     assert bool(online_result["forward_inputs"]["ready_for_online"].item()) is True
     assert online_result["expert_label_flag"] is True
+
+
+def test_rlt_stage2_policy_emits_step_trace_schema_when_stride_enabled():
+    policy = _FakeRLTStage2Policy()
+    policy.replay_subsample_stride = 1
+    env_infos = {
+        "policy_info": {
+            "expert_takeover": torch.tensor([[False]]),
+            "in_critical_phase": torch.tensor([[True]]),
+            "record_transition": torch.tensor([[True]]),
+            "intervention_phase": torch.tensor([[0.0]]),
+        },
+        "rlt_step_trace_obs": {
+            "states": torch.zeros((1, 2, 3), dtype=torch.float32),
+            "task_descriptions": ["insert"],
+        },
+        "rlt_step_trace_infos": {
+            "policy_info": {
+                "record_transition": torch.tensor([[False, True]]),
+            },
+        },
+    }
+
+    _, result = policy.predict_action_batch(
+        env_obs={"states": torch.zeros((1, 3))},
+        mode="train",
+        env_infos=env_infos,
+    )
+
+    forward_inputs = result["forward_inputs"]
+    assert forward_inputs["rlt_step_trace"]["x"].shape == (1, 2, 3)
+    assert forward_inputs["rlt_step_trace"]["a_tilde"].shape == (1, 2, 4)
+    assert bool(forward_inputs["rlt_step_trace_valid"].item()) is True
+    record_trace = forward_inputs["rlt_step_trace_infos"]["policy_info"][
+        "record_transition"
+    ]
+    assert record_trace.shape == (1, 2, 1)
+    assert record_trace.reshape(1, 2).tolist() == [[False, True]]
 
 
 def _route(

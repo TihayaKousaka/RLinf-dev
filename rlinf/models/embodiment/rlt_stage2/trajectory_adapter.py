@@ -43,11 +43,7 @@ class RLTStage2TrajectoryReplayAdapter:
 
         stride = int(self.cfg.actor.model.rlt_stage2.get("replay_subsample_stride", 0))
         if stride > 0:
-            raise ValueError(
-                "RLT Stage2 replay_subsample_stride is no longer implemented via "
-                "generic env/rollout worker hooks. Set replay_subsample_stride=0 "
-                "or add a model/env-native replay feature path."
-            )
+            return self._stride_trajectory_to_transitions(traj, stride=stride)
         return self._chunk_trajectory_to_transitions(traj)
 
     @staticmethod
@@ -347,5 +343,384 @@ class RLTStage2TrajectoryReplayAdapter:
                     completed_episodes += 1
                     if not auto_reset:
                         break
+
+        return replay_trajectories, completed_episodes
+
+    def _stride_trajectory_to_transitions(
+        self,
+        traj: Trajectory,
+        *,
+        stride: int,
+    ) -> tuple[list[Trajectory], int]:
+        if stride <= 0:
+            raise ValueError(f"RLT replay_subsample_stride must be positive, got {stride}.")
+        if traj.actions is None or not traj.forward_inputs:
+            return [], 0
+
+        chunk_len = int(self.cfg.actor.model.num_action_chunks)
+        action_dim = int(self.cfg.actor.model.action_dim)
+        allow_terminal_partial = bool(
+            self.cfg.actor.model.rlt_stage2.get("replay_allow_terminal_partial", True)
+        )
+        traj_len = int(traj.actions.shape[0])
+        bsz = int(traj.actions.shape[1])
+        replay_trajectories: list[Trajectory] = []
+        completed_episodes = 0
+
+        step_trace_all = traj.forward_inputs.get("rlt_step_trace", None)
+        if not isinstance(step_trace_all, dict):
+            raise RuntimeError(
+                "RLT Stage2 stride replay requires forward_inputs['rlt_step_trace']. "
+                "Run rollout with RLT step-trace emission enabled."
+            )
+        step_x_all = step_trace_all.get("x", None)
+        step_ref_all = step_trace_all.get("a_tilde", None)
+        step_trace_valid_all = traj.forward_inputs.get("rlt_step_trace_valid", None)
+        if not isinstance(step_x_all, torch.Tensor) or not isinstance(
+            step_ref_all,
+            torch.Tensor,
+        ):
+            raise RuntimeError(
+                "RLT Stage2 stride replay requires rlt_step_trace.x and "
+                "rlt_step_trace.a_tilde tensors."
+            )
+        if (
+            step_x_all.shape[0] < traj_len + 1
+            or step_ref_all.shape[0] < traj_len + 1
+        ):
+            raise RuntimeError(
+                "RLT Stage2 stride replay step trace must align with rollout "
+                f"trajectory length {traj_len}+1, got x={tuple(step_x_all.shape)} "
+                f"and a_tilde={tuple(step_ref_all.shape)}."
+            )
+        if not isinstance(step_trace_valid_all, torch.Tensor):
+            raise RuntimeError(
+                "RLT Stage2 stride replay requires "
+                "forward_inputs['rlt_step_trace_valid']."
+            )
+        x_all = traj.forward_inputs.get("x")
+        a_tilde_all = traj.forward_inputs.get("a_tilde")
+        if not isinstance(x_all, torch.Tensor) or not isinstance(
+            a_tilde_all,
+            torch.Tensor,
+        ):
+            raise RuntimeError("RLT Stage2 stride replay requires boundary x/a_tilde.")
+
+        dones_all = traj.dones
+        rewards_all = traj.rewards
+        if dones_all is None or rewards_all is None:
+            return [], 0
+        source_chunk_all = traj.forward_inputs.get("source_chunk")
+        intervention_flags_all = traj.forward_inputs.get("intervention_flags")
+        if intervention_flags_all is None:
+            intervention_flags_all = traj.intervene_flags
+        collection_phase_id_all = traj.forward_inputs.get("collection_phase_id")
+        record_transition_all = traj.forward_inputs.get("record_transition")
+        auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
+        step_trace_infos_all = traj.forward_inputs.get("rlt_step_trace_infos")
+
+        def _trace_policy_scalar(
+            name: str,
+            *,
+            trace_idx: int,
+            env_idx: int,
+            offset: int,
+        ) -> torch.Tensor | None:
+            if not isinstance(step_trace_infos_all, dict):
+                return None
+            policy_info = step_trace_infos_all.get("policy_info")
+            if not isinstance(policy_info, dict):
+                return None
+            value = policy_info.get(name)
+            if not isinstance(value, torch.Tensor):
+                return None
+            if value.shape[0] <= trace_idx or value.shape[2] <= offset:
+                return None
+            return value[trace_idx, env_idx, offset].detach().reshape(-1)[0]
+
+        for env_idx in range(bsz):
+            flat_actions: list[torch.Tensor] = []
+            state_by_step: list[torch.Tensor] = []
+            ref_by_step: list[torch.Tensor] = []
+            flat_rewards: list[torch.Tensor] = []
+            flat_dones: list[torch.Tensor] = []
+            flat_sources: list[torch.Tensor] = []
+            flat_interventions: list[torch.Tensor] = []
+            flat_record: list[torch.Tensor] = []
+            flat_phase: list[torch.Tensor] = []
+            state_record_by_step: list[torch.Tensor] = []
+            state_phase_by_step: list[torch.Tensor] = []
+            for t in range(traj_len):
+                absolute_start = t * chunk_len
+                if len(state_by_step) < absolute_start:
+                    raise RuntimeError(
+                        "RLT Stage2 stride replay has a gap in reconstructed "
+                        f"state trace before rollout chunk {t}."
+                    )
+                if record_transition_all is None:
+                    boundary_record = torch.ones(
+                        (),
+                        dtype=torch.bool,
+                        device=traj.actions.device,
+                    )
+                else:
+                    boundary_record = (
+                        record_transition_all[t, env_idx]
+                        .detach()
+                        .to(device=traj.actions.device, dtype=torch.bool)
+                        .reshape(-1)
+                        .all()
+                    )
+                if collection_phase_id_all is None:
+                    boundary_phase = torch.as_tensor(
+                        COLLECTION_PHASE_UNKNOWN,
+                        dtype=torch.uint8,
+                        device=traj.actions.device,
+                    )
+                else:
+                    boundary_phase = (
+                        collection_phase_id_all[t, env_idx]
+                        .detach()
+                        .to(device=traj.actions.device, dtype=torch.uint8)
+                        .reshape(-1)[0]
+                    )
+                boundary_x = x_all[t, env_idx].detach()
+                boundary_ref = a_tilde_all[t, env_idx].detach().reshape(-1)
+                if len(state_by_step) == absolute_start:
+                    state_by_step.append(boundary_x)
+                    ref_by_step.append(boundary_ref)
+                    state_record_by_step.append(boundary_record)
+                    state_phase_by_step.append(boundary_phase)
+                else:
+                    state_by_step[absolute_start] = boundary_x
+                    ref_by_step[absolute_start] = boundary_ref
+                    state_record_by_step[absolute_start] = boundary_record
+                    state_phase_by_step[absolute_start] = boundary_phase
+
+                trace_idx = t + 1
+                trace_valid = bool(
+                    step_trace_valid_all[trace_idx, env_idx]
+                    .detach()
+                    .reshape(-1)[0]
+                    .item()
+                )
+                if not trace_valid:
+                    raise RuntimeError(
+                        "RLT Stage2 stride replay is missing a valid step trace "
+                        f"for rollout chunk {t}."
+                    )
+                action_chunk = traj.actions[t, env_idx].detach().reshape(
+                    chunk_len,
+                    action_dim,
+                )
+                step_x_trace = step_x_all[trace_idx, env_idx].detach()
+                step_ref_trace = step_ref_all[trace_idx, env_idx].detach()
+                if step_x_trace.shape[0] != chunk_len:
+                    raise RuntimeError(
+                        "RLT Stage2 stride replay step x trace length mismatch: "
+                        f"expected {chunk_len}, got {tuple(step_x_trace.shape)}."
+                    )
+                if step_ref_trace.shape[0] != chunk_len:
+                    raise RuntimeError(
+                        "RLT Stage2 stride replay step ref trace length mismatch: "
+                        f"expected {chunk_len}, got {tuple(step_ref_trace.shape)}."
+                    )
+                rewards = rewards_all[t, env_idx].detach().reshape(chunk_len)
+                done_idx = min(t + 1, dones_all.shape[0] - 1)
+                dones = dones_all[done_idx, env_idx].detach().reshape(chunk_len)
+                intervention_mask = torch.zeros_like(action_chunk, dtype=torch.bool)
+                if intervention_flags_all is not None:
+                    intervention_mask = self._normalize_intervention_mask(
+                        intervention_flags_all[t, env_idx],
+                        action=action_chunk.reshape(-1),
+                        chunk_len=chunk_len,
+                        action_dim=action_dim,
+                    ).reshape(chunk_len, action_dim)
+                if source_chunk_all is not None:
+                    source_chunk = (
+                        source_chunk_all[t, env_idx].detach().to(torch.uint8).reshape(chunk_len)
+                    )
+                else:
+                    source_chunk = torch.full(
+                        (chunk_len,),
+                        int(TransitionSource.RL),
+                        dtype=torch.uint8,
+                        device=action_chunk.device,
+                    )
+                source_chunk = source_chunk.clone()
+                source_chunk[intervention_mask.any(dim=-1).to(source_chunk.device)] = (
+                    int(TransitionSource.HUMAN)
+                )
+
+                for offset in range(chunk_len):
+                    absolute_after = absolute_start + offset + 1
+                    trace_record = _trace_policy_scalar(
+                        "record_transition",
+                        trace_idx=trace_idx,
+                        env_idx=env_idx,
+                        offset=offset,
+                    )
+                    next_record = (
+                        trace_record.to(device=action_chunk.device, dtype=torch.bool)
+                        if trace_record is not None
+                        else boundary_record.to(
+                            device=action_chunk.device,
+                            dtype=torch.bool,
+                        )
+                    )
+                    if len(state_by_step) == absolute_after:
+                        state_by_step.append(step_x_trace[offset])
+                        ref_by_step.append(step_ref_trace[offset].reshape(-1))
+                        state_record_by_step.append(next_record)
+                        state_phase_by_step.append(boundary_phase)
+                    elif len(state_by_step) > absolute_after:
+                        state_by_step[absolute_after] = step_x_trace[offset]
+                        ref_by_step[absolute_after] = step_ref_trace[offset].reshape(-1)
+                        state_record_by_step[absolute_after] = next_record
+                        state_phase_by_step[absolute_after] = boundary_phase
+                    else:
+                        raise RuntimeError(
+                            "RLT Stage2 stride replay has a gap in reconstructed "
+                            f"state trace after rollout chunk {t} offset {offset}."
+                        )
+                    flat_actions.append(action_chunk[offset])
+                    flat_rewards.append(rewards[offset])
+                    flat_dones.append(dones[offset].to(torch.bool))
+                    flat_sources.append(source_chunk[offset])
+                    flat_interventions.append(intervention_mask[offset])
+                    flat_record.append(
+                        state_record_by_step[absolute_start + offset]
+                    )
+                    flat_phase.append(state_phase_by_step[absolute_start + offset])
+                if bool(dones.any().item()) and not auto_reset:
+                    break
+
+            if not flat_actions:
+                continue
+
+            action_steps = torch.stack(flat_actions, dim=0)
+            state_steps = torch.stack(state_by_step, dim=0)
+            ref_chunks_by_step = torch.stack(ref_by_step, dim=0)
+            reward_steps = torch.stack(flat_rewards, dim=0)
+            done_steps = torch.stack(flat_dones, dim=0).to(torch.bool)
+            source_steps = torch.stack(flat_sources, dim=0).to(torch.uint8)
+            intervention_steps = torch.stack(flat_interventions, dim=0).to(torch.bool)
+            record_steps = torch.stack(flat_record, dim=0).to(torch.bool)
+            phase_steps = torch.stack(flat_phase, dim=0).to(torch.uint8)
+
+            total_steps = int(action_steps.shape[0])
+            segment_start = 0
+            while segment_start < total_steps:
+                done_indices = torch.nonzero(
+                    done_steps[segment_start:],
+                    as_tuple=False,
+                ).reshape(-1)
+                if done_indices.numel() > 0:
+                    segment_end = segment_start + int(done_indices[0].item()) + 1
+                    completed_episodes += 1
+                    is_terminal_segment = True
+                else:
+                    segment_end = total_steps
+                    is_terminal_segment = False
+
+                for start in range(segment_start, segment_end, stride):
+                    if not bool(record_steps[start].item()):
+                        continue
+                    end = start + chunk_len
+                    is_partial = end > segment_end
+                    if is_partial and not (
+                        allow_terminal_partial and is_terminal_segment
+                    ):
+                        break
+                    valid_end = min(end, segment_end)
+                    pad_count = end - valid_end
+
+                    action_chunk = action_steps[start:valid_end]
+                    rewards = reward_steps[start:valid_end]
+                    source_chunk = source_steps[start:valid_end]
+                    intervention = intervention_steps[start:valid_end]
+                    source = resolve_chunk_source(source_chunk.cpu().numpy())
+                    if pad_count > 0:
+                        action_chunk = torch.cat(
+                            [
+                                action_chunk,
+                                torch.zeros(
+                                    (pad_count, action_dim),
+                                    dtype=action_chunk.dtype,
+                                    device=action_chunk.device,
+                                ),
+                            ],
+                            dim=0,
+                        )
+                        rewards = torch.cat(
+                            [
+                                rewards,
+                                torch.zeros(
+                                    pad_count,
+                                    dtype=rewards.dtype,
+                                    device=rewards.device,
+                                ),
+                            ],
+                            dim=0,
+                        )
+                        source_chunk = torch.cat(
+                            [
+                                source_chunk,
+                                torch.full(
+                                    (pad_count,),
+                                    int(TransitionSource.BASE),
+                                    dtype=torch.uint8,
+                                    device=source_chunk.device,
+                                ),
+                            ],
+                            dim=0,
+                        )
+                        intervention = torch.cat(
+                            [
+                                intervention,
+                                torch.zeros(
+                                    (pad_count, action_dim),
+                                    dtype=torch.bool,
+                                    device=intervention.device,
+                                ),
+                            ],
+                            dim=0,
+                        )
+
+                    done = bool(done_steps[start:valid_end].any().item())
+                    next_index = valid_end
+                    next_x = state_steps[next_index]
+                    next_ref_chunk = ref_chunks_by_step[next_index]
+                    ref_chunk = ref_chunks_by_step[start].reshape(
+                        chunk_len,
+                        action_dim,
+                    )
+
+                    phase_id = int(phase_steps[start].detach().cpu().item())
+                    replay_trajectories.append(
+                        self._transition_trajectory(
+                            x=state_steps[start],
+                            action_chunk=action_chunk.reshape(-1),
+                            ref_chunk=ref_chunk.reshape(-1),
+                            rewards=rewards,
+                            next_x=next_x,
+                            next_ref_chunk=next_ref_chunk.reshape(-1),
+                            done=done,
+                            intervention=intervention.reshape(-1),
+                            source_chunk=source_chunk,
+                            source=source,
+                            collection_phase_id=phase_id,
+                            intervention_flag=bool(intervention.any().item()),
+                            step_id=start,
+                            model_weights_id=traj.model_weights_id,
+                        )
+                    )
+
+                if is_terminal_segment:
+                    segment_start = (
+                        (segment_end + chunk_len - 1) // chunk_len
+                    ) * chunk_len
+                else:
+                    break
 
         return replay_trajectories, completed_episodes

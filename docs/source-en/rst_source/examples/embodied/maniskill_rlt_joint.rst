@@ -326,13 +326,16 @@ To override paths directly from the command line:
 
 Some important defaults in the current config:
 
-- ``algorithm.warmup_min_size: 1000``: replay must reach 1000 chunk transitions before training
+- ``algorithm.warmup_min_size: 1000``: algorithm-level warmup setting; used as the fallback when replay has no explicit ready threshold
+- ``algorithm.replay_buffer.min_buffer_size: 600``: the current scheduler's replay-ready threshold; check both values when changing warmup
 - ``algorithm.warmup_post_collect_updates: 30000``: critic warmup before the actor goes online
 - ``algorithm.train_every_transitions: 5``: add training budget every 5 new replay transitions
 - ``algorithm.max_updates_per_train_step: 1600``: cap actual learner updates in one runner step
-- ``actor.model.rlt_stage2.replay_subsample_stride: 0``: use boundary-only replay by default
-- ``actor.model.rlt_stage2.actor_noise_sigma: 0.002``: training-time exploration noise
-- ``actor.model.rlt_stage2.ref_action_dropout: 0.5``: prevent the actor from merely copying the VLA reference
+- ``actor.model.rlt_stage2.buffer_capacity: 50000``: active sample cap for RLT replay; ``fill_ratio`` saturates here
+- ``actor.model.rlt_stage2.replay_subsample_stride: 0``: use boundary-only replay by default; set a positive value to build step-stride windows from rollout step traces
+- ``actor.model.rlt_stage2.actor_noise_sigma: 0.003``: fixed Gaussian std; eval uses the mean
+- ``actor.model.rlt_stage2.ref_action_dropout: 0.4``: prevent the actor from merely copying the VLA reference
+- ``actor.model.rlt_stage2.delta_weight: 0.1``: smoothness regularizer on within-chunk action deltas
 
 4. Current rollout and replay semantics
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -344,10 +347,13 @@ The most important implementation details are:
 - before that gate opens, rollout executes the base VLA reference chunk
 - the default public config uses boundary-only replay because
   ``replay_subsample_stride`` is ``0``
-- stride replay still exists in the implementation, but it is a heavier
-  optional mode
-- when expert intervention executes a replacement action, the replay-side
-  reference chunk is replaced on the intervened steps as well
+- when ``replay_subsample_stride > 0``, rollout emits per-step RLT traces and
+  replay builds denser sliding windows without crossing episode boundaries
+- the learner uses RLinf ``TrajectoryReplayBuffer``; each RLT transition is wrapped
+  as a 1-sample trajectory and active samples are capped by ``buffer_capacity``
+- when expert intervention executes a replacement action, replay stores the base
+  ``ref_chunk``, the executed ``action_chunk``, and ``source_chunk``; actor loss
+  uses ``action_chunk`` as the BC target on ``HUMAN/MIXED`` steps
 
 5. Stage2 outputs
 ~~~~~~~~~~~~~~~~~
@@ -378,8 +384,12 @@ For Stage2, prioritize:
 - ``eval/success_once``: the main final metric
 - ``env/success_once``: useful for online data collection diagnostics, but may be affected by intervention
 - ``train/replay_buffer/size``: whether replay has passed the warmup threshold
+- ``train/replay_buffer/fill_ratio``: whether active samples have reached ``buffer_capacity``
 - ``train/replay_buffer/intervention_rate``: how much expert data is being injected
 - ``train/rlt_stage2/pending_update_budget``: whether the learner is falling behind the incoming data
+- ``env/rlt_ready_for_online`` / ``env/student_control_rate``: online gate and actual actor-control ratio
+- ``env/expert_intervention_requested_rate`` / ``env/expert_intervention_actual_rate``: expert trigger and intervention rates
+- ``env/deviation_rate``: how often rollout deviation/intervention checks fire
 
 For this task, **do not treat train success as the final answer**. Fixed-reset-id
 ``eval/success_once`` is the more reliable checkpoint comparison metric.

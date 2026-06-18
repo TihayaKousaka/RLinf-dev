@@ -61,6 +61,9 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self.proprio_mode = stage2_cfg.get("proprio_mode", None)
         if self.proprio_mode is not None:
             self.proprio_mode = str(self.proprio_mode)
+        self.replay_subsample_stride = int(
+            stage2_cfg.get("replay_subsample_stride", 0)
+        )
         self.proprio_dim = resolve_proprio_dim(
             stage2_cfg,
             default_dim=self.action_dim,
@@ -267,6 +270,77 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         x = torch.cat([z_rl.to(torch.float32), state], dim=-1)
         return x, a_tilde_flat, processed_obs
 
+    @torch.no_grad()
+    def _encode_step_trace(
+        self,
+        trace_obs: dict[str, Any] | None,
+    ) -> dict[str, torch.Tensor]:
+        if not isinstance(trace_obs, dict) or not trace_obs:
+            return {}
+        states = trace_obs.get("states", None)
+        if not isinstance(states, torch.Tensor) or states.ndim < 3:
+            raise ValueError(
+                "RLT step trace obs must contain states with shape [B, S, ...], "
+                f"got {self._shape_str(states)}."
+            )
+        batch_size = int(states.shape[0])
+        trace_len = int(states.shape[1])
+        flat_obs: dict[str, Any] = {}
+        for key, value in trace_obs.items():
+            if key == "task_descriptions":
+                if value is None:
+                    flat_obs[key] = None
+                elif isinstance(value, list):
+                    flat_obs[key] = [
+                        item for item in value for _ in range(trace_len)
+                    ]
+                else:
+                    flat_obs[key] = value
+                continue
+            if isinstance(value, torch.Tensor):
+                if value.shape[0] != batch_size or value.shape[1] != trace_len:
+                    raise ValueError(
+                        f"RLT step trace obs[{key!r}] must have leading shape "
+                        f"[{batch_size}, {trace_len}], got {self._shape_str(value)}."
+                    )
+                flat_obs[key] = value.reshape(batch_size * trace_len, *value.shape[2:])
+            else:
+                flat_obs[key] = value
+        x, a_tilde, _ = self._prepare_features(flat_obs)
+        return {
+            "x": x.reshape(batch_size, trace_len, -1).detach(),
+            "a_tilde": a_tilde.reshape(batch_size, trace_len, -1).detach(),
+        }
+
+    @staticmethod
+    def _normalize_step_record_trace(
+        record_trace: torch.Tensor | None,
+        *,
+        fallback_record: torch.Tensor,
+        chunk_length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        batch_size = int(fallback_record.shape[0])
+        if not isinstance(record_trace, torch.Tensor):
+            record_trace = fallback_record
+        record_trace = record_trace.to(dtype=torch.bool, device=device)
+        if record_trace.numel() == 1:
+            return record_trace.reshape(1, 1, 1).expand(
+                batch_size,
+                chunk_length,
+                1,
+            )
+        record_trace = record_trace.reshape(batch_size, -1)
+        if record_trace.shape[1] == 1:
+            record_trace = record_trace.expand(-1, chunk_length)
+        if record_trace.shape[1] != chunk_length:
+            raise ValueError(
+                "RLT step trace record_transition must have shape [B], [B, 1], "
+                f"[B, {chunk_length}], or [B, {chunk_length}, 1], got "
+                f"{tuple(record_trace.shape)} after normalization."
+            )
+        return record_trace[:, :, None]
+
     def default_forward(self, **kwargs):
         raise NotImplementedError(
             "RLT Stage 2 does not use RLinf PPO-style default_forward."
@@ -460,4 +534,75 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             student_prediction=(actions, result),
         )
         route.result["expert_label_flag"] = route.expert_label_flag
+        forward_inputs = route.result["forward_inputs"]
+        if self.replay_subsample_stride > 0 and isinstance(env_infos, dict):
+            encoded_step_trace = self._encode_step_trace(
+                env_infos.get("rlt_step_trace_obs", None)
+            )
+            if encoded_step_trace and encoded_step_trace["x"].shape[1] != self.chunk_length:
+                raise ValueError(
+                    "RLT step trace length must match chunk_length "
+                    f"{self.chunk_length}, got {encoded_step_trace['x'].shape[1]}."
+                )
+            if encoded_step_trace:
+                forward_inputs["rlt_step_trace"] = encoded_step_trace
+                forward_inputs["rlt_step_trace_valid"] = torch.ones(
+                    (action_flat.shape[0], 1),
+                    dtype=torch.bool,
+                    device=action_flat.device,
+                )
+            trace_infos = env_infos.get("rlt_step_trace_infos", None)
+            policy_trace_infos = (
+                trace_infos.get("policy_info", {})
+                if isinstance(trace_infos, dict)
+                else {}
+            )
+            record_trace = (
+                policy_trace_infos.get("record_transition")
+                if isinstance(policy_trace_infos, dict)
+                else None
+            )
+            record_trace = self._normalize_step_record_trace(
+                record_trace,
+                fallback_record=forward_inputs["record_transition"],
+                chunk_length=self.chunk_length,
+                device=action_flat.device,
+            )
+            forward_inputs["rlt_step_trace_infos"] = {
+                "policy_info": {
+                    "record_transition": record_trace.detach(),
+                },
+            }
+        if self.replay_subsample_stride > 0 and "rlt_step_trace" not in forward_inputs:
+            # The first rollout step has no previous chunk trace. Keep a typed
+            # placeholder so trajectory stacking preserves the trace schema; the
+            # adapter only consumes entries marked valid.
+            forward_inputs["rlt_step_trace"] = {
+                "x": x[:, None, :].expand(-1, self.chunk_length, -1).detach(),
+                "a_tilde": a_tilde[:, None, :].expand(
+                    -1,
+                    self.chunk_length,
+                    -1,
+                ).detach(),
+            }
+            forward_inputs["rlt_step_trace_valid"] = torch.zeros(
+                (action_flat.shape[0], 1),
+                dtype=torch.bool,
+                device=action_flat.device,
+            )
+        if (
+            self.replay_subsample_stride > 0
+            and "rlt_step_trace_infos" not in forward_inputs
+        ):
+            record_trace = self._normalize_step_record_trace(
+                None,
+                fallback_record=forward_inputs["record_transition"],
+                chunk_length=self.chunk_length,
+                device=action_flat.device,
+            )
+            forward_inputs["rlt_step_trace_infos"] = {
+                "policy_info": {
+                    "record_transition": record_trace.detach(),
+                },
+            }
         return route.actions, route.result

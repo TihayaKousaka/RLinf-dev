@@ -522,6 +522,22 @@ class EnvWorker(Worker):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
+            if (
+                isinstance(infos, dict)
+                and self.cfg.actor.model.get("model_type", None) == "rlt_stage2"
+                and int(
+                    self.cfg.actor.model.get("rlt_stage2", {}).get(
+                        "replay_subsample_stride",
+                        0,
+                    )
+                )
+                > 0
+            ):
+                infos["rlt_step_trace_obs"] = self._stack_rlt_step_trace_obs(obs_list)
+                infos["rlt_step_trace_infos"] = self._stack_rlt_step_trace_infos(
+                    infos_list,
+                    expected_trace_len=int(self.cfg.actor.model.num_action_chunks),
+                )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         final_obs = (
             self._build_chunk_final_obs(obs_list, infos_list)
@@ -592,6 +608,87 @@ class EnvWorker(Worker):
             intervene_flags=intervene_flags,
         )
         return env_output, env_info
+
+    @staticmethod
+    def _stack_rlt_step_trace_obs(obs_list) -> dict[str, Any] | None:
+        if not isinstance(obs_list, (list, tuple)) or not obs_list:
+            return None
+        trace_obs: dict[str, Any] = {}
+        first_obs = obs_list[0]
+        if not isinstance(first_obs, dict):
+            return None
+        for key in ("main_images", "wrist_images", "extra_view_images", "states"):
+            values = [obs.get(key, None) for obs in obs_list if isinstance(obs, dict)]
+            first_value = next((value for value in values if value is not None), None)
+            if first_value is None:
+                continue
+            if isinstance(first_value, torch.Tensor):
+                trace_obs[key] = torch.stack(values, dim=1).cpu().contiguous()
+            elif isinstance(first_value, np.ndarray):
+                trace_obs[key] = torch.from_numpy(np.stack(values, axis=1)).cpu()
+        if isinstance(first_obs.get("task_descriptions", None), list):
+            trace_obs["task_descriptions"] = list(first_obs["task_descriptions"])
+        return trace_obs
+
+    @staticmethod
+    def _stack_rlt_step_trace_infos(
+        infos_list,
+        *,
+        expected_trace_len: int | None = None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(infos_list, (list, tuple)) or not infos_list:
+            return None
+        stacked: dict[str, Any] = {}
+        for key in ("policy_info",):
+            last_info = infos_list[-1] if isinstance(infos_list[-1], dict) else None
+            last_value = last_info.get(key, None) if isinstance(last_info, dict) else None
+            if isinstance(last_value, dict):
+                nested = {
+                    nested_key: value.cpu().contiguous()
+                    for nested_key, value in last_value.items()
+                    if (
+                        isinstance(value, torch.Tensor)
+                        and value.ndim >= 2
+                        and (
+                            expected_trace_len is None
+                            or int(value.shape[1]) == int(expected_trace_len)
+                        )
+                    )
+                }
+                if nested:
+                    stacked[key] = nested
+                    continue
+
+            per_step = [
+                info.get(key, None) if isinstance(info, dict) else None
+                for info in infos_list
+            ]
+            if not any(isinstance(value, dict) for value in per_step):
+                continue
+            nested: dict[str, Any] = {}
+            nested_keys = {
+                nested_key
+                for value in per_step
+                if isinstance(value, dict)
+                for nested_key in value.keys()
+            }
+            for nested_key in nested_keys:
+                values = [
+                    value.get(nested_key, None) if isinstance(value, dict) else None
+                    for value in per_step
+                ]
+                first_value = next(
+                    (value for value in values if isinstance(value, torch.Tensor)),
+                    None,
+                )
+                if first_value is None:
+                    continue
+                if any(not isinstance(value, torch.Tensor) for value in values):
+                    continue
+                nested[nested_key] = torch.stack(values, dim=1).cpu().contiguous()
+            if nested:
+                stacked[key] = nested
+        return stacked or None
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int

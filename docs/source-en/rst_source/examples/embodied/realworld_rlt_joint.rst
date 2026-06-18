@@ -404,10 +404,10 @@ Stage2 warmup and online gating are configured in
        enable: True
        mode: human_override
 
-``warmup_min_size`` is the minimum replay transition/window count. It is not the
-number of episodes. ``warmup_post_collect_updates`` is the number of learner
-updates required after replay reaches the warmup size. ``human_override`` uses
-the real-world human intervention action as the intervention source.
+``warmup_min_size`` is the minimum replay transition count. It is not the number
+of episodes. ``warmup_post_collect_updates`` is the number of learner updates
+required after replay reaches the warmup size. ``human_override`` uses the
+real-world human intervention action as the intervention source.
 
 Teleoperation and keyboard reward are configured under both ``env.train`` and
 ``env.eval``:
@@ -658,9 +658,10 @@ Warmup and Online Operation
 
 Stage2 uses replay-buffer size and learner updates to gate online control:
 
-- ``warmup_min_size`` counts replay transitions/windows, not episodes.
+- ``warmup_min_size`` counts replay transitions, not episodes.
 - ``warmup_post_collect_updates`` counts actor/critic learner update steps.
-- With ``replay_subsample_stride: 0``, replay is built at chunk boundaries.
+- With ``replay_subsample_stride: 0``, replay is built at chunk boundaries; a
+  positive stride builds denser step-stride windows from rollout step traces.
 
 At runtime, Stage2 emits fixed-format online switching status lines:
 
@@ -808,16 +809,17 @@ debugging tool; enable it only when you suspect collection is wrong:
    algorithm:
      replay_buffer:
        auto_save: true
-       auto_save_every_episodes: 1
-       auto_save_every_transitions: 0
-       auto_save_dir: ${runner.logger.log_path}/debug/rlt_replay
+       auto_save_path: ${runner.logger.log_path}/debug/rlt_replay
+       trajectory_format: pt
 
-When enabled, the actor overwrites a debug snapshot:
+When enabled, the actor incrementally writes the standard RLinf
+``TrajectoryReplayBuffer`` format:
 
 .. code-block:: text
 
-   ${runner.logger.log_path}/debug/rlt_replay/rank_0/buffer.pt
    ${runner.logger.log_path}/debug/rlt_replay/rank_0/metadata.json
+   ${runner.logger.log_path}/debug/rlt_replay/rank_0/trajectory_index.json
+   ${runner.logger.log_path}/debug/rlt_replay/rank_0/trajectory_*.pt
 
 Inspect the replay content with:
 
@@ -825,10 +827,10 @@ Inspect the replay content with:
 
    python -m toolkits.rlt.inspect_rlt_replay ../results/debug/rlt_replay/rank_0
 
-Check whether ``size`` grows, reward is not stuck at all zeros,
-``source_chunk`` contains expected ``HUMAN/MIXED`` chunks, ``collection_phase``
-matches warmup/online expectations, and ``intervention_flag_rate`` roughly
-matches on-site GELLO takeover.
+Check whether ``total_samples`` / ``inspected_samples`` grow, reward is not
+stuck at all zeros, ``source_chunk`` contains expected ``HUMAN/MIXED`` chunks,
+``collection_phase`` matches warmup/online expectations, and
+``intervention_flag_rate`` roughly matches on-site GELLO takeover.
 
 Troubleshooting
 ---------------

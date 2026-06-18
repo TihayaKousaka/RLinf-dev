@@ -384,7 +384,7 @@ Stage2 warmup 和 online gate 在
        enable: True
        mode: human_override
 
-``warmup_min_size`` 是 replay transition/window 数，不是 episode 数。
+``warmup_min_size`` 是 replay transition 数，不是 episode 数。
 ``warmup_post_collect_updates`` 是 replay 满后所需的 learner update 步数。
 ``human_override`` 表示用真机人在环动作作为干预来源。
 
@@ -626,9 +626,10 @@ Warmup 与在线操作
 
 Stage2 使用 replay buffer 大小和 learner 更新步数来控制 online 接管：
 
-- ``warmup_min_size`` 统计 replay transitions/windows，不是 episode 数。
+- ``warmup_min_size`` 统计 replay transitions，不是 episode 数。
 - ``warmup_post_collect_updates`` 统计 actor/critic learner update 步数。
-- ``replay_subsample_stride: 0`` 时，replay 按 chunk boundary 构造。
+- ``replay_subsample_stride: 0`` 时，replay 按 chunk boundary 构造；设为正数时，
+  会基于 rollout step trace 构造更密的 step-stride 滑窗。
 
 Stage2 运行时会在日志里输出固定格式的在线切换状态：
 

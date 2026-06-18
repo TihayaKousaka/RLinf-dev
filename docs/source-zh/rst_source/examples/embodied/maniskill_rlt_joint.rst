@@ -310,13 +310,16 @@ Stage2 使用冻结 VLA + 冻结 RL token + 小 actor-critic 的在线 RL 流程
 
 当前配置中的重要项包括：
 
-- ``algorithm.warmup_min_size: 1000``：replay 至少累积 1000 条 chunk transition 再训练
+- ``algorithm.warmup_min_size: 1000``：算法级 warmup 配置值；当 replay buffer 没有单独设置 ready 下限时作为回退值
+- ``algorithm.replay_buffer.min_buffer_size: 600``：当前 scheduler 实际使用的 replay ready 下限；如修改 warmup，请同步检查这两个值
 - ``algorithm.warmup_post_collect_updates: 30000``：actor 正式上线前先做一轮 critic warmup
 - ``algorithm.train_every_transitions: 5``：每新增 5 条 replay transition 增加训练预算
 - ``algorithm.max_updates_per_train_step: 1600``：限制单次 runner step 中的实际更新数
-- ``actor.model.rlt_stage2.replay_subsample_stride: 0``：默认使用 chunk boundary replay
-- ``actor.model.rlt_stage2.actor_noise_sigma: 0.002``：训练探索噪声
-- ``actor.model.rlt_stage2.ref_action_dropout: 0.5``：避免 actor 只复制 VLA reference
+- ``actor.model.rlt_stage2.buffer_capacity: 50000``：RLT replay active sample cap，``fill_ratio`` 会在这里封顶
+- ``actor.model.rlt_stage2.replay_subsample_stride: 0``：默认使用 chunk boundary replay；设为正数时会基于 rollout step trace 构造 step-stride 滑窗
+- ``actor.model.rlt_stage2.actor_noise_sigma: 0.003``：固定 Gaussian std，eval 使用均值
+- ``actor.model.rlt_stage2.ref_action_dropout: 0.4``：避免 actor 只复制 VLA reference
+- ``actor.model.rlt_stage2.delta_weight: 0.1``：chunk 内相邻动作 delta 的平滑正则
 
 4. 当前 rollout 与 replay 语义
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -328,9 +331,13 @@ Stage2 使用冻结 VLA + 冻结 RL token + 小 actor-critic 的在线 RL 流程
 - 在此之前，rollout 执行的是 base VLA reference chunk
 - 公开默认配置使用的是 boundary-only replay，因为
   ``replay_subsample_stride`` 为 ``0``
-- stride replay 仍然存在，但属于更重的可选路径
-- expert intervention 执行替换动作时，对应 step 的 replay reference chunk
-  也会同步替换
+- 当 ``replay_subsample_stride > 0`` 时，rollout 会输出 step-level RLT trace，
+  replay 会构造更密的滑动窗口，且不会跨 episode 边界
+- learner 使用 RLinf ``TrajectoryReplayBuffer``，RLT transition 会被包装成
+  1-sample trajectory，并通过 ``buffer_capacity`` 限制 active samples
+- expert intervention 执行替换动作时，replay 会同时保存 base ``ref_chunk``、
+  实际执行的 ``action_chunk`` 和 ``source_chunk``；actor loss 在
+  ``HUMAN/MIXED`` step 上使用 ``action_chunk`` 作为 BC target
 
 5. Stage2 输出
 ~~~~~~~~~~~~~~
@@ -361,8 +368,12 @@ Stage2 中建议优先看：
 - ``eval/success_once``: 最终性能指标，优先级最高
 - ``env/success_once``: 在线采样中的成功率，可辅助观察，但可能受 intervention 影响
 - ``train/replay_buffer/size``: replay 是否已经超过 warmup 门槛
+- ``train/replay_buffer/fill_ratio``: active samples 是否已经达到 ``buffer_capacity``
 - ``train/replay_buffer/intervention_rate``: expert 样本占比
 - ``train/rlt_stage2/pending_update_budget``: learner 是否跟得上新数据
+- ``env/rlt_ready_for_online`` / ``env/student_control_rate``: online gate 和 actor 实际接管比例
+- ``env/expert_intervention_requested_rate`` / ``env/expert_intervention_actual_rate``: expert 触发与实际干预比例
+- ``env/deviation_rate``: 当前 rollout 偏离/干预判定是否频繁触发
 
 对于这个任务，**不要只看 train success 判断是否真的提升**。固定 reset ids 的
 ``eval/success_once`` 更适合比较 checkpoint。
