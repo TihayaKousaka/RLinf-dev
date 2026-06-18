@@ -1123,6 +1123,35 @@ def test_env_worker_auto_reset_bootstrap_preserves_env_infos():
     assert bool(policy_info["record_transition"].item()) is False
 
 
+def test_env_worker_rlt_step_trace_obs_preserves_optional_none_keys():
+    stacked = EnvWorker._stack_rlt_step_trace_obs(
+        [
+            {
+                "states": torch.zeros((1, 3), dtype=torch.float32),
+                "main_images": torch.zeros((1, 4, 4, 3), dtype=torch.uint8),
+                "wrist_images": torch.ones((1, 4, 4, 3), dtype=torch.uint8),
+                "extra_view_images": None,
+                "task_descriptions": ["insert"],
+            },
+            {
+                "states": torch.ones((1, 3), dtype=torch.float32),
+                "main_images": torch.ones((1, 4, 4, 3), dtype=torch.uint8),
+                "wrist_images": torch.zeros((1, 4, 4, 3), dtype=torch.uint8),
+                "extra_view_images": None,
+                "task_descriptions": ["insert"],
+            },
+        ]
+    )
+
+    assert stacked is not None
+    assert stacked["states"].shape == (1, 2, 3)
+    assert stacked["main_images"].shape == (1, 2, 4, 4, 3)
+    assert stacked["wrist_images"].shape == (1, 2, 4, 4, 3)
+    assert "extra_view_images" in stacked
+    assert stacked["extra_view_images"] is None
+    assert stacked["task_descriptions"] == ["insert"]
+
+
 def test_env_worker_rlt_step_trace_infos_accepts_prestacked_policy_info():
     stacked = EnvWorker._stack_rlt_step_trace_infos(
         [

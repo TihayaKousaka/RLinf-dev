@@ -621,6 +621,8 @@ class EnvWorker(Worker):
             values = [obs.get(key, None) for obs in obs_list if isinstance(obs, dict)]
             first_value = next((value for value in values if value is not None), None)
             if first_value is None:
+                if key in first_obs:
+                    trace_obs[key] = None
                 continue
             if isinstance(first_value, torch.Tensor):
                 trace_obs[key] = torch.stack(values, dim=1).cpu().contiguous()
