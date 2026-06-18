@@ -1205,12 +1205,15 @@ class _FakeRLTStage2Policy(RLTStage2Policy):
         self.replay_subsample_stride = 0
 
     def _prepare_features(self, env_obs):
-        del env_obs
-        x = torch.ones((1, 3), dtype=torch.float32)
-        a_tilde = torch.tensor([[0.1, 0.2, 0.3, 0.4]], dtype=torch.float32)
+        batch_size = int(env_obs["states"].shape[0])
+        x = torch.ones((batch_size, 3), dtype=torch.float32)
+        a_tilde = torch.tensor(
+            [[0.1, 0.2, 0.3, 0.4]],
+            dtype=torch.float32,
+        ).expand(batch_size, -1)
         processed_obs = {
-            "tokenized_prompt": torch.ones((1, 2), dtype=torch.int64),
-            "tokenized_prompt_mask": torch.ones((1, 2), dtype=torch.bool),
+            "tokenized_prompt": torch.ones((batch_size, 2), dtype=torch.int64),
+            "tokenized_prompt_mask": torch.ones((batch_size, 2), dtype=torch.bool),
         }
         return x, a_tilde, processed_obs
 
@@ -1224,7 +1227,10 @@ class _FakeRLTStage2Policy(RLTStage2Policy):
         apply_action_noise=None,
     ):
         del x, a_tilde, deterministic, apply_ref_dropout, apply_action_noise
-        return torch.tensor([[1.0, 1.0, 2.0, 2.0]], dtype=torch.float32)
+        return torch.tensor(
+            [[1.0, 1.0, 2.0, 2.0]],
+            dtype=torch.float32,
+        ).expand(x.shape[0], -1)
 
 
 def test_rlt_stage2_policy_predict_action_batch_owns_online_route():

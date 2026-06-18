@@ -307,6 +307,13 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             else:
                 flat_obs[key] = value
         x, a_tilde, _ = self._prepare_features(flat_obs)
+        expected_batch = batch_size * trace_len
+        if x.shape[0] != expected_batch or a_tilde.shape[0] != expected_batch:
+            raise ValueError(
+                "RLT step trace feature encoder must preserve flattened batch size "
+                f"{expected_batch}, got x={self._shape_str(x)} and "
+                f"a_tilde={self._shape_str(a_tilde)}."
+            )
         return {
             "x": x.reshape(batch_size, trace_len, -1).detach(),
             "a_tilde": a_tilde.reshape(batch_size, trace_len, -1).detach(),
