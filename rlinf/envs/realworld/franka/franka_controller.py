@@ -46,8 +46,6 @@ class FrankaController(Worker):
         end_effector_config: Optional[dict] = None,
         gripper_type: Optional[str] = None,
         gripper_connection: Optional[str] = None,
-        joint_command_topic: Optional[str] = None,
-        joint_command_joint_names: Optional[list[str]] = None,
     ):
         """Launch a FrankaController on the specified worker's node."""
         cluster = Cluster()
@@ -59,8 +57,6 @@ class FrankaController(Worker):
             end_effector_config or {},
             gripper_type,
             gripper_connection,
-            joint_command_topic,
-            joint_command_joint_names,
         ).launch(
             cluster=cluster,
             placement_strategy=placement,
@@ -75,15 +71,22 @@ class FrankaController(Worker):
         end_effector_config: Optional[dict] = None,
         gripper_type: Optional[str] = None,
         gripper_connection: Optional[str] = None,
-        joint_command_topic: Optional[str] = None,
-        joint_command_joint_names: Optional[list[str]] = None,
     ):
         super().__init__()
         self._logger = get_logger()
+        # A remote arm's IP may not reach the env worker; resolve it from this
+        # node's hardware infos instead.
+        if not robot_ip:
+            robot_ip = self._resolve_robot_ip_from_node()
+        if not robot_ip:
+            raise ValueError(
+                "Franka 'robot_ip' is not set and could not be resolved from "
+                f"node rank {self._cluster_node_rank}'s hardware infos. Provide "
+                "it in the env config, the Franka hardware config, or set the "
+                "'ROBOT_IP' environment variable on the controller's node."
+            )
         self._robot_ip = robot_ip
         self._ros_pkg = ros_pkg
-        self._joint_command_topic = joint_command_topic
-        self._joint_command_joint_names = joint_command_joint_names
         self._end_effector_type = normalize_end_effector_type(
             end_effector_type,
             gripper_type,
@@ -94,14 +97,12 @@ class FrankaController(Worker):
         import rospy
         from dynamic_reconfigure.client import Client as ReconfClient
         from franka_msgs.msg import ErrorRecoveryActionGoal, FrankaState
-        from sensor_msgs.msg import JointState
         from serl_franka_controllers.msg import ZeroJacobian
 
         self._geom_msg = geom_msg
         self._rospy = rospy
         self._ErrorRecoveryActionGoal = ErrorRecoveryActionGoal
         self._FrankaState = FrankaState
-        self._JointState = JointState
         self._ZeroJacobian = ZeroJacobian
         self._ReconfClient = ReconfClient
 
@@ -122,6 +123,27 @@ class FrankaController(Worker):
         self._reconf_client = self._ReconfClient(
             "cartesian_impedance_controllerdynamic_reconfigure_compliance_param_node"
         )
+
+    def _resolve_robot_ip_from_node(self) -> Optional[str]:
+        """Return the first ``robot_ip`` in this node's hardware infos, if any.
+
+        The controller's node enumerates the arm and resolves ``robot_ip`` from
+        its local ``ROBOT_IP``, so the value is available here even when the env
+        worker on another node could not detect it.
+        """
+        try:
+            node_info = Cluster().get_node_info(self._cluster_node_rank)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._logger.warning(
+                "Could not access node info to resolve robot_ip: %s", exc
+            )
+            return None
+        for resource in node_info.hardware_resources:
+            for info in resource.infos:
+                robot_ip = getattr(getattr(info, "config", None), "robot_ip", None)
+                if robot_ip:
+                    return robot_ip
+        return None
 
     def _init_end_effector(
         self,
@@ -182,12 +204,6 @@ class FrankaController(Worker):
             self._FrankaState,
             self._on_arm_state_msg,
         )
-        if self._joint_command_topic is not None:
-            self._ros.create_ros_channel(
-                self._joint_command_topic,
-                self._JointState,
-                queue_size=10,
-            )
 
     def _on_arm_jacobian_msg(self, msg):
         self._state.arm_jacobian = np.array(list(msg.zero_jacobian)).reshape(
@@ -323,30 +339,6 @@ class FrankaController(Worker):
 
         self._ros.put_channel(self._arm_equilibrium_channel, pose_msg)
         self.log_debug(f"Move arm to position: {position}")
-
-    def move_joints(self, joint_positions: np.ndarray):
-        """Publish an absolute 7-DoF joint target for online joint control."""
-        if self._joint_command_topic is None:
-            raise RuntimeError(
-                "FrankaController.move_joints requires joint_command_topic. "
-                "Set env override_cfg.joint_command_topic for joint-target tasks."
-            )
-
-        joint_positions = np.asarray(joint_positions, dtype=np.float64).reshape(-1)
-        assert len(joint_positions) == 7, (
-            "Invalid joint target, expected 7 dimensions but got "
-            f"{len(joint_positions)}"
-        )
-
-        msg = self._JointState()
-        msg.header.stamp = self._rospy.Time.now()
-        if self._joint_command_joint_names:
-            msg.name = list(self._joint_command_joint_names)
-        msg.position = joint_positions.astype(float).tolist()
-        msg.velocity = [0.0] * 7
-        msg.effort = [0.0] * 7
-        self._ros.put_channel(self._joint_command_topic, msg)
-        self.log_debug(f"Move joints to target: {joint_positions}")
 
     def command_end_effector(self, action: np.ndarray) -> bool:
         """Send an action to the active end-effector."""

@@ -32,7 +32,7 @@ Run from the repo root::
 
     export PYTHONPATH=$(pwd)
     python toolkits/realworld_rlt/backfill_ee_delta_actions.py \\
-        --src /path/to/rlt_realworld_joint \\
+        --src /path/to/source_lerobot_8d_actions \\
         --dst /path/to/rlt_realworld_ee
 """
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unified preflight checks for real-world Franka joint-control RLT.
+"""Unified preflight checks for real-world Franka EE-action RLT.
 
 The checks are intentionally read-only with respect to robot motion: Franka is
 queried for controller readiness/state, cameras are opened for frame capture,
@@ -37,6 +37,7 @@ _PLACEHOLDER_VALUES = {
     "ROBOT_IP",
     "MAIN_CAMERA_SERIAL",
     "WRIST_CAMERA_SERIAL",
+    "TARGET_EE_POSE",
     "TARGET_POS",
     "RESET_JOINT_QPOS",
     "CRITICAL_PHASE_RESET_JOINT_QPOS",
@@ -73,19 +74,19 @@ def _repo_root() -> Path:
 
 
 def _default_config_path() -> Path:
-    return _repo_root() / "examples/embodiment/config/rlt_stage2_realworld_joint.yaml"
+    return _repo_root() / "examples/embodiment/config/rlt_stage2_realworld_ee.yaml"
 
 
 def _default_env_config_path() -> Path:
     return (
         _repo_root()
-        / "examples/embodiment/config/env/realworld_rlt_joint_peg_insertion.yaml"
+        / "examples/embodiment/config/env/realworld_rlt_ee_peg_insertion.yaml"
     )
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Preflight-check the real-world RLT Franka/GELLO/keyboard stack."
+        description="Preflight-check the real-world RLT Franka EE-action stack."
     )
     parser.add_argument(
         "--config",
@@ -379,10 +380,8 @@ def _check_config(
         failures.append(placeholder)
 
     for key in (
-        "override_cfg.target_pos",
-        "override_cfg.reset_joint_qpos",
-        "override_cfg.critical_phase_reset_joint_qpos",
-        "override_cfg.full_task_reset_joint_qpos",
+        "override_cfg.target_ee_pose",
+        "override_cfg.joint_reset_qpos",
     ):
         value = _select(env_config, key)
         if env_config.data is not None and _is_placeholder(value):
@@ -420,8 +419,8 @@ def _check_config(
         )
 
     gello_mode = _select(main_config, "env.train.gello_action_mode")
-    if gello_mode is not None and str(gello_mode) != "joint_target":
-        warnings.append(f"env.train.gello_action_mode is {gello_mode!r}, not joint_target")
+    if gello_mode is not None and str(gello_mode) != "ee_delta":
+        warnings.append(f"env.train.gello_action_mode is {gello_mode!r}, not ee_delta")
 
     keyboard_wrapper = _select(main_config, "env.train.keyboard_reward_wrapper")
     if keyboard_wrapper is not None and str(keyboard_wrapper) != "single_stage":
@@ -705,12 +704,15 @@ def _check_gello(args: argparse.Namespace, main_config: LoadedConfig) -> CheckRe
                 "GELLO did not produce a reading",
                 [f"port={port}", f"timeout={args.gello_timeout:.1f}s"],
             )
-        joints, gripper = gello.get_joint_action()
-        joints = np.asarray(joints, dtype=float).reshape(-1)
+        target_pos, target_quat, gripper = gello.get_action()
+        target_pos = np.asarray(target_pos, dtype=float).reshape(-1)
+        target_quat = np.asarray(target_quat, dtype=float).reshape(-1)
         gripper = np.asarray(gripper, dtype=float).reshape(-1)
         failures = []
-        if joints.shape != (7,) or not np.isfinite(joints).all():
-            failures.append(f"joint action invalid: shape={joints.shape}")
+        if target_pos.shape != (3,) or not np.isfinite(target_pos).all():
+            failures.append(f"target_pos invalid: shape={target_pos.shape}")
+        if target_quat.shape != (4,) or not np.isfinite(target_quat).all():
+            failures.append(f"target_quat invalid: shape={target_quat.shape}")
         if gripper.size != 1 or not np.isfinite(gripper).all():
             failures.append(f"gripper action invalid: shape={gripper.shape}")
         if not getattr(gello, "thread", None) or not gello.thread.is_alive():
@@ -719,7 +721,8 @@ def _check_gello(args: argparse.Namespace, main_config: LoadedConfig) -> CheckRe
             return _result("gello", "FAIL", "GELLO reading is invalid", failures)
         details = [
             f"port={port}",
-            f"joints={np.array2string(joints, precision=3, suppress_small=True)}",
+            f"target_pos={np.array2string(target_pos, precision=3, suppress_small=True)}",
+            f"target_quat={np.array2string(target_quat, precision=3, suppress_small=True)}",
             f"gripper={np.array2string(gripper, precision=3, suppress_small=True)}",
         ]
         return _result("gello", "PASS", "GELLO is readable", details)

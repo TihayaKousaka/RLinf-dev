@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Replay realworld RLT LeRobot state as Franka joint targets.
-
-This is a destructive hardware check: it bypasses the model and directly feeds
-dataset ``state[1:8]`` as ``FrankaJointPegInsertionEnv`` joint targets.
-"""
+"""Replay realworld RLT EE-action LeRobot demos on the original PegInsertionEnv."""
 
 from __future__ import annotations
 
@@ -31,7 +27,7 @@ _bootstrap_repo_paths()
 
 
 STATE_DIM = 34
-ACTION_DIM = 8
+ACTION_DIM = 7
 
 
 def _quat_xyzw_to_rpy(quat: np.ndarray) -> list[float]:
@@ -90,29 +86,38 @@ def _load_episode(dataset_path: Path, episode_index: int) -> list[dict[str, Any]
     return rows
 
 
-def _row_state(row: dict[str, Any]) -> np.ndarray:
-    if "state" in row:
-        raw_state = row["state"]
-    elif "observation.state" in row:
-        raw_state = row["observation.state"]
-    elif isinstance(row.get("observation"), dict) and "state" in row["observation"]:
-        raw_state = row["observation"]["state"]
+def _row_array(row: dict[str, Any], names: tuple[str, ...], *, dim: int) -> np.ndarray:
+    for name in names:
+        if name in row:
+            value = row[name]
+            break
     else:
-        raise KeyError(f"Dataset row has no state field. Keys: {list(row)}")
+        if isinstance(row.get("observation"), dict):
+            for name in names:
+                if name in row["observation"]:
+                    value = row["observation"][name]
+                    break
+            else:
+                raise KeyError(f"Dataset row has none of {names}. Keys: {list(row)}")
+        else:
+            raise KeyError(f"Dataset row has none of {names}. Keys: {list(row)}")
 
-    state = _to_numpy(raw_state).astype(np.float64).reshape(-1)
-    if state.shape[0] != STATE_DIM:
-        raise RuntimeError(f"Expected {STATE_DIM}D state, got {state.shape}")
-    return state
+    arr = _to_numpy(value).astype(np.float64).reshape(-1)
+    if arr.shape[0] != dim:
+        raise RuntimeError(f"Expected {dim}D for {names}, got {arr.shape}")
+    return arr
 
 
-def _obs_joint_pos(obs: dict[str, Any]) -> np.ndarray:
-    state = obs["state"]
-    if "joint_pos" in state:
-        return np.asarray(state["joint_pos"], dtype=np.float64).reshape(-1)
-    if "arm_joint_position" in state:
-        return np.asarray(state["arm_joint_position"], dtype=np.float64).reshape(-1)
-    raise KeyError(f"Observation state has no joint_pos keys: {list(state)}")
+def _row_state(row: dict[str, Any]) -> np.ndarray:
+    return _row_array(row, ("state", "observation.state"), dim=STATE_DIM)
+
+
+def _row_action(row: dict[str, Any]) -> np.ndarray:
+    return _row_array(row, ("actions", "action"), dim=ACTION_DIM)
+
+
+def _obs_tcp_pose(obs: dict[str, Any]) -> np.ndarray:
+    return np.asarray(obs["state"]["tcp_pose"], dtype=np.float64).reshape(-1)
 
 
 def _obs_gripper(obs: dict[str, Any]) -> float:
@@ -125,9 +130,7 @@ def _obs_gripper(obs: dict[str, Any]) -> float:
 
 
 def _make_env(args: argparse.Namespace):
-    from rlinf.envs.realworld.franka.tasks.joint_peg_insertion_env import (
-        FrankaJointPegInsertionEnv,
-    )
+    from rlinf.envs.realworld.franka.tasks.peg_insertion_env import PegInsertionEnv
     from rlinf.scheduler.hardware.robots.franka import FrankaConfig, FrankaHWInfo
 
     camera_infos = [
@@ -159,15 +162,12 @@ def _make_env(args: argparse.Namespace):
         "task_description": args.task_description,
         "target_ee_pose": args.target_ee_pose,
         "joint_reset_qpos": args.joint_reset_qpos,
-        "critical_phase_reset_joint_qpos": args.joint_reset_qpos,
-        "full_task_reset_joint_qpos": args.joint_reset_qpos,
-        "max_joint_delta": args.max_joint_delta,
         "enable_gripper_penalty": False,
         "reward_threshold": args.reward_threshold,
         "max_num_steps": args.max_steps,
         "enable_camera_player": False,
     }
-    return FrankaJointPegInsertionEnv(
+    return PegInsertionEnv(
         override_cfg=override_cfg,
         worker_info=None,
         hardware_info=hardware_info,
@@ -178,13 +178,27 @@ def _make_env(args: argparse.Namespace):
 def _parse_float_list(raw: str, *, length: int, name: str) -> list[float]:
     values = [float(x) for x in raw.split(",") if x.strip()]
     if len(values) != length:
-        raise argparse.ArgumentTypeError(f"{name} must have {length} comma-separated floats")
+        raise argparse.ArgumentTypeError(
+            f"{name} must have {length} comma-separated floats"
+        )
     return values
+
+
+def _patch_video_player_stop(env: Any) -> None:
+    player = getattr(env, "camera_player", None)
+    if player is None or hasattr(player, "stop"):
+        return
+
+    def _stop() -> None:
+        if getattr(player, "is_running", False):
+            player.queue.put(None)
+
+    player.stop = _stop
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay realworld LeRobot state[1:8] as Franka joint targets."
+        description="Replay backfilled realworld EE actions on PegInsertionEnv."
     )
     parser.add_argument("--dataset-path", required=True)
     parser.add_argument("--episode-index", type=int, default=0)
@@ -207,7 +221,7 @@ def _parse_args() -> argparse.Namespace:
         "--joint-reset-qpos",
         type=lambda raw: _parse_float_list(raw, length=7, name="joint_reset_qpos"),
         default=None,
-        help="Comma-separated 7D safe reset qpos, e.g. '0.0677,0.1155,...'.",
+        help="Comma-separated 7D safe reset qpos. Defaults to first row state[1:8].",
     )
     parser.add_argument(
         "--target-ee-pose",
@@ -220,7 +234,6 @@ def _parse_args() -> argparse.Namespace:
         type=lambda raw: _parse_float_list(raw, length=6, name="reward_threshold"),
         default=[0.015, 0.015, 0.03, 0.2, 0.2, 0.2],
     )
-    parser.add_argument("--max-joint-delta", type=float, default=float("inf"))
     parser.add_argument("--task-description", default="insert the peg in the hole")
     args = parser.parse_args()
 
@@ -252,6 +265,7 @@ def main() -> None:
             + _quat_xyzw_to_rpy(first_state[21:25])
         )
 
+    first_action = _row_action(selected_rows[0])
     print(
         json.dumps(
             {
@@ -260,42 +274,41 @@ def main() -> None:
                 "start": args.start,
                 "num_selected_rows": len(selected_rows),
                 "stride": args.stride,
-                "mode": "state[1:8] -> action[:7], state[0] -> action[7]",
-                "max_joint_delta": args.max_joint_delta,
+                "mode": "actions[0:7] -> PegInsertionEnv EE delta action",
                 "joint_reset_qpos": np.round(args.joint_reset_qpos, 6).tolist(),
                 "target_ee_pose": np.round(args.target_ee_pose, 6).tolist(),
             },
             indent=2,
         )
     )
-    print(f"first target_q={np.round(first_state[1:8], 4).tolist()} gripper={first_state[0]:.4f}")
+    print(f"first ee_action={np.round(first_action, 4).tolist()}")
 
     if not args.yes:
         print("\nDESTRUCTIVE TEST: this will command the real Franka arm.")
         input("Press ENTER to continue, or Ctrl+C to abort...")
 
     env = _make_env(args)
+    _patch_video_player_stop(env)
     try:
         obs, _ = env.reset()
-        current_q = _obs_joint_pos(obs)
-        print(f"after reset current_q={np.round(current_q, 4).tolist()} gripper={_obs_gripper(obs):.4f}")
+        current_tcp = _obs_tcp_pose(obs)
+        print(
+            "after reset "
+            f"tcp_xyz={np.round(current_tcp[:3], 4).tolist()} "
+            f"gripper={_obs_gripper(obs):.4f}"
+        )
 
         for step_idx, row in enumerate(selected_rows, start=1):
-            state = _row_state(row)
-            action = np.zeros(ACTION_DIM, dtype=np.float32)
-            action[:7] = state[1:8].astype(np.float32)
-            action[7] = np.float32(state[0])
-
-            obs, reward, terminated, truncated, info = env.step(action)
-            current_q = _obs_joint_pos(obs)
-            err = current_q - action[:7]
+            action = _row_action(row).astype(np.float32)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            current_tcp = _obs_tcp_pose(obs)
             if step_idx == 1 or step_idx % args.log_every == 0:
                 print(
-                    f"step={step_idx} reward={reward:.4f} term={terminated} trunc={truncated} "
-                    f"target_q={np.round(action[:7], 4).tolist()} "
-                    f"current_q={np.round(current_q, 4).tolist()} "
-                    f"max_abs_err={float(np.max(np.abs(err))):.5f} "
-                    f"executed={np.round(info.get('executed_action', action), 4).tolist()}"
+                    f"step={step_idx} reward={reward:.4f} "
+                    f"term={terminated} trunc={truncated} "
+                    f"ee_action={np.round(action, 4).tolist()} "
+                    f"tcp_xyz={np.round(current_tcp[:3], 4).tolist()} "
+                    f"gripper={_obs_gripper(obs):.4f}"
                 )
             if terminated or truncated:
                 print("stopped: env terminated/truncated")

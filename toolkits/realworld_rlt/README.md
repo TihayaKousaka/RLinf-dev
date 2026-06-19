@@ -53,4 +53,4 @@ bash examples/embodiment/run_realworld_eval.sh rlt_realworld_ee_pi05_sft_eval
 ```
 
 This eval uses `PegInsertionEnv-v1` with 7D EE-delta actions and gripper
-enabled. It does not use `FrankaJointPegInsertionEnv-v1`.
+enabled.

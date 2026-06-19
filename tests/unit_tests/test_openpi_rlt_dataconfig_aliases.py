@@ -38,9 +38,6 @@ ROOT = Path(__file__).resolve().parents[2]
 MANISKILL_STAGE2_CONFIG = (
     ROOT / "examples/embodiment/config/rlt_stage2_maniskill_joint.yaml"
 )
-REALWORLD_STAGE2_CONFIG = (
-    ROOT / "examples/embodiment/config/rlt_stage2_realworld_joint.yaml"
-)
 REALWORLD_EE_STAGE2_CONFIG = (
     ROOT / "examples/embodiment/config/rlt_stage2_realworld_ee.yaml"
 )
@@ -49,9 +46,6 @@ REALWORLD_EE_SFT_EVAL_CONFIG = (
 )
 REALWORLD_EE_SFT_CONFIG = ROOT / "examples/sft/config/rlt_realworld_ee_pi05_sft.yaml"
 REALWORLD_EE_STAGE1_CONFIG = ROOT / "examples/sft/config/rlt_stage1_realworld_ee.yaml"
-REALWORLD_ENV_CONFIG = (
-    ROOT / "examples/embodiment/config/env/realworld_rlt_joint_peg_insertion.yaml"
-)
 REALWORLD_EE_ENV_CONFIG = (
     ROOT / "examples/embodiment/config/env/realworld_rlt_ee_peg_insertion.yaml"
 )
@@ -235,35 +229,6 @@ def test_rlt_maniskill_stage2_yaml_dimension_contract():
     )
 
 
-def test_rlt_realworld_joint_dataconfig_contract():
-    cfg = get_openpi_config("pi05_rlt_realworld_joint")
-
-    _assert_rlt_train_config_contract(
-        cfg,
-        repo_id="rlt_realworld_joint",
-        image_key="extra_view_image",
-        wrist_image_key="image",
-    )
-
-    raw_sample = {
-        "extra_view_image": _uint8_image((128, 128, 3)),
-        "image": np.linspace(0.0, 1.0, 3 * 96 * 96, dtype=np.float32).reshape(
-            3, 96, 96
-        ),
-        "state": np.linspace(-2.0, 2.0, 34, dtype=np.float32),
-        "actions": np.arange(10 * 9, dtype=np.float32).reshape(10, 9),
-        "prompt": "insert the peg in the hole",
-    }
-    _assert_rlt_policy_transform_contract(
-        cfg,
-        raw_sample,
-        expected_state_dim=34,
-        expected_action_dim=8,
-        expected_base_image_shape=(128, 128, 3),
-        expected_wrist_image_shape=(96, 96, 3),
-    )
-
-
 def test_rlt_realworld_ee_dataconfig_contract():
     cfg = get_openpi_config("pi05_rlt_realworld_ee")
 
@@ -292,22 +257,6 @@ def test_rlt_realworld_ee_dataconfig_contract():
         expected_base_image_shape=(128, 128, 3),
         expected_wrist_image_shape=(96, 96, 3),
     )
-
-
-def test_rlt_realworld_stage2_yaml_dimension_contract():
-    cfg = _load_yaml_config(REALWORLD_STAGE2_CONFIG)
-
-    _assert_stage2_dimension_contract(
-        cfg,
-        config_name="pi05_rlt_realworld_joint",
-        action_dim=8,
-        action_horizon=10,
-        num_images=2,
-        proprio_dim=8,
-        proprio_mode="joint_pos_gripper",
-    )
-    assert cfg.env.train.keyboard_reward_wrapper is None
-    assert cfg.env.eval.keyboard_reward_wrapper is None
 
 
 def test_rlt_realworld_ee_stage2_yaml_dimension_contract():
@@ -362,34 +311,6 @@ def test_rlt_realworld_ee_stage1_yaml_dimension_contract():
     assert cfg.actor.openpi_data.repo_id == (
         "${oc.env:RLT_REALWORLD_EE_REPO_ID,rlt_realworld_ee}"
     )
-
-
-def test_rlt_realworld_env_yaml_observation_contract():
-    cfg = _load_yaml_config(REALWORLD_ENV_CONFIG)
-    raw_cfg = OmegaConf.to_container(cfg, resolve=False)
-
-    assert cfg.use_rlt_joint_obs is True
-    assert raw_cfg["main_image_key"] == (
-        "${oc.env:RLT_REALWORLD_MAIN_IMAGE_KEY,main_camera}"
-    )
-    assert raw_cfg["wrist_image_key"] == (
-        "${oc.env:RLT_REALWORLD_WRIST_IMAGE_KEY,wrist_camera}"
-    )
-    assert cfg.gello_action_mode == "joint_target"
-    assert raw_cfg["init_params"]["id"] == (
-        "${oc.env:RLT_REALWORLD_JOINT_ENV_ID,FrankaJointPegInsertionEnv-v1}"
-    )
-    assert "target_ee_pose" in raw_cfg["override_cfg"]
-    assert "target_pos" not in raw_cfg["override_cfg"]
-    assert list(cfg.state_key_order) == [
-        "gripper",
-        "joint_pos",
-        "joint_vel",
-        "tcp_force",
-        "tcp_pose",
-        "tcp_torque",
-        "tcp_vel",
-    ]
 
 
 def test_rlt_realworld_ee_env_yaml_observation_contract():

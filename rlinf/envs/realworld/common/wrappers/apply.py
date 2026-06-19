@@ -37,9 +37,6 @@ from rlinf.envs.realworld.common.wrappers.euler_obs import Quat2EulerWrapper
 from rlinf.envs.realworld.common.wrappers.gello_intervention import (
     GelloIntervention,
 )
-from rlinf.envs.realworld.common.wrappers.gello_joint_target_intervention import (
-    GelloJointTargetIntervention,
-)
 from rlinf.envs.realworld.common.wrappers.gripper_close import GripperCloseEnv
 from rlinf.envs.realworld.common.wrappers.relative_frame import RelativeFrame
 from rlinf.envs.realworld.common.wrappers.reward_done_wrapper import (
@@ -144,23 +141,16 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
                 "(e.g. env.eval.gello_port)."
             )
         gello_action_mode = str(cfg.get("gello_action_mode", "ee_delta"))
-        if gello_action_mode == "ee_delta":
-            env = GelloIntervention(
-                env,
-                port=gello_port,
-                gripper_enabled=gripper_enabled,
-            )
-        elif gello_action_mode == "joint_target":
-            env = GelloJointTargetIntervention(
-                env,
-                port=gello_port,
-                gripper_enabled=gripper_enabled,
-            )
-        else:
+        if gello_action_mode != "ee_delta":
             raise ValueError(
-                "Unsupported gello_action_mode. Expected 'ee_delta' or "
-                f"'joint_target', got {gello_action_mode!r}."
+                "Unsupported single-arm GELLO action mode. Realworld Franka "
+                f"supports only 'ee_delta', got {gello_action_mode!r}."
             )
+        env = GelloIntervention(
+            env,
+            port=gello_port,
+            gripper_enabled=gripper_enabled,
+        )
 
     env = _apply_rlt_critical_phase(env, cfg)
     env = _apply_keyboard_reward(env, cfg.get("keyboard_reward_wrapper", None))
