@@ -78,6 +78,12 @@ class ROSController:
             return False
         return self._input_channel_status.get(name, False)
 
+    def get_output_channel_connections(self, name: str) -> int:
+        """Return the number of subscribers connected to a ROS output channel."""
+        if name not in self._output_channels:
+            return 0
+        return self._output_channels[name].get_num_connections()
+
     def create_ros_channel(
         self, name: str, data_class: rospy.Message, queue_size: Optional[int] = None
     ):

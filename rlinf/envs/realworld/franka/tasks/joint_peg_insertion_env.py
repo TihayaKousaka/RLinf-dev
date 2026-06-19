@@ -262,9 +262,16 @@ class FrankaJointPegInsertionEnv(PegInsertionEnv):
         self._controller.start_joint(q_target.astype(float).tolist()).wait()
         self._controller.move_joints(q_target.astype(float)).wait()
 
+    def reset(self, joint_reset=False, seed=None, options=None):
+        if not self.config.is_dummy:
+            self._controller.stop_joint().wait()
+            self._controller.start_impedance().wait()
+        return super().reset(joint_reset=joint_reset, seed=seed, options=options)
+
     def go_to_rest(self, joint_reset=False):
         if not self.config.is_dummy:
             self._controller.stop_joint().wait()
+            self._controller.start_impedance().wait()
         super().go_to_rest(joint_reset)
 
     def _clip_joint_target(

@@ -123,6 +123,41 @@ class FrankaController(Worker):
             "cartesian_impedance_controllerdynamic_reconfigure_compliance_param_node"
         )
 
+    def _terminate_launch_tree(
+        self,
+        proc: psutil.Process | None,
+        *,
+        name: str,
+        timeout: float = 5.0,
+    ) -> None:
+        """Terminate a roslaunch process and its child nodes before relaunching."""
+        if proc is None:
+            return
+        try:
+            if proc.poll() is not None:
+                return
+            children = proc.children(recursive=True)
+            proc.terminate()
+            gone, alive = psutil.wait_procs([proc, *children], timeout=timeout)
+            del gone
+            if alive:
+                self._logger.warning(
+                    "%s roslaunch did not exit after %.1fs; killing %d process(es)",
+                    name,
+                    timeout,
+                    len(alive),
+                )
+                for child in alive:
+                    try:
+                        child.kill()
+                    except psutil.Error:
+                        pass
+                psutil.wait_procs(alive, timeout=2.0)
+        except psutil.NoSuchProcess:
+            return
+        except psutil.Error as exc:
+            self._logger.warning("Failed to terminate %s roslaunch cleanly: %s", name, exc)
+
     def _init_end_effector(
         self,
         end_effector_config: dict,
@@ -238,6 +273,8 @@ class FrankaController(Worker):
 
     def start_impedance(self):
         """Start the impedance controller."""
+        if self._impedance is not None and self._impedance.poll() is None:
+            return
         load_gripper = (
             "true"
             if self._end_effector_type == EndEffectorType.FRANKA_GRIPPER
@@ -260,7 +297,7 @@ class FrankaController(Worker):
 
     def stop_impedance(self):
         if self._impedance:
-            self._impedance.terminate()
+            self._terminate_launch_tree(self._impedance, name="impedance")
             self._impedance = None
             self._wait_robot()
         self.log_debug("Stop Impedance controller")
@@ -302,7 +339,8 @@ class FrankaController(Worker):
 
         self._wait_for_joint(reset_pos)
 
-        self._joint.terminate()
+        self._terminate_launch_tree(self._joint, name="joint")
+        self._joint = None
         self._wait_robot()
         self.clear_errors()
         self.start_impedance()
@@ -340,14 +378,30 @@ class FrankaController(Worker):
         )
         self._wait_robot()
         self.clear_errors()
+        self._wait_for_joint_command_subscriber()
 
     def stop_joint(self):
         """Stop the persistent joint-position controller if it is running."""
         if self._joint:
-            self._joint.terminate()
+            self._terminate_launch_tree(self._joint, name="joint")
             self._joint = None
             self._wait_robot()
             self.clear_errors()
+
+    def _wait_for_joint_command_subscriber(self, timeout: float = 5.0) -> None:
+        """Wait until the joint controller subscribes to the command topic."""
+        if self._joint_command_topic is None:
+            return
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._ros.get_output_channel_connections(self._joint_command_topic) > 0:
+                return
+            time.sleep(0.05)
+        raise TimeoutError(
+            "Timed out waiting for a subscriber on "
+            f"{self._joint_command_topic!r}. The joint controller likely failed "
+            "to start."
+        )
 
     def move_arm(self, position: np.ndarray):
         """Move the robot arm to the desired position."""
