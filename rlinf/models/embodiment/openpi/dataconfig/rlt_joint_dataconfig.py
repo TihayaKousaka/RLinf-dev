@@ -38,6 +38,7 @@ class LeRobotRLTJointDataConfig(DataConfigFactory):
     prompt_key: str | None = None
     norm_stats_path: str | None = None
     default_prompt: str | None = None
+    output_action_dim: int = 8
 
     def _load_explicit_norm_stats(self):
         if not self.norm_stats_path:
@@ -90,7 +91,11 @@ class LeRobotRLTJointDataConfig(DataConfigFactory):
                     default_prompt=self.default_prompt,
                 )
             ],
-            outputs=[rlt_joint_policy.RLTJointOutputs(output_action_dim=8)],
+            outputs=[
+                rlt_joint_policy.RLTJointOutputs(
+                    output_action_dim=self.output_action_dim
+                )
+            ],
         )
 
         if self.extra_delta_transform:

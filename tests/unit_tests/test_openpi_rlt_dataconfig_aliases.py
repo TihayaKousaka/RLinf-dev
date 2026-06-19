@@ -30,6 +30,9 @@ from rlinf.models.embodiment.openpi.policies.rlt_joint_policy import (
 from rlinf.models.embodiment.rlt_stage2.proprio import (
     resolve_proprio_dim,
 )
+from toolkits.realworld_rlt.backfill_ee_delta_actions import (
+    build_ee_delta_actions,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 MANISKILL_STAGE2_CONFIG = (
@@ -38,8 +41,19 @@ MANISKILL_STAGE2_CONFIG = (
 REALWORLD_STAGE2_CONFIG = (
     ROOT / "examples/embodiment/config/rlt_stage2_realworld_joint.yaml"
 )
+REALWORLD_EE_STAGE2_CONFIG = (
+    ROOT / "examples/embodiment/config/rlt_stage2_realworld_ee.yaml"
+)
+REALWORLD_EE_SFT_EVAL_CONFIG = (
+    ROOT / "examples/embodiment/config/rlt_realworld_ee_pi05_sft_eval.yaml"
+)
+REALWORLD_EE_SFT_CONFIG = ROOT / "examples/sft/config/rlt_realworld_ee_pi05_sft.yaml"
+REALWORLD_EE_STAGE1_CONFIG = ROOT / "examples/sft/config/rlt_stage1_realworld_ee.yaml"
 REALWORLD_ENV_CONFIG = (
     ROOT / "examples/embodiment/config/env/realworld_rlt_joint_peg_insertion.yaml"
+)
+REALWORLD_EE_ENV_CONFIG = (
+    ROOT / "examples/embodiment/config/env/realworld_rlt_ee_peg_insertion.yaml"
 )
 
 
@@ -95,22 +109,23 @@ def _assert_rlt_policy_transform_contract(
     expected_state_dim,
     expected_base_image_shape,
     expected_wrist_image_shape,
+    expected_action_dim=8,
 ):
     inputs_transform = RLTJointInputs(
         model_type=cfg.model.model_type,
         use_wrist_image=True,
     )
-    outputs_transform = RLTJointOutputs(output_action_dim=8)
+    outputs_transform = RLTJointOutputs(output_action_dim=expected_action_dim)
 
     transformed = inputs_transform(_canonicalize_raw_sample(cfg, raw_sample))
     actions = outputs_transform({"actions": raw_sample[cfg.data.action_key]})
 
     assert transformed["state"].shape == (expected_state_dim,)
     assert transformed["actions"].shape == raw_sample[cfg.data.action_key].shape
-    assert actions["actions"].shape == (cfg.model.action_horizon, 8)
+    assert actions["actions"].shape == (cfg.model.action_horizon, expected_action_dim)
     np.testing.assert_array_equal(
         actions["actions"],
-        raw_sample[cfg.data.action_key][:, :8],
+        raw_sample[cfg.data.action_key][:, :expected_action_dim],
     )
 
     assert transformed["image"]["base_0_rgb"].shape == expected_base_image_shape
@@ -243,6 +258,37 @@ def test_rlt_realworld_joint_dataconfig_contract():
         cfg,
         raw_sample,
         expected_state_dim=34,
+        expected_action_dim=8,
+        expected_base_image_shape=(128, 128, 3),
+        expected_wrist_image_shape=(96, 96, 3),
+    )
+
+
+def test_rlt_realworld_ee_dataconfig_contract():
+    cfg = get_openpi_config("pi05_rlt_realworld_ee")
+
+    _assert_rlt_train_config_contract(
+        cfg,
+        repo_id="rlt_realworld_ee",
+        image_key="extra_view_image",
+        wrist_image_key="image",
+    )
+    assert cfg.data.output_action_dim == 7
+
+    raw_sample = {
+        "extra_view_image": _uint8_image((128, 128, 3)),
+        "image": np.linspace(0.0, 1.0, 3 * 96 * 96, dtype=np.float32).reshape(
+            3, 96, 96
+        ),
+        "state": np.linspace(-2.0, 2.0, 34, dtype=np.float32),
+        "actions": np.arange(10 * 7, dtype=np.float32).reshape(10, 7),
+        "prompt": "insert the peg in the hole",
+    }
+    _assert_rlt_policy_transform_contract(
+        cfg,
+        raw_sample,
+        expected_state_dim=34,
+        expected_action_dim=7,
         expected_base_image_shape=(128, 128, 3),
         expected_wrist_image_shape=(96, 96, 3),
     )
@@ -262,6 +308,60 @@ def test_rlt_realworld_stage2_yaml_dimension_contract():
     )
     assert cfg.env.train.keyboard_reward_wrapper is None
     assert cfg.env.eval.keyboard_reward_wrapper is None
+
+
+def test_rlt_realworld_ee_stage2_yaml_dimension_contract():
+    cfg = _load_yaml_config(REALWORLD_EE_STAGE2_CONFIG)
+
+    _assert_stage2_dimension_contract(
+        cfg,
+        config_name="pi05_rlt_realworld_ee",
+        action_dim=7,
+        action_horizon=10,
+        num_images=2,
+        proprio_dim=8,
+        proprio_mode="joint_pos_gripper",
+    )
+    assert cfg.env.train.gello_action_mode == "ee_delta"
+    assert cfg.env.eval.gello_action_mode == "ee_delta"
+    assert cfg.env.train.keyboard_reward_wrapper is None
+    assert cfg.env.eval.keyboard_reward_wrapper is None
+
+
+def test_rlt_realworld_ee_sft_yaml_dimension_contract():
+    cfg = _load_yaml_config(REALWORLD_EE_SFT_CONFIG)
+
+    assert cfg.actor.model.action_dim == 7
+    assert cfg.actor.model.openpi.config_name == "pi05_rlt_realworld_ee"
+    assert cfg.actor.model.openpi.num_images_in_input == 2
+    assert cfg.actor.model.openpi.action_env_dim == cfg.actor.model.action_dim
+    assert cfg.actor.openpi_data.repo_id == (
+        "${oc.env:RLT_REALWORLD_EE_REPO_ID,rlt_realworld_ee}"
+    )
+
+
+def test_rlt_realworld_ee_sft_eval_yaml_dimension_contract():
+    cfg = _load_yaml_config(REALWORLD_EE_SFT_EVAL_CONFIG)
+
+    assert cfg.actor.model.action_dim == 7
+    assert cfg.actor.model.num_action_chunks == 10
+    assert cfg.actor.model.openpi.config_name == "pi05_rlt_realworld_ee"
+    assert cfg.actor.model.openpi.num_images_in_input == 2
+    assert cfg.actor.model.openpi.action_env_dim == cfg.actor.model.action_dim
+    assert cfg.env.eval.action_exec_chunks == cfg.actor.model.num_action_chunks
+    assert cfg.env.train.gello_action_mode == "ee_delta"
+    assert cfg.env.eval.gello_action_mode == "ee_delta"
+
+
+def test_rlt_realworld_ee_stage1_yaml_dimension_contract():
+    cfg = _load_yaml_config(REALWORLD_EE_STAGE1_CONFIG)
+
+    assert cfg.actor.model.action_dim == 7
+    assert cfg.actor.model.rlt_stage1.config_name == "pi05_rlt_realworld_ee"
+    assert cfg.actor.model.rlt_stage1.num_images_in_input == 2
+    assert cfg.actor.openpi_data.repo_id == (
+        "${oc.env:RLT_REALWORLD_EE_REPO_ID,rlt_realworld_ee}"
+    )
 
 
 def test_rlt_realworld_env_yaml_observation_contract():
@@ -290,3 +390,67 @@ def test_rlt_realworld_env_yaml_observation_contract():
         "tcp_torque",
         "tcp_vel",
     ]
+
+
+def test_rlt_realworld_ee_env_yaml_observation_contract():
+    cfg = _load_yaml_config(REALWORLD_EE_ENV_CONFIG)
+    raw_cfg = OmegaConf.to_container(cfg, resolve=False)
+
+    assert cfg.use_rlt_joint_obs is True
+    assert raw_cfg["main_image_key"] == (
+        "${oc.env:RLT_REALWORLD_MAIN_IMAGE_KEY,main_camera}"
+    )
+    assert raw_cfg["wrist_image_key"] == (
+        "${oc.env:RLT_REALWORLD_WRIST_IMAGE_KEY,wrist_camera}"
+    )
+    assert cfg.gello_action_mode == "ee_delta"
+    assert raw_cfg["init_params"]["id"] == (
+        "${oc.env:RLT_REALWORLD_EE_ENV_ID,PegInsertionEnv-v1}"
+    )
+    assert "target_ee_pose" in raw_cfg["override_cfg"]
+    assert "critical_phase_reset_joint_qpos" not in raw_cfg["override_cfg"]
+    assert "full_task_reset_joint_qpos" not in raw_cfg["override_cfg"]
+    assert list(cfg.state_key_order) == [
+        "gripper",
+        "joint_pos",
+        "joint_vel",
+        "tcp_force",
+        "tcp_pose",
+        "tcp_torque",
+        "tcp_vel",
+    ]
+
+
+def test_realworld_joint_to_ee_action_backfill_contract():
+    state = np.zeros((3, 34), dtype=np.float32)
+    state[:, 21:25] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    state[:, 18:21] = np.array(
+        [
+            [0.50, 0.00, 0.10],
+            [0.51, 0.02, 0.10],
+            [0.51, 0.02, 0.08],
+        ],
+        dtype=np.float32,
+    )
+    actions = np.zeros((3, 8), dtype=np.float32)
+    actions[:, 7] = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
+
+    ee_actions, metrics = build_ee_delta_actions(
+        state,
+        actions,
+        pos_scale=0.02,
+        rot_scale=0.1,
+        clip=False,
+    )
+
+    expected = np.array(
+        [
+            [0.5, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+            [0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(ee_actions, expected, atol=1e-6)
+    assert metrics["max_abs_arm_action"] == pytest.approx(1.0)
+    assert metrics["arm_clip_fraction"] == pytest.approx(0.0)
