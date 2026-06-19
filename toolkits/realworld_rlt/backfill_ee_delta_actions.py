@@ -285,8 +285,7 @@ def _patch_hf_metadata(
         _swap_feature_entries(feats, "image", "extra_view_image")
     feats["prompt"] = {
         "dtype": "string",
-        "shape": [1],
-        "names": None,
+        "_type": "Value",
     }
     out[b"huggingface"] = json.dumps(info, separators=(",", ":")).encode()
     return out
