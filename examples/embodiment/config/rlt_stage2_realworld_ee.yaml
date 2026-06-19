@@ -33,14 +33,16 @@ cluster:
       hardware:
         type: Franka
         configs:
-          - robot_ip: "${oc.env:RLT_REALWORLD_ROBOT_IP,ROBOT_IP}"
+          - robot_ip: 172.16.0.2
+            gripper_type: robotiq
+            gripper_connection: "/dev/ttyUSB0"
             camera_infos:
               - name: main_camera
-                serial_number: "${oc.env:RLT_REALWORLD_MAIN_CAMERA_SERIAL,MAIN_CAMERA_SERIAL}"
-                camera_type: "${oc.env:RLT_REALWORLD_MAIN_CAMERA_TYPE,realsense}"
+                serial_number: "141722070657"
+                camera_type: "realsense"
               - name: wrist_camera
-                serial_number: "${oc.env:RLT_REALWORLD_WRIST_CAMERA_SERIAL,WRIST_CAMERA_SERIAL}"
-                camera_type: "${oc.env:RLT_REALWORLD_WRIST_CAMERA_TYPE,lumos}"
+                serial_number: "usb-XVisio_Technology_XVisio_vSLAM_250801DR48FB26001216-video-index0"
+                camera_type: "lumos"
             node_rank: 1
 
 runner:
@@ -123,7 +125,7 @@ env:
     # Current realworld Franka wrappers support SpaceMouse and GELLO.
     use_spacemouse: False
     use_gello: True
-    gello_port: "${oc.env:RLT_REALWORLD_GELLO_PORT,/dev/ttyUSB0}"
+    gello_port: "/dev/ttyUSB0"
     gello_action_mode: ee_delta
     video_cfg:
       save_video: True
@@ -144,7 +146,7 @@ env:
     # Teleoperation backend for optional eval-time intervention/debugging.
     use_spacemouse: False
     use_gello: True
-    gello_port: "${oc.env:RLT_REALWORLD_GELLO_PORT,/dev/ttyUSB0}"
+    gello_port: "/dev/ttyUSB0"
     gello_action_mode: ee_delta
     video_cfg:
       save_video: True

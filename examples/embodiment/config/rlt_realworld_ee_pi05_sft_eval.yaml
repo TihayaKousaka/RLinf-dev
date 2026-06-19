@@ -33,14 +33,16 @@ cluster:
       hardware:
         type: Franka
         configs:
-          - robot_ip: "${oc.env:RLT_REALWORLD_ROBOT_IP,ROBOT_IP}"
+          - robot_ip: 172.16.0.2
+            gripper_type: robotiq
+            gripper_connection: "/dev/ttyUSB0"
             camera_infos:
               - name: main_camera
-                serial_number: "${oc.env:RLT_REALWORLD_MAIN_CAMERA_SERIAL,MAIN_CAMERA_SERIAL}"
-                camera_type: "${oc.env:RLT_REALWORLD_MAIN_CAMERA_TYPE,realsense}"
+                serial_number: "141722070657"
+                camera_type: "realsense"
               - name: wrist_camera
-                serial_number: "${oc.env:RLT_REALWORLD_WRIST_CAMERA_SERIAL,WRIST_CAMERA_SERIAL}"
-                camera_type: "${oc.env:RLT_REALWORLD_WRIST_CAMERA_TYPE,lumos}"
+                serial_number: "usb-XVisio_Technology_XVisio_vSLAM_250801DR48FB26001216-video-index0"
+                camera_type: "lumos"
             node_rank: 1
 
 runner:
@@ -136,8 +138,8 @@ env:
     gello_action_mode: ee_delta
     override_cfg:
       # Replace placeholders with calibrated realworld EE-task values before running hardware.
-      target_ee_pose: TARGET_EE_POSE
-      joint_reset_qpos: RESET_JOINT_QPOS
+      target_ee_pose: [ 0.60283899, -0.30243948,  0.42646784,  2.93922733, -0.03996551, -1.67041543]
+      joint_reset_qpos: [0.0677, 0.1155, 0.1334, -1.5898, 0.1972, 2.1341, -0.5112]
     video_cfg:
       save_video: True
       fps: 10
@@ -166,7 +168,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "${oc.env:RLT_REALWORLD_EE_SFT_PATH,/path/to/rlt_realworld_ee_pi05_sft/checkpoints/global_step_5000/actor}"
+    model_path: "/path/to/rlt_realworld_ee_pi05_sft/checkpoints/global_step_5000/actor"
     precision: null
     model_type: "openpi"
     num_action_chunks: 10
@@ -184,8 +186,8 @@ actor:
       action_chunk: ${actor.model.num_action_chunks}
       action_env_dim: ${actor.model.action_dim}
     openpi_data:
-      repo_id: "${oc.env:RLT_REALWORLD_EE_REPO_ID,rlt_realworld_ee}"
-      norm_stats_path: "${oc.env:RLT_REALWORLD_EE_NORM_STATS_PATH,/path/to/rlt_realworld_ee/norm_stats.json}"
+      repo_id: "rlt_realworld_ee"
+      norm_stats_path: "/path/to/rlt_realworld_ee/norm_stats.json"
       default_prompt: "insert the peg in the hole"
 
   optim:

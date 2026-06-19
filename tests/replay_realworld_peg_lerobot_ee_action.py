@@ -209,14 +209,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--yes", action="store_true", help="Skip destructive-test confirmation.")
 
-    parser.add_argument("--robot-ip", default=os.environ.get("RLT_REALWORLD_ROBOT_IP"))
+    parser.add_argument("--robot-ip", default="172.16.0.2")
     parser.add_argument("--node-rank", type=int, default=int(os.environ.get("RLINF_NODE_RANK", "0")))
-    parser.add_argument("--gripper-type", default=os.environ.get("RLT_REALWORLD_GRIPPER_TYPE", "robotiq"))
-    parser.add_argument("--gripper-connection", default=os.environ.get("RLT_REALWORLD_GRIPPER_CONNECTION", "/dev/ttyUSB0"))
-    parser.add_argument("--main-camera-serial", default=os.environ.get("RLT_REALWORLD_MAIN_CAMERA_SERIAL"))
-    parser.add_argument("--main-camera-type", default=os.environ.get("RLT_REALWORLD_MAIN_CAMERA_TYPE", "realsense"))
-    parser.add_argument("--wrist-camera-serial", default=os.environ.get("RLT_REALWORLD_WRIST_CAMERA_SERIAL"))
-    parser.add_argument("--wrist-camera-type", default=os.environ.get("RLT_REALWORLD_WRIST_CAMERA_TYPE", "lumos"))
+    parser.add_argument("--gripper-type", default="robotiq")
+    parser.add_argument("--gripper-connection", default="/dev/ttyUSB0")
+    parser.add_argument("--main-camera-serial", default="141722070657")
+    parser.add_argument("--main-camera-type", default="realsense")
+    parser.add_argument(
+        "--wrist-camera-serial",
+        default="usb-XVisio_Technology_XVisio_vSLAM_250801DR48FB26001216-video-index0",
+    )
+    parser.add_argument("--wrist-camera-type", default="lumos")
     parser.add_argument(
         "--joint-reset-qpos",
         type=lambda raw: _parse_float_list(raw, length=7, name="joint_reset_qpos"),
