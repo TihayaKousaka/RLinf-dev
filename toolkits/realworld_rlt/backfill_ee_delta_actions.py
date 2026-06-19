@@ -67,6 +67,7 @@ GRIPPER_ACTION_IDX = 7
 DEFAULT_POS_SCALE = 0.02
 DEFAULT_ROT_SCALE = 0.1
 DEFAULT_GRIPPER_SCALE = 1.0
+DEFAULT_PROMPT = "insert the peg in the hole"
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +283,11 @@ def _patch_hf_metadata(
         feats["state"]["length"] = output_state_dim
     if swap_image_columns:
         _swap_feature_entries(feats, "image", "extra_view_image")
+    feats["prompt"] = {
+        "dtype": "string",
+        "shape": [1],
+        "names": None,
+    }
     out[b"huggingface"] = json.dumps(info, separators=(",", ":")).encode()
     return out
 
@@ -317,6 +323,7 @@ def rewrite_parquet(
     clip: bool,
     output_state_dim: int,
     swap_image_columns: bool,
+    prompt: str,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     """Rewrite one episode parquet. Returns output state, new actions, metrics."""
 
@@ -363,6 +370,7 @@ def rewrite_parquet(
         )
 
     new_fields = []
+    has_prompt = False
     for field in src_table.schema:
         if field.name == "state":
             new_fields.append(
@@ -390,8 +398,21 @@ def rewrite_parquet(
             new_fields.append(
                 _renamed_field(pa, image_fields["image"], "extra_view_image")
             )
+        elif field.name == "prompt":
+            has_prompt = True
+            new_fields.append(
+                pa.field(
+                    "prompt",
+                    pa.string(),
+                    nullable=field.nullable,
+                    metadata=field.metadata,
+                )
+            )
         else:
             new_fields.append(field)
+    if not has_prompt:
+        new_fields.append(pa.field("prompt", pa.string(), nullable=False))
+
     new_schema = pa.schema(
         new_fields,
         metadata=_patch_hf_metadata(
@@ -402,6 +423,7 @@ def rewrite_parquet(
     )
 
     new_columns = []
+    prompt_col = pa.array([prompt] * src_table.num_rows, type=pa.string())
     for name in src_table.column_names:
         if name == "state":
             new_columns.append(_fsl_float32(state_np))
@@ -411,8 +433,12 @@ def rewrite_parquet(
             new_columns.append(src_table.column("extra_view_image").combine_chunks())
         elif swap_image_columns and name == "extra_view_image":
             new_columns.append(src_table.column("image").combine_chunks())
+        elif name == "prompt":
+            new_columns.append(prompt_col)
         else:
             new_columns.append(src_table.column(name).combine_chunks())
+    if not has_prompt:
+        new_columns.append(prompt_col)
 
     new_table = pa.Table.from_arrays(new_columns, schema=new_schema)
     dst_path.parent.mkdir(parents=True, exist_ok=True)
@@ -447,6 +473,7 @@ def _patch_info_json(
     *,
     output_state_dim: int,
     swap_image_columns: bool,
+    prompt: str,
 ) -> None:
     with (src_meta / "info.json").open() as f:
         info = json.load(f)
@@ -454,6 +481,11 @@ def _patch_info_json(
     info["features"]["actions"]["shape"] = [ACTION_DIM_OUT]
     if swap_image_columns:
         _swap_feature_entries(info["features"], "image", "extra_view_image")
+    info["features"]["prompt"] = {
+        "dtype": "string",
+        "shape": [1],
+        "names": None,
+    }
     with (dst_meta / "info.json").open("w") as f:
         json.dump(info, f, indent=4)
 
@@ -490,6 +522,27 @@ def _copy_other_meta(src_meta: Path, dst_meta: Path) -> None:
         if src_file.name in {"info.json", "episodes_stats.jsonl"}:
             continue
         shutil.copy2(src_file, dst_meta / src_file.name)
+
+
+def _patch_tasks_jsonl(dst_meta: Path, prompt: str) -> None:
+    tasks_path = dst_meta / "tasks.jsonl"
+    if not tasks_path.exists():
+        return
+
+    task_indices = []
+    with tasks_path.open() as f:
+        for idx, line in enumerate(f):
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            task_indices.append(int(entry.get("task_index", idx)))
+
+    if not task_indices:
+        task_indices = [0]
+
+    with tasks_path.open("w") as f:
+        for task_index in task_indices:
+            f.write(json.dumps({"task_index": task_index, "task": prompt}) + "\n")
 
 
 def _load_json(path: Path) -> dict:
@@ -536,6 +589,7 @@ def rewrite_meta(
     *,
     output_state_dim: int,
     swap_image_columns: bool,
+    prompt: str,
 ) -> None:
     src_meta = src / "meta"
     dst_meta = dst / "meta"
@@ -545,6 +599,7 @@ def rewrite_meta(
         dst_meta,
         output_state_dim=output_state_dim,
         swap_image_columns=swap_image_columns,
+        prompt=prompt,
     )
     _patch_episodes_stats(
         src_meta,
@@ -554,6 +609,7 @@ def rewrite_meta(
         swap_image_columns=swap_image_columns,
     )
     _copy_other_meta(src_meta, dst_meta)
+    _patch_tasks_jsonl(dst_meta, prompt)
     _patch_norm_stats(
         src,
         dst,
@@ -590,6 +646,7 @@ def backfill(
     clip: bool = True,
     output_state_dim: int = STATE_DIM_REALWORLD,
     swap_image_columns: bool = True,
+    prompt: str = DEFAULT_PROMPT,
     overwrite: bool = False,
 ) -> None:
     src_meta = src / "meta"
@@ -628,6 +685,7 @@ def backfill(
             clip=clip,
             output_state_dim=output_state_dim,
             swap_image_columns=swap_image_columns,
+            prompt=prompt,
         )
         ep_idx = int(src_pq.stem.split("_")[-1])
         per_episode_state[ep_idx] = state_np
@@ -643,6 +701,7 @@ def backfill(
         per_episode_actions,
         output_state_dim=output_state_dim,
         swap_image_columns=swap_image_columns,
+        prompt=prompt,
     )
 
     total_frames = sum(arr.shape[0] for arr in per_episode_actions.values())
@@ -662,6 +721,7 @@ def backfill(
             "    image columns: "
             "image=source extra_view_image, extra_view_image=source image"
         )
+    print(f"    prompt: {prompt}")
     print(f"    src -> dst: {src}  ->  {dst}")
 
 
@@ -726,6 +786,11 @@ def main() -> int:
         help="Do not clip output actions to [-1, 1].",
     )
     parser.add_argument(
+        "--prompt",
+        default=DEFAULT_PROMPT,
+        help="Prompt written to every output frame and meta/tasks.jsonl.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Remove --dst before writing. Does NOT touch --src.",
@@ -744,6 +809,7 @@ def main() -> int:
             if args.state_format == "realworld19"
             else STATE_DIM_LEGACY,
             swap_image_columns=not args.no_swap_image_columns,
+            prompt=args.prompt,
             overwrite=args.overwrite,
         )
     except (FileNotFoundError, FileExistsError, ValueError) as exc:
