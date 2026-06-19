@@ -8,7 +8,7 @@ hydra:
     dir: .
   output_subdir: null
   searchpath:
-    - file://${oc.env:EMBODIED_PATH}/config/
+    - file:///home/i-tingying/RLinf-dev2/examples/embodiment/config/
 
 cluster:
   num_nodes: 1
@@ -32,7 +32,7 @@ data:
   train_data_paths:
     # Build this dataset from joint demos with
     # toolkits/realworld_rlt/backfill_ee_delta_actions.py.
-    - dataset_path: "${oc.env:RLT_REALWORLD_EE_DATA_PATH,/path/to/rlt_realworld_ee}"
+    - dataset_path: "/home/i-tingying/rlt_id3_id4_dataset/collected_data_id3_id4/rank_0/id_4_ee_action_state19"
       weight: 1.0
 
 algorithm:
@@ -47,7 +47,7 @@ actor:
 
   model:
     precision: null
-    model_path: "${oc.env:RLT_REALWORLD_EE_SFT_PATH,/path/to/rlt_realworld_ee_pi05_sft/checkpoints/global_step_5000/actor}"
+    model_path: "/home/i-tingying/RLinf-dev2/logs/rlt_realworld_ee_pi05_sft/checkpoints/global_step_5000/actor"
     num_action_chunks: 10
     action_dim: 7
     rlt_stage1:
@@ -64,8 +64,8 @@ actor:
       gradient_checkpointing: True
 
   openpi_data:
-    repo_id: "${oc.env:RLT_REALWORLD_EE_REPO_ID,rlt_realworld_ee}"
-    norm_stats_path: "${oc.env:RLT_REALWORLD_EE_NORM_STATS_PATH,/path/to/rlt_realworld_ee/norm_stats.json}"
+    repo_id: "/home/i-tingying/rlt_id3_id4_dataset/collected_data_id3_id4/rank_0/id_4_ee_action_state19"
+    norm_stats_path: "/home/i-tingying/rlt_id3_id4_dataset/collected_data_id3_id4/rank_0/id_4_ee_action_state19/norm_stats.json"
     default_prompt: "insert the peg in the hole"
 
   optim:

@@ -13,12 +13,12 @@ max_steps_per_rollout_epoch: 100
 max_episode_steps: 100
 no_gripper: False
 use_spacemouse: False
-use_gello: True
-gello_port: "/dev/ttyUSB0"
+use_gello: False
+gello_port: null
 gello_action_mode: ee_delta
 use_relative_frame: False
-use_quat_tcp_pose: True
-use_rlt_joint_obs: True
+use_quat_tcp_pose: False
+use_rlt_joint_obs: False
 main_image_key: "main_camera"
 wrist_image_key: "wrist_camera"
 default_prompt: "insert the peg in the hole"
@@ -27,18 +27,14 @@ task_mode: critical_phase
 critical_phase_key: v
 record_prefix_before_critical_phase: false
 
-# Keep the current realworld RLT 34D state layout for SFT/Stage1/Stage2:
-# state[0] gripper
-# state[1:8] joint_pos
-# state[8:15] joint_vel
-# state[15:18] tcp_force
-# state[18:25] tcp_pose
-# state[25:28] tcp_torque
-# state[28:34] tcp_vel
+# Keep the RLinf realworld 19D state layout used by realworld_dataconfig:
+# state[0] gripper_position
+# state[1:4] tcp_force
+# state[4:10] tcp_pose (xyz + xyz-euler)
+# state[10:13] tcp_torque
+# state[13:19] tcp_vel
 state_key_order:
-  - gripper
-  - joint_pos
-  - joint_vel
+  - gripper_position
   - tcp_force
   - tcp_pose
   - tcp_torque

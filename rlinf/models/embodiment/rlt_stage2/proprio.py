@@ -23,6 +23,7 @@ import torch
 PROPRIO_MODE_TO_DIM = {
     "joint_pos_gripper": 8,
     "joint_pos_vel_gripper": 15,
+    "realworld_ee": 19,
     "full_state": 34,
 }
 
@@ -71,8 +72,8 @@ def select_proprio(
 ) -> torch.Tensor:
     """Select proprio state columns for RLT Stage 2.
 
-    Realworld RLT uses contiguous prefixes:
-    [gripper, joint_pos, joint_vel, tcp_force, tcp_pose, tcp_torque, tcp_vel].
+    Realworld EE RLT uses the full 19D realworld state:
+    [gripper, tcp_force, tcp_pose(xyz+euler), tcp_torque, tcp_vel].
     ManiSkill configs keep using the legacy ``proprio_dim`` prefix selection.
     """
 

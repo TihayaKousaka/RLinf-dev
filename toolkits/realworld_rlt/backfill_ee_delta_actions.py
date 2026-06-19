@@ -18,22 +18,30 @@ The source dataset is the current single-arm realworld RLT LeRobot layout:
     state: 34D [gripper, joint_pos(7), joint_vel(7), tcp_force(3),
                 tcp_pose(7 xyz+xyzw), tcp_torque(3), tcp_vel(6)]
     actions: 8D [joint_target(7), gripper]
+    extra_view_image: base camera
+    image: wrist camera
 
-The output keeps ``state`` unchanged at 34D, but rewrites ``actions`` to the
-7D normalized action consumed by ``PegInsertionEnv-v1``:
+The output defaults to RLinf's existing realworld OpenPI layout:
+
+    state: 19D [gripper, tcp_force(3), tcp_pose(6 xyz+euler),
+                tcp_torque(3), tcp_vel(6)]
+    actions: 7D normalized action consumed by ``PegInsertionEnv-v1``
+    image: base camera
+    extra_view_image: wrist camera
 
     [dx / pos_scale, dy / pos_scale, dz / pos_scale,
      droll / rot_scale, dpitch / rot_scale, dyaw / rot_scale, gripper]
 
 The EE target proxy is the next frame's recorded TCP pose. The last frame holds
-the current TCP pose. The source is left untouched.
+the current TCP pose. The source is left untouched. Use
+``--state-format legacy34`` only for legacy debugging.
 
 Run from the repo root::
 
     export PYTHONPATH=$(pwd)
     python toolkits/realworld_rlt/backfill_ee_delta_actions.py \\
         --src /path/to/source_lerobot_8d_actions \\
-        --dst /path/to/rlt_realworld_ee
+        --dst /path/to/rlt_realworld_ee_state19
 """
 
 from __future__ import annotations
@@ -46,7 +54,9 @@ from pathlib import Path
 
 import numpy as np
 
-STATE_DIM = 34
+STATE_DIM_IN = 34
+STATE_DIM_REALWORLD = 19
+STATE_DIM_LEGACY = 34
 ACTION_DIM_IN = 8
 ACTION_DIM_OUT = 7
 
@@ -76,8 +86,10 @@ def _assert_unit_quats(state_34: np.ndarray) -> None:
 
 
 def _assert_source_layout(state_34: np.ndarray, actions_8: np.ndarray) -> None:
-    if state_34.ndim != 2 or state_34.shape[1] != STATE_DIM:
-        raise ValueError(f"expected state shape (T, {STATE_DIM}), got {state_34.shape}")
+    if state_34.ndim != 2 or state_34.shape[1] != STATE_DIM_IN:
+        raise ValueError(
+            f"expected state shape (T, {STATE_DIM_IN}), got {state_34.shape}"
+        )
     if actions_8.shape != (state_34.shape[0], ACTION_DIM_IN):
         raise ValueError(
             f"expected actions shape (T, {ACTION_DIM_IN}), got {actions_8.shape}"
@@ -137,6 +149,32 @@ def _quat_xyzw_to_xyz_euler(quat: np.ndarray) -> np.ndarray:
     pitch = np.arcsin(np.clip(-matrix[:, 2, 0], -1.0, 1.0))
     yaw = np.arctan2(matrix[:, 1, 0], matrix[:, 0, 0])
     return np.stack([roll, pitch, yaw], axis=-1)
+
+
+def build_realworld_19d_state(state_34: np.ndarray) -> np.ndarray:
+    """Convert realworld RLT 34D state to RLinf realworld 19D state."""
+
+    if state_34.ndim != 2 or state_34.shape[1] != STATE_DIM_IN:
+        raise ValueError(
+            f"expected state shape (T, {STATE_DIM_IN}), got {state_34.shape}"
+        )
+    _assert_unit_quats(state_34)
+
+    gripper = state_34[:, 0:1]
+    tcp_force = state_34[:, 15:18]
+    tcp_xyz = state_34[:, TCP_XYZ_SLICE]
+    tcp_quat = state_34[:, TCP_QUAT_SLICE]
+    tcp_euler = _quat_xyzw_to_xyz_euler(tcp_quat)
+    tcp_torque = state_34[:, 25:28]
+    tcp_vel = state_34[:, 28:34]
+
+    state_19 = np.concatenate(
+        [gripper, tcp_force, tcp_xyz, tcp_euler, tcp_torque, tcp_vel],
+        axis=-1,
+    ).astype(np.float32)
+    if state_19.shape != (state_34.shape[0], STATE_DIM_REALWORLD):
+        raise AssertionError(f"unexpected realworld state shape {state_19.shape}")
+    return state_19
 
 
 def build_ee_delta_actions(
@@ -218,10 +256,18 @@ def _fsl_to_numpy(col, dim: int) -> np.ndarray:
     return flat.reshape(-1, dim).astype(np.float32, copy=False)
 
 
+def _swap_feature_entries(features: dict, key_a: str, key_b: str) -> None:
+    if key_a in features and key_b in features:
+        features[key_a], features[key_b] = features[key_b], features[key_a]
+
+
 def _patch_hf_metadata(
     metadata: dict[bytes, bytes] | None,
+    *,
+    output_state_dim: int,
+    swap_image_columns: bool,
 ) -> dict[bytes, bytes] | None:
-    """Update Hugging Face schema metadata's actions length to 7 if present."""
+    """Update Hugging Face schema metadata if present."""
     if metadata is None:
         return None
     out = dict(metadata)
@@ -233,9 +279,32 @@ def _patch_hf_metadata(
     if "actions" in feats:
         feats["actions"]["length"] = ACTION_DIM_OUT
     if "state" in feats:
-        feats["state"]["length"] = STATE_DIM
+        feats["state"]["length"] = output_state_dim
+    if swap_image_columns:
+        _swap_feature_entries(feats, "image", "extra_view_image")
     out[b"huggingface"] = json.dumps(info, separators=(",", ":")).encode()
     return out
+
+
+def _image_swap_fields(schema) -> dict[str, object]:
+    fields = {field.name: field for field in schema}
+    missing = [name for name in ("image", "extra_view_image") if name not in fields]
+    if missing:
+        raise ValueError(
+            "Cannot swap realworld image columns because the source parquet is "
+            f"missing {missing}. Pass --no-swap-image-columns only for datasets "
+            "that already use image=base and extra_view_image=wrist."
+        )
+    return fields
+
+
+def _renamed_field(pa, field, name: str):
+    return pa.field(
+        name,
+        field.type,
+        nullable=field.nullable,
+        metadata=field.metadata,
+    )
 
 
 def rewrite_parquet(
@@ -246,44 +315,65 @@ def rewrite_parquet(
     rot_scale: float,
     gripper_scale: float,
     clip: bool,
+    output_state_dim: int,
+    swap_image_columns: bool,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
-    """Rewrite one episode parquet. Returns unchanged state, new actions, metrics."""
+    """Rewrite one episode parquet. Returns output state, new actions, metrics."""
 
     pa, pq = _import_pyarrow()
     src_table = pq.read_table(src_path)
     if "state" not in src_table.column_names or "actions" not in src_table.column_names:
         raise ValueError(f"{src_path}: missing state/actions column")
+    image_fields = _image_swap_fields(src_table.schema) if swap_image_columns else {}
 
     state_type = src_table.schema.field("state").type
     actions_type = src_table.schema.field("actions").type
     state_size = getattr(state_type, "list_size", None)
     actions_size = getattr(actions_type, "list_size", None)
-    if state_size == STATE_DIM and actions_size == ACTION_DIM_OUT:
+    if state_size == output_state_dim and actions_size == ACTION_DIM_OUT:
         raise ValueError(
             f"{src_path}: actions are already {ACTION_DIM_OUT}D; dataset looks "
             "already backfilled. Point --src at the original 8D joint dataset, "
             "or pick a fresh --dst."
         )
-    if state_size != STATE_DIM or actions_size != ACTION_DIM_IN:
+    if state_size != STATE_DIM_IN or actions_size != ACTION_DIM_IN:
         raise ValueError(
             f"{src_path}: expected source state/actions dimensions "
-            f"{STATE_DIM}/{ACTION_DIM_IN}, got {state_size}/{actions_size}."
+            f"{STATE_DIM_IN}/{ACTION_DIM_IN}, got {state_size}/{actions_size}."
         )
 
-    state_np = _fsl_to_numpy(src_table.column("state"), STATE_DIM)
+    state_34 = _fsl_to_numpy(src_table.column("state"), STATE_DIM_IN)
     actions_np = _fsl_to_numpy(src_table.column("actions"), ACTION_DIM_IN)
     new_actions, metrics = build_ee_delta_actions(
-        state_np,
+        state_34,
         actions_np,
         pos_scale=pos_scale,
         rot_scale=rot_scale,
         gripper_scale=gripper_scale,
         clip=clip,
     )
+    if output_state_dim == STATE_DIM_REALWORLD:
+        state_np = build_realworld_19d_state(state_34)
+    elif output_state_dim == STATE_DIM_LEGACY:
+        state_np = state_34
+    else:
+        raise ValueError(
+            f"unsupported output_state_dim={output_state_dim}; expected "
+            f"{STATE_DIM_REALWORLD} or {STATE_DIM_LEGACY}."
+        )
 
     new_fields = []
     for field in src_table.schema:
-        if field.name == "actions":
+        if field.name == "state":
+            new_fields.append(
+                pa.field(
+                    "state",
+                    pa.list_(pa.float32(), output_state_dim),
+                    nullable=field.nullable,
+                    metadata=field.metadata,
+                )
+            )
+        elif field.name == "actions":
             new_fields.append(
                 pa.field(
                     "actions",
@@ -292,16 +382,35 @@ def rewrite_parquet(
                     metadata=field.metadata,
                 )
             )
+        elif swap_image_columns and field.name == "image":
+            new_fields.append(
+                _renamed_field(pa, image_fields["extra_view_image"], "image")
+            )
+        elif swap_image_columns and field.name == "extra_view_image":
+            new_fields.append(
+                _renamed_field(pa, image_fields["image"], "extra_view_image")
+            )
         else:
             new_fields.append(field)
     new_schema = pa.schema(
-        new_fields, metadata=_patch_hf_metadata(src_table.schema.metadata)
+        new_fields,
+        metadata=_patch_hf_metadata(
+            src_table.schema.metadata,
+            output_state_dim=output_state_dim,
+            swap_image_columns=swap_image_columns,
+        ),
     )
 
     new_columns = []
     for name in src_table.column_names:
-        if name == "actions":
+        if name == "state":
+            new_columns.append(_fsl_float32(state_np))
+        elif name == "actions":
             new_columns.append(_fsl_float32(new_actions))
+        elif swap_image_columns and name == "image":
+            new_columns.append(src_table.column("extra_view_image").combine_chunks())
+        elif swap_image_columns and name == "extra_view_image":
+            new_columns.append(src_table.column("image").combine_chunks())
         else:
             new_columns.append(src_table.column(name).combine_chunks())
 
@@ -332,11 +441,19 @@ def _aggregate_stats(arrays: list[np.ndarray]) -> dict:
     return _stats_for(np.concatenate(arrays, axis=0))
 
 
-def _patch_info_json(src_meta: Path, dst_meta: Path) -> None:
+def _patch_info_json(
+    src_meta: Path,
+    dst_meta: Path,
+    *,
+    output_state_dim: int,
+    swap_image_columns: bool,
+) -> None:
     with (src_meta / "info.json").open() as f:
         info = json.load(f)
-    info["features"]["state"]["shape"] = [STATE_DIM]
+    info["features"]["state"]["shape"] = [output_state_dim]
     info["features"]["actions"]["shape"] = [ACTION_DIM_OUT]
+    if swap_image_columns:
+        _swap_feature_entries(info["features"], "image", "extra_view_image")
     with (dst_meta / "info.json").open("w") as f:
         json.dump(info, f, indent=4)
 
@@ -344,7 +461,10 @@ def _patch_info_json(src_meta: Path, dst_meta: Path) -> None:
 def _patch_episodes_stats(
     src_meta: Path,
     dst_meta: Path,
+    new_state_per_episode: dict[int, np.ndarray],
     new_actions_per_episode: dict[int, np.ndarray],
+    *,
+    swap_image_columns: bool,
 ) -> None:
     src_stats = src_meta / "episodes_stats.jsonl"
     if not src_stats.exists():
@@ -354,8 +474,12 @@ def _patch_episodes_stats(
         for line in f_in:
             entry = json.loads(line)
             ep = entry["episode_index"]
+            if ep in new_state_per_episode:
+                entry["stats"]["state"] = _stats_for(new_state_per_episode[ep])
             if ep in new_actions_per_episode:
                 entry["stats"]["actions"] = _stats_for(new_actions_per_episode[ep])
+            if swap_image_columns:
+                _swap_feature_entries(entry["stats"], "image", "extra_view_image")
             f_out.write(json.dumps(entry) + "\n")
 
 
@@ -383,6 +507,8 @@ def _patch_norm_stats(
     dst: Path,
     all_state: list[np.ndarray],
     all_actions: list[np.ndarray],
+    *,
+    swap_image_columns: bool,
 ) -> None:
     """Copy top-level norm_stats.json when present, patching actions stats."""
 
@@ -397,6 +523,8 @@ def _patch_norm_stats(
     if all_state:
         container["state"] = _aggregate_stats(all_state)
     container["actions"] = _aggregate_stats(all_actions)
+    if swap_image_columns:
+        _swap_feature_entries(container, "image", "extra_view_image")
     _dump_json(dst / "norm_stats.json", stats)
 
 
@@ -405,18 +533,33 @@ def rewrite_meta(
     dst: Path,
     per_episode_state: dict[int, np.ndarray],
     per_episode_actions: dict[int, np.ndarray],
+    *,
+    output_state_dim: int,
+    swap_image_columns: bool,
 ) -> None:
     src_meta = src / "meta"
     dst_meta = dst / "meta"
     dst_meta.mkdir(parents=True, exist_ok=True)
-    _patch_info_json(src_meta, dst_meta)
-    _patch_episodes_stats(src_meta, dst_meta, per_episode_actions)
+    _patch_info_json(
+        src_meta,
+        dst_meta,
+        output_state_dim=output_state_dim,
+        swap_image_columns=swap_image_columns,
+    )
+    _patch_episodes_stats(
+        src_meta,
+        dst_meta,
+        per_episode_state,
+        per_episode_actions,
+        swap_image_columns=swap_image_columns,
+    )
     _copy_other_meta(src_meta, dst_meta)
     _patch_norm_stats(
         src,
         dst,
         list(per_episode_state.values()),
         list(per_episode_actions.values()),
+        swap_image_columns=swap_image_columns,
     )
 
 
@@ -445,6 +588,8 @@ def backfill(
     rot_scale: float = DEFAULT_ROT_SCALE,
     gripper_scale: float = DEFAULT_GRIPPER_SCALE,
     clip: bool = True,
+    output_state_dim: int = STATE_DIM_REALWORLD,
+    swap_image_columns: bool = True,
     overwrite: bool = False,
 ) -> None:
     src_meta = src / "meta"
@@ -481,6 +626,8 @@ def backfill(
             rot_scale=rot_scale,
             gripper_scale=gripper_scale,
             clip=clip,
+            output_state_dim=output_state_dim,
+            swap_image_columns=swap_image_columns,
         )
         ep_idx = int(src_pq.stem.split("_")[-1])
         per_episode_state[ep_idx] = state_np
@@ -489,13 +636,20 @@ def backfill(
         clipped_values += metrics["arm_clip_fraction"] * state_np.shape[0] * 6
         total_arm_values += state_np.shape[0] * 6
 
-    rewrite_meta(src, dst, per_episode_state, per_episode_actions)
+    rewrite_meta(
+        src,
+        dst,
+        per_episode_state,
+        per_episode_actions,
+        output_state_dim=output_state_dim,
+        swap_image_columns=swap_image_columns,
+    )
 
     total_frames = sum(arr.shape[0] for arr in per_episode_actions.values())
     clip_fraction = clipped_values / total_arm_values if total_arm_values else 0.0
     print(
         f"OK  episodes={len(per_episode_actions)}  frames={total_frames}  "
-        f"state dim={STATE_DIM}  actions dim={ACTION_DIM_OUT}"
+        f"state dim={output_state_dim}  actions dim={ACTION_DIM_OUT}"
     )
     print(
         "    action scale: "
@@ -503,6 +657,11 @@ def backfill(
         f"clip={clip} max_abs_arm_action_preclip={max_abs_arm_action:.4f} "
         f"arm_clip_fraction={clip_fraction:.6f}"
     )
+    if swap_image_columns:
+        print(
+            "    image columns: "
+            "image=source extra_view_image, extra_view_image=source image"
+        )
     print(f"    src -> dst: {src}  ->  {dst}")
 
 
@@ -510,7 +669,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Backfill a single-arm realworld RLT joint-action LeRobot dataset "
-            "into a 34D-state/7D-EE-action dataset for PegInsertionEnv-v1."
+            "into an RLinf realworld EE-action dataset for PegInsertionEnv-v1."
         )
     )
     parser.add_argument(
@@ -523,7 +682,25 @@ def main() -> int:
         "--dst",
         type=Path,
         required=True,
-        help="Output LeRobot root for the 34D-state/7D-EE-action dataset.",
+        help="Output LeRobot root for the converted EE-action dataset.",
+    )
+    parser.add_argument(
+        "--state-format",
+        choices=("realworld19", "legacy34"),
+        default="realworld19",
+        help=(
+            "Output state layout. realworld19 matches RLinf realworld_dataconfig; "
+            "legacy34 keeps the old RLT joint-observation layout."
+        ),
+    )
+    parser.add_argument(
+        "--no-swap-image-columns",
+        action="store_true",
+        help=(
+            "Do not swap image and extra_view_image. By default the script fixes "
+            "the current realworld RLT dataset naming bug where extra_view_image "
+            "is the base view and image is the wrist view."
+        ),
     )
     parser.add_argument(
         "--pos-scale",
@@ -563,6 +740,10 @@ def main() -> int:
             rot_scale=args.rot_scale,
             gripper_scale=args.gripper_scale,
             clip=not args.no_clip,
+            output_state_dim=STATE_DIM_REALWORLD
+            if args.state_format == "realworld19"
+            else STATE_DIM_LEGACY,
+            swap_image_columns=not args.no_swap_image_columns,
             overwrite=args.overwrite,
         )
     except (FileNotFoundError, FileExistsError, ValueError) as exc:

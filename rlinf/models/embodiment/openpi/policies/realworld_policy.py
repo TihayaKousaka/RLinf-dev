@@ -70,7 +70,10 @@ class RealworldInputs(transforms.DataTransformFn):
         state = transforms.pad_to_dim(data["observation/state"], self.action_dim)
         base_image = _parse_image(data["observation/image"])
         extra_view_image = _parse_image(
-            data.get("observation/extra_view_image", np.zeros_like(base_image))
+            data.get(
+                "observation/extra_view_image",
+                data.get("observation/wrist_image", np.zeros_like(base_image)),
+            )
         )
 
         if self.model_type in (_model.ModelType.PI0, _model.ModelType.PI05):

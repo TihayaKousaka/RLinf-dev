@@ -44,6 +44,14 @@ _PLACEHOLDER_VALUES = {
     "FULL_TASK_RESET_JOINT_QPOS",
 }
 _PLACEHOLDER_TOKENS = sorted(_PLACEHOLDER_VALUES - {""})
+_DEFAULT_ROBOT_IP = "172.16.0.2"
+_DEFAULT_GRIPPER_CONNECTION = "/dev/ttyUSB0"
+_DEFAULT_MAIN_CAMERA_SERIAL = "141722070657"
+_DEFAULT_MAIN_CAMERA_TYPE = "realsense"
+_DEFAULT_WRIST_CAMERA_SERIAL = (
+    "usb-XVisio_Technology_XVisio_vSLAM_250801DR48FB26001216-video-index0"
+)
+_DEFAULT_WRIST_CAMERA_TYPE = "lumos"
 
 
 @dataclass
@@ -103,14 +111,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--robot-ip",
         default=os.environ.get("RLT_REALWORLD_ROBOT_IP")
-        or os.environ.get("FRANKA_ROBOT_IP"),
-        help="Franka IP. Defaults to RLT_REALWORLD_ROBOT_IP or FRANKA_ROBOT_IP.",
+        or os.environ.get("FRANKA_ROBOT_IP")
+        or _DEFAULT_ROBOT_IP,
+        help="Franka IP.",
     )
     parser.add_argument(
         "--end-effector-type",
-        default="franka_gripper",
+        default="robotiq_gripper",
         choices=["franka_gripper", "robotiq_gripper", "ruiyan_hand"],
         help="Mounted Franka end-effector type.",
+    )
+    parser.add_argument(
+        "--gripper-connection",
+        default=os.environ.get("RLT_REALWORLD_GRIPPER_CONNECTION")
+        or _DEFAULT_GRIPPER_CONNECTION,
+        help="Serial port for Robotiq gripper.",
     )
     parser.add_argument(
         "--hand-port",
@@ -138,22 +153,26 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--main-camera-serial",
-        default=os.environ.get("RLT_REALWORLD_MAIN_CAMERA_SERIAL"),
+        default=os.environ.get("RLT_REALWORLD_MAIN_CAMERA_SERIAL")
+        or _DEFAULT_MAIN_CAMERA_SERIAL,
         help="Override main camera serial/device id.",
     )
     parser.add_argument(
         "--main-camera-type",
-        default=os.environ.get("RLT_REALWORLD_MAIN_CAMERA_TYPE"),
+        default=os.environ.get("RLT_REALWORLD_MAIN_CAMERA_TYPE")
+        or _DEFAULT_MAIN_CAMERA_TYPE,
         help="Override main camera type.",
     )
     parser.add_argument(
         "--wrist-camera-serial",
-        default=os.environ.get("RLT_REALWORLD_WRIST_CAMERA_SERIAL"),
+        default=os.environ.get("RLT_REALWORLD_WRIST_CAMERA_SERIAL")
+        or _DEFAULT_WRIST_CAMERA_SERIAL,
         help="Override wrist camera serial/device id.",
     )
     parser.add_argument(
         "--wrist-camera-type",
-        default=os.environ.get("RLT_REALWORLD_WRIST_CAMERA_TYPE"),
+        default=os.environ.get("RLT_REALWORLD_WRIST_CAMERA_TYPE")
+        or _DEFAULT_WRIST_CAMERA_TYPE,
         help="Override wrist camera type.",
     )
     parser.add_argument(
@@ -329,6 +348,13 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
+def _flag_enabled(value: Any) -> bool:
+    value = _resolve_value(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
 def _text_placeholder_details(path: Path) -> list[str]:
     if not path.exists():
         return [f"{path}: file not found"]
@@ -359,6 +385,16 @@ def _camera_specs(args: argparse.Namespace, main_config: LoadedConfig) -> list[C
         CameraSpec("main_camera", main_serial, str(main_type or "realsense")),
         CameraSpec("wrist_camera", wrist_serial, str(wrist_type or "lumos")),
     ]
+
+
+def _hardware_gripper_connection(
+    args: argparse.Namespace,
+    main_config: LoadedConfig,
+) -> Any:
+    return args.gripper_connection or _select(
+        main_config,
+        "cluster.node_groups.1.hardware.configs.0.gripper_connection",
+    )
 
 
 def _check_config(
@@ -396,11 +432,25 @@ def _check_config(
     else:
         details.append(f"Franka IP: {_format_value(robot_ip)}")
 
+    gripper_connection = _hardware_gripper_connection(args, main_config)
+    if args.end_effector_type == "robotiq_gripper":
+        if _is_placeholder(gripper_connection):
+            failures.append("Robotiq gripper connection is missing or placeholder")
+        else:
+            details.append(f"Robotiq gripper connection: {gripper_connection}")
+
+    use_gello = _flag_enabled(_select(main_config, "env.train.use_gello", False))
     gello_port = args.gello_port or _select(main_config, "env.train.gello_port")
-    if _is_placeholder(gello_port):
-        failures.append("GELLO port is missing or still a placeholder")
-    else:
+    if use_gello and _is_placeholder(gello_port):
+        failures.append("GELLO is enabled but gello_port is missing or placeholder")
+    elif use_gello and str(gello_port) == str(gripper_connection):
+        failures.append(
+            f"GELLO port {gello_port} conflicts with Robotiq gripper connection"
+        )
+    elif use_gello:
         details.append(f"GELLO port: {_format_value(gello_port)}")
+    else:
+        details.append("GELLO intervention: disabled")
 
     for spec in _camera_specs(args, main_config):
         if _is_placeholder(spec.serial_number):
@@ -429,6 +479,12 @@ def _check_config(
             f"{keyboard_wrapper!r}, not single_stage"
         )
 
+    task_mode = _select(env_config, "task_mode")
+    if task_mode == "full_task":
+        details.append("Keyboard critical-phase key is required for full_task mode")
+    elif keyboard_wrapper is None:
+        details.append("Keyboard input: not required by current env config")
+
     if failures:
         return _result("config", "FAIL", "configuration has blocking issues", failures)
     if warnings:
@@ -446,11 +502,20 @@ def _check_franka(args: argparse.Namespace, main_config: LoadedConfig) -> CheckR
     )
     if _is_placeholder(robot_ip):
         return _result("franka", "FAIL", "Franka IP is missing or placeholder")
+    gripper_connection = _hardware_gripper_connection(args, main_config)
     if args.end_effector_type == "ruiyan_hand" and args.hand_port is None:
         return _result(
             "franka",
             "FAIL",
             "--hand-port is required for --end-effector-type=ruiyan_hand",
+        )
+    if args.end_effector_type == "robotiq_gripper" and _is_placeholder(
+        gripper_connection
+    ):
+        return _result(
+            "franka",
+            "FAIL",
+            "--gripper-connection is required for --end-effector-type=robotiq_gripper",
         )
 
     try:
@@ -479,6 +544,9 @@ def _check_franka(args: argparse.Namespace, main_config: LoadedConfig) -> CheckR
             robot_ip=str(robot_ip),
             end_effector_type=args.end_effector_type,
             end_effector_config=end_effector_config,
+            gripper_connection=str(gripper_connection)
+            if gripper_connection is not None
+            else None,
         )
         start = time.time()
         robot_up = False
@@ -671,10 +739,21 @@ def _check_gello(args: argparse.Namespace, main_config: LoadedConfig) -> CheckRe
     if args.skip_gello:
         return _result("gello", "SKIP", "skipped by --skip-gello")
 
+    use_gello = _flag_enabled(_select(main_config, "env.train.use_gello", False))
+    if not use_gello:
+        return _result("gello", "SKIP", "env.train.use_gello is false")
+
     port = args.gello_port or _select(main_config, "env.train.gello_port")
     if _is_placeholder(port):
         return _result("gello", "FAIL", "GELLO port is missing or placeholder")
     port = str(port)
+    gripper_connection = _hardware_gripper_connection(args, main_config)
+    if gripper_connection is not None and port == str(gripper_connection):
+        return _result(
+            "gello",
+            "FAIL",
+            f"GELLO port conflicts with Robotiq gripper connection: {port}",
+        )
     if not os.path.exists(port):
         return _result("gello", "FAIL", f"GELLO port does not exist: {port}")
 
@@ -741,9 +820,23 @@ def _keyboard_device_supports(device: Any, ecodes: Any, key_names: tuple[str, ..
     return all(getattr(ecodes, key_name) in supported_key_codes for key_name in key_names)
 
 
-def _check_keyboard(args: argparse.Namespace) -> CheckResult:
+def _keyboard_required(main_config: LoadedConfig, env_config: LoadedConfig) -> bool:
+    return bool(
+        _select(main_config, "env.train.keyboard_reward_wrapper") is not None
+        or _select(env_config, "keyboard_reward_wrapper") is not None
+        or _select(env_config, "task_mode") == "full_task"
+    )
+
+
+def _check_keyboard(
+    args: argparse.Namespace,
+    main_config: LoadedConfig,
+    env_config: LoadedConfig,
+) -> CheckResult:
     if args.skip_keyboard:
         return _result("keyboard", "SKIP", "skipped by --skip-keyboard")
+    if not _keyboard_required(main_config, env_config):
+        return _result("keyboard", "SKIP", "keyboard is not required by env config")
 
     try:
         from evdev import InputDevice, ecodes, list_devices
@@ -826,7 +919,7 @@ def main() -> int:
         _check_franka(args, main_config),
         *_check_cameras(args, main_config),
         _check_gello(args, main_config),
-        _check_keyboard(args),
+        _check_keyboard(args, main_config, env_config),
     ]
     _print_results(results)
 

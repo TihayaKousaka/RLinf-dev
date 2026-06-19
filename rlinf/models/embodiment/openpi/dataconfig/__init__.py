@@ -204,16 +204,13 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True, action_horizon=10, discrete_state_input=True
         ),
-        data=LeRobotRLTJointDataConfig(
+        data=LeRobotRealworldDataConfig(
             repo_id="rlt_realworld_ee",
             base_config=DataConfig(prompt_from_task=False),
             assets=AssetsConfig(
                 assets_dir="checkpoints/torch/pi05_rlt_realworld_ee/assets"
             ),
-            image_key="extra_view_image",
-            wrist_image_key="image",
             extra_delta_transform=False,
-            output_action_dim=7,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "checkpoints/jax/pi05_base"

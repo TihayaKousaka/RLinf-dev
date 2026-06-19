@@ -32,7 +32,7 @@ data:
   train_data_paths:
     # Build this dataset from joint demos with
     # toolkits/realworld_rlt/backfill_ee_delta_actions.py.
-    - dataset_path: "${oc.env:RLT_REALWORLD_EE_DATA_PATH,/path/to/rlt_realworld_ee}"
+    - dataset_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/data/realworld_ee_lerobot"
       weight: 1.0
 
 algorithm:
@@ -41,17 +41,17 @@ algorithm:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 256
-  global_batch_size: 1024
+  micro_batch_size: 32
+  global_batch_size: 256
   seed: 0
   openpi_data:
-    repo_id: "${oc.env:RLT_REALWORLD_EE_REPO_ID,rlt_realworld_ee}"
-    norm_stats_path: "${oc.env:RLT_REALWORLD_EE_NORM_STATS_PATH,/path/to/rlt_realworld_ee/norm_stats.json}"
+    repo_id: "data/realworld_ee_lerobot"
+    norm_stats_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/data/realworld_ee_lerobot/norm_stats.json"
     default_prompt: "insert the peg in the hole"
 
   model:
     precision: null
-    model_path: "${oc.env:PI05_BASE_PATH,/path/to/pi05_base}"
+    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/pi05_base"
     num_action_chunks: 10
     action_dim: 7
     add_value_head: False

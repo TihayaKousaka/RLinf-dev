@@ -19,10 +19,17 @@ import pytest
 
 np = pytest.importorskip("numpy")
 OmegaConf = pytest.importorskip("omegaconf").OmegaConf
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 pytest.importorskip("openpi")
 
 from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+from rlinf.models.embodiment.openpi.dataconfig.realworld_dataconfig import (
+    LeRobotRealworldDataConfig,
+)
+from rlinf.models.embodiment.openpi.policies.realworld_policy import (
+    RealworldInputs,
+    RealworldOutputs,
+)
 from rlinf.models.embodiment.openpi.policies.rlt_joint_policy import (
     RLTJointInputs,
     RLTJointOutputs,
@@ -31,6 +38,7 @@ from rlinf.models.embodiment.rlt_stage2.proprio import (
     resolve_proprio_dim,
 )
 from toolkits.realworld_rlt.backfill_ee_delta_actions import (
+    build_realworld_19d_state,
     build_ee_delta_actions,
 )
 
@@ -63,6 +71,12 @@ def _normalize_config(config):
 
 def _uint8_image(shape):
     return (np.arange(np.prod(shape)).reshape(shape) % 256).astype(np.uint8)
+
+
+def _as_numpy(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
 
 
 def _canonicalize_raw_sample(cfg, raw_sample):
@@ -139,6 +153,84 @@ def _assert_rlt_policy_transform_contract(
     np.testing.assert_array_equal(
         transformed["image"]["left_wrist_0_rgb"],
         expected_wrist,
+    )
+
+    assert transformed["image"]["right_wrist_0_rgb"].shape == expected_base_image_shape
+    np.testing.assert_array_equal(
+        transformed["image"]["right_wrist_0_rgb"],
+        np.zeros(expected_base_image_shape, dtype=np.uint8),
+    )
+    assert transformed["image_mask"] == {
+        "base_0_rgb": np.True_,
+        "left_wrist_0_rgb": np.True_,
+        "right_wrist_0_rgb": np.False_,
+    }
+    assert transformed["prompt"] == raw_sample["prompt"]
+
+
+def _assert_realworld_policy_transform_contract(
+    cfg,
+    raw_sample,
+    *,
+    expected_base_image_shape,
+    expected_extra_view_image_shape,
+):
+    inputs_transform = RealworldInputs(
+        action_dim=cfg.model.action_dim,
+        model_type=cfg.model.model_type,
+    )
+    outputs_transform = RealworldOutputs()
+
+    canonical = {
+        "observation/image": raw_sample["image"],
+        "observation/extra_view_image": raw_sample["extra_view_image"],
+        "observation/state": raw_sample["state"],
+        "actions": raw_sample["actions"],
+        "prompt": raw_sample["prompt"],
+    }
+    transformed = inputs_transform(canonical)
+    actions = outputs_transform({"actions": transformed["actions"]})
+
+    assert transformed["state"].shape == (cfg.model.action_dim,)
+    state = _as_numpy(transformed["state"])
+    np.testing.assert_array_equal(state[:19], raw_sample["state"])
+    np.testing.assert_array_equal(state[19:], np.zeros(cfg.model.action_dim - 19))
+    assert transformed["actions"].shape == (
+        cfg.model.action_horizon,
+        cfg.model.action_dim,
+    )
+    padded_actions = _as_numpy(transformed["actions"])
+    np.testing.assert_array_equal(
+        padded_actions[:, :7],
+        raw_sample["actions"],
+    )
+    np.testing.assert_array_equal(
+        padded_actions[:, 7:],
+        np.zeros((cfg.model.action_horizon, cfg.model.action_dim - 7)),
+    )
+    assert actions["actions"].shape == (cfg.model.action_horizon, 7)
+    np.testing.assert_array_equal(actions["actions"], raw_sample["actions"])
+
+    assert transformed["image"]["base_0_rgb"].shape == expected_base_image_shape
+    assert transformed["image"]["base_0_rgb"].dtype == np.uint8
+    np.testing.assert_array_equal(
+        transformed["image"]["base_0_rgb"],
+        raw_sample["image"],
+    )
+
+    assert (
+        transformed["image"]["left_wrist_0_rgb"].shape
+        == expected_extra_view_image_shape
+    )
+    assert transformed["image"]["left_wrist_0_rgb"].dtype == np.uint8
+    expected_extra_view = raw_sample["extra_view_image"]
+    if np.issubdtype(expected_extra_view.dtype, np.floating):
+        expected_extra_view = (255 * expected_extra_view).astype(np.uint8)
+    if expected_extra_view.ndim == 3 and expected_extra_view.shape[0] == 3:
+        expected_extra_view = np.transpose(expected_extra_view, (1, 2, 0))
+    np.testing.assert_array_equal(
+        transformed["image"]["left_wrist_0_rgb"],
+        expected_extra_view,
     )
 
     assert transformed["image"]["right_wrist_0_rgb"].shape == expected_base_image_shape
@@ -232,30 +324,26 @@ def test_rlt_maniskill_stage2_yaml_dimension_contract():
 def test_rlt_realworld_ee_dataconfig_contract():
     cfg = get_openpi_config("pi05_rlt_realworld_ee")
 
-    _assert_rlt_train_config_contract(
-        cfg,
-        repo_id="rlt_realworld_ee",
-        image_key="extra_view_image",
-        wrist_image_key="image",
-    )
-    assert cfg.data.output_action_dim == 7
+    assert isinstance(cfg.data, LeRobotRealworldDataConfig)
+    assert cfg.model.action_horizon == 10
+    assert cfg.model.discrete_state_input is True
+    assert cfg.data.repo_id == "rlt_realworld_ee"
+    assert cfg.data.extra_delta_transform is False
 
     raw_sample = {
-        "extra_view_image": _uint8_image((128, 128, 3)),
-        "image": np.linspace(0.0, 1.0, 3 * 96 * 96, dtype=np.float32).reshape(
+        "image": _uint8_image((128, 128, 3)),
+        "extra_view_image": np.linspace(0.0, 1.0, 3 * 96 * 96, dtype=np.float32).reshape(
             3, 96, 96
         ),
-        "state": np.linspace(-2.0, 2.0, 34, dtype=np.float32),
+        "state": np.linspace(-2.0, 2.0, 19, dtype=np.float32),
         "actions": np.arange(10 * 7, dtype=np.float32).reshape(10, 7),
         "prompt": "insert the peg in the hole",
     }
-    _assert_rlt_policy_transform_contract(
+    _assert_realworld_policy_transform_contract(
         cfg,
         raw_sample,
-        expected_state_dim=34,
-        expected_action_dim=7,
         expected_base_image_shape=(128, 128, 3),
-        expected_wrist_image_shape=(96, 96, 3),
+        expected_extra_view_image_shape=(96, 96, 3),
     )
 
 
@@ -268,8 +356,8 @@ def test_rlt_realworld_ee_stage2_yaml_dimension_contract():
         action_dim=7,
         action_horizon=10,
         num_images=2,
-        proprio_dim=8,
-        proprio_mode="joint_pos_gripper",
+        proprio_dim=19,
+        proprio_mode="realworld_ee",
     )
     assert cfg.env.train.gello_action_mode == "ee_delta"
     assert cfg.env.eval.gello_action_mode == "ee_delta"
@@ -284,8 +372,9 @@ def test_rlt_realworld_ee_sft_yaml_dimension_contract():
     assert cfg.actor.model.openpi.config_name == "pi05_rlt_realworld_ee"
     assert cfg.actor.model.openpi.num_images_in_input == 2
     assert cfg.actor.model.openpi.action_env_dim == cfg.actor.model.action_dim
-    assert cfg.actor.openpi_data.repo_id == (
-        "${oc.env:RLT_REALWORLD_EE_REPO_ID,rlt_realworld_ee}"
+    assert cfg.actor.openpi_data.repo_id.endswith("/id_4_ee_action_state19")
+    assert cfg.actor.openpi_data.norm_stats_path.endswith(
+        "/id_4_ee_action_state19/norm_stats.json"
     )
 
 
@@ -308,8 +397,9 @@ def test_rlt_realworld_ee_stage1_yaml_dimension_contract():
     assert cfg.actor.model.action_dim == 7
     assert cfg.actor.model.rlt_stage1.config_name == "pi05_rlt_realworld_ee"
     assert cfg.actor.model.rlt_stage1.num_images_in_input == 2
-    assert cfg.actor.openpi_data.repo_id == (
-        "${oc.env:RLT_REALWORLD_EE_REPO_ID,rlt_realworld_ee}"
+    assert cfg.actor.openpi_data.repo_id.endswith("/id_4_ee_action_state19")
+    assert cfg.actor.openpi_data.norm_stats_path.endswith(
+        "/id_4_ee_action_state19/norm_stats.json"
     )
 
 
@@ -317,24 +407,17 @@ def test_rlt_realworld_ee_env_yaml_observation_contract():
     cfg = _load_yaml_config(REALWORLD_EE_ENV_CONFIG)
     raw_cfg = OmegaConf.to_container(cfg, resolve=False)
 
-    assert cfg.use_rlt_joint_obs is True
-    assert raw_cfg["main_image_key"] == (
-        "${oc.env:RLT_REALWORLD_MAIN_IMAGE_KEY,main_camera}"
-    )
-    assert raw_cfg["wrist_image_key"] == (
-        "${oc.env:RLT_REALWORLD_WRIST_IMAGE_KEY,wrist_camera}"
-    )
+    assert cfg.use_rlt_joint_obs is False
+    assert cfg.use_quat_tcp_pose is False
+    assert raw_cfg["main_image_key"] == "main_camera"
+    assert raw_cfg["wrist_image_key"] == "wrist_camera"
     assert cfg.gello_action_mode == "ee_delta"
-    assert raw_cfg["init_params"]["id"] == (
-        "${oc.env:RLT_REALWORLD_EE_ENV_ID,PegInsertionEnv-v1}"
-    )
+    assert raw_cfg["init_params"]["id"] == "PegInsertionEnv-v1"
     assert "target_ee_pose" in raw_cfg["override_cfg"]
     assert "critical_phase_reset_joint_qpos" not in raw_cfg["override_cfg"]
     assert "full_task_reset_joint_qpos" not in raw_cfg["override_cfg"]
     assert list(cfg.state_key_order) == [
-        "gripper",
-        "joint_pos",
-        "joint_vel",
+        "gripper_position",
         "tcp_force",
         "tcp_pose",
         "tcp_torque",
@@ -375,3 +458,69 @@ def test_realworld_joint_to_ee_action_backfill_contract():
     np.testing.assert_allclose(ee_actions, expected, atol=1e-6)
     assert metrics["max_abs_arm_action"] == pytest.approx(1.0)
     assert metrics["arm_clip_fraction"] == pytest.approx(0.0)
+
+
+def test_realworld_34d_to_19d_state_backfill_contract():
+    state = np.zeros((2, 34), dtype=np.float32)
+    state[:, 0] = [0.25, 0.75]
+    state[:, 1:8] = 100.0
+    state[:, 8:15] = 200.0
+    state[:, 15:18] = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    state[:, 18:21] = [[0.5, -0.1, 0.2], [0.6, -0.2, 0.3]]
+    state[:, 21:25] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    state[:, 25:28] = [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]
+    state[:, 28:34] = [
+        [13.0, 14.0, 15.0, 16.0, 17.0, 18.0],
+        [19.0, 20.0, 21.0, 22.0, 23.0, 24.0],
+    ]
+
+    state_19 = build_realworld_19d_state(state)
+
+    expected = np.array(
+        [
+            [
+                0.25,
+                1.0,
+                2.0,
+                3.0,
+                0.5,
+                -0.1,
+                0.2,
+                0.0,
+                0.0,
+                0.0,
+                7.0,
+                8.0,
+                9.0,
+                13.0,
+                14.0,
+                15.0,
+                16.0,
+                17.0,
+                18.0,
+            ],
+            [
+                0.75,
+                4.0,
+                5.0,
+                6.0,
+                0.6,
+                -0.2,
+                0.3,
+                0.0,
+                0.0,
+                0.0,
+                10.0,
+                11.0,
+                12.0,
+                19.0,
+                20.0,
+                21.0,
+                22.0,
+                23.0,
+                24.0,
+            ],
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(state_19, expected, atol=1e-6)

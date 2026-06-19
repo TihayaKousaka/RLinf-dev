@@ -115,6 +115,8 @@ class Stage2VLAWrapper:
             to_process_obs["observation/wrist_image"] = obs["wrist_images"]
         if obs.get("extra_view_images") is not None:
             to_process_obs["observation/extra_view_image"] = obs["extra_view_images"]
+        elif obs.get("wrist_images") is not None:
+            to_process_obs["observation/extra_view_image"] = obs["wrist_images"]
         return to_process_obs
 
     def extract_proprio(
