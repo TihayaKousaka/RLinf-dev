@@ -36,6 +36,16 @@ _FRANKA_JOINT_LIMIT_HIGH = np.array(
     [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
     dtype=np.float64,
 )
+_DEFAULT_JOINT_COMMAND_TOPIC = "/joint_position_controller/command"
+_DEFAULT_JOINT_COMMAND_JOINT_NAMES = [
+    "panda_joint1",
+    "panda_joint2",
+    "panda_joint3",
+    "panda_joint4",
+    "panda_joint5",
+    "panda_joint6",
+    "panda_joint7",
+]
 
 @dataclass
 class FrankaJointPegInsertionConfig(PegInsertionConfig):
@@ -58,6 +68,10 @@ class FrankaJointPegInsertionConfig(PegInsertionConfig):
     full_task_reset_joint_qpos: list[float] | None = None
     max_joint_delta: float | list[float] = 0.08
     enable_gripper_penalty: bool = False
+    joint_command_topic: str | None = _DEFAULT_JOINT_COMMAND_TOPIC
+    joint_command_joint_names: list[str] | None = field(
+        default_factory=lambda: list(_DEFAULT_JOINT_COMMAND_JOINT_NAMES)
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -245,7 +259,13 @@ class FrankaJointPegInsertionEnv(PegInsertionEnv):
         return observation, reward, terminated, truncated, info
 
     def _move_joint_action(self, q_target: np.ndarray):
-        self._controller.reset_joint(q_target.astype(float).tolist()).wait()
+        self._controller.start_joint(q_target.astype(float).tolist()).wait()
+        self._controller.move_joints(q_target.astype(float)).wait()
+
+    def go_to_rest(self, joint_reset=False):
+        if not self.config.is_dummy:
+            self._controller.stop_joint().wait()
+        super().go_to_rest(joint_reset)
 
     def _clip_joint_target(
         self,

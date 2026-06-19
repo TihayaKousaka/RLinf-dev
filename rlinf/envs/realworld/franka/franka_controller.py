@@ -270,6 +270,7 @@ class FrankaController(Worker):
 
     def reset_joint(self, reset_pos: list[float]):
         """Reset the joint positions of the robot arm."""
+        self.stop_joint()
         self.stop_impedance()
         self.clear_errors()
         self._wait_robot()
@@ -305,6 +306,48 @@ class FrankaController(Worker):
         self._wait_robot()
         self.clear_errors()
         self.start_impedance()
+
+    def start_joint(self, initial_pos: list[float] | np.ndarray | None = None):
+        """Start the joint-position controller for streaming joint targets."""
+        if self._joint is not None and self._joint.poll() is None:
+            return
+        self.stop_impedance()
+        self.clear_errors()
+        self._wait_robot()
+        if initial_pos is None:
+            initial_pos = self._state.arm_joint_position
+        initial_pos = np.asarray(initial_pos, dtype=np.float64).reshape(-1)
+        assert len(initial_pos) == 7, (
+            "Invalid initial joint target, expected 7 dimensions but got "
+            f"{len(initial_pos)}"
+        )
+        load_gripper = (
+            "true"
+            if self._end_effector_type == EndEffectorType.FRANKA_GRIPPER
+            else "false"
+        )
+        self._rospy.set_param("/target_joint_positions", initial_pos.tolist())
+        self._joint = psutil.Popen(
+            [
+                "roslaunch",
+                self._ros_pkg,
+                "joint.launch",
+                "robot_ip:=" + self._robot_ip,
+                f"load_gripper:={load_gripper}",
+            ],
+            stdout=sys.stdout,
+            stderr=sys.stdout,
+        )
+        self._wait_robot()
+        self.clear_errors()
+
+    def stop_joint(self):
+        """Stop the persistent joint-position controller if it is running."""
+        if self._joint:
+            self._joint.terminate()
+            self._joint = None
+            self._wait_robot()
+            self.clear_errors()
 
     def move_arm(self, position: np.ndarray):
         """Move the robot arm to the desired position."""

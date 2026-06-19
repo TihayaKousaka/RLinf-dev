@@ -32,6 +32,16 @@ _bootstrap_repo_paths()
 
 STATE_DIM = 34
 ACTION_DIM = 8
+DEFAULT_JOINT_COMMAND_TOPIC = "/joint_position_controller/command"
+DEFAULT_JOINT_NAMES = [
+    "panda_joint1",
+    "panda_joint2",
+    "panda_joint3",
+    "panda_joint4",
+    "panda_joint5",
+    "panda_joint6",
+    "panda_joint7",
+]
 
 
 def _quat_xyzw_to_rpy(quat: np.ndarray) -> list[float]:
@@ -166,6 +176,8 @@ def _make_env(args: argparse.Namespace):
         "reward_threshold": args.reward_threshold,
         "max_num_steps": args.max_steps,
         "enable_camera_player": False,
+        "joint_command_topic": args.joint_command_topic,
+        "joint_command_joint_names": args.joint_command_joint_names,
     }
     return FrankaJointPegInsertionEnv(
         override_cfg=override_cfg,
@@ -180,6 +192,22 @@ def _parse_float_list(raw: str, *, length: int, name: str) -> list[float]:
     if len(values) != length:
         raise argparse.ArgumentTypeError(f"{name} must have {length} comma-separated floats")
     return values
+
+
+def _parse_str_list(raw: str) -> list[str]:
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _patch_video_player_stop(env: Any) -> None:
+    player = getattr(env, "camera_player", None)
+    if player is None or hasattr(player, "stop"):
+        return
+
+    def _stop() -> None:
+        if getattr(player, "is_running", False):
+            player.queue.put(None)
+
+    player.stop = _stop
 
 
 def _parse_args() -> argparse.Namespace:
@@ -203,6 +231,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--main-camera-type", default=os.environ.get("RLT_REALWORLD_MAIN_CAMERA_TYPE", "realsense"))
     parser.add_argument("--wrist-camera-serial", default=os.environ.get("RLT_REALWORLD_WRIST_CAMERA_SERIAL"))
     parser.add_argument("--wrist-camera-type", default=os.environ.get("RLT_REALWORLD_WRIST_CAMERA_TYPE", "lumos"))
+    parser.add_argument(
+        "--joint-command-topic",
+        default=os.environ.get(
+            "RLT_REALWORLD_JOINT_COMMAND_TOPIC",
+            DEFAULT_JOINT_COMMAND_TOPIC,
+        ),
+    )
+    parser.add_argument(
+        "--joint-command-joint-names",
+        type=_parse_str_list,
+        default=DEFAULT_JOINT_NAMES,
+        help="Comma-separated joint names for sensor_msgs/JointState commands.",
+    )
     parser.add_argument(
         "--joint-reset-qpos",
         type=lambda raw: _parse_float_list(raw, length=7, name="joint_reset_qpos"),
@@ -262,6 +303,7 @@ def main() -> None:
                 "stride": args.stride,
                 "mode": "state[1:8] -> action[:7], state[0] -> action[7]",
                 "max_joint_delta": args.max_joint_delta,
+                "joint_command_topic": args.joint_command_topic,
                 "joint_reset_qpos": np.round(args.joint_reset_qpos, 6).tolist(),
                 "target_ee_pose": np.round(args.target_ee_pose, 6).tolist(),
             },
@@ -275,6 +317,7 @@ def main() -> None:
         input("Press ENTER to continue, or Ctrl+C to abort...")
 
     env = _make_env(args)
+    _patch_video_player_stop(env)
     try:
         obs, _ = env.reset()
         current_q = _obs_joint_pos(obs)

@@ -745,7 +745,11 @@ class FrankaEnv(gym.Env):
     def close(self):
         """Release all hardware resources including cameras and video player."""
         if hasattr(self, "camera_player"):
-            self.camera_player.stop()
+            stop = getattr(self.camera_player, "stop", None)
+            if stop is not None:
+                stop()
+            elif getattr(self.camera_player, "is_running", False):
+                self.camera_player.queue.put(None)
         if not self.config.is_dummy and hasattr(self, "_cameras"):
             self._close_cameras()
         super().close()
