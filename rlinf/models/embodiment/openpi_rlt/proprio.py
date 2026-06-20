@@ -24,11 +24,16 @@ def resolve_proprio_dim(default_dim: int, **_: object) -> int:
     return int(default_dim)
 
 
-def select_proprio(state: torch.Tensor) -> torch.Tensor:
-    """Use the full environment state as the RLT proprio feature."""
+def select_proprio(state: torch.Tensor, *, proprio_dim: int) -> torch.Tensor:
+    """Select the real environment state slice used as the RLT proprio feature."""
     if state.ndim != 2:
         raise ValueError(
             "OpenPI-RLT observation.state must be a 2D tensor [B, state_dim], "
             f"got shape={tuple(state.shape)}."
         )
-    return state.to(dtype=torch.float32)
+    if state.shape[1] < int(proprio_dim):
+        raise ValueError(
+            "OpenPI-RLT observation.state does not contain enough real state dims: "
+            f"required proprio_dim={int(proprio_dim)}, got state_dim={state.shape[1]}."
+        )
+    return state[:, : int(proprio_dim)].to(dtype=torch.float32)

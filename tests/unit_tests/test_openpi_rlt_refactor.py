@@ -339,20 +339,22 @@ def test_vla_sft_worker_exports_only_rlt_stage1_rl_token_checkpoint(
     )
 
 
-def test_select_proprio_uses_full_state_without_environment_slicing():
+def test_select_proprio_uses_real_state_prefix_from_model_state_tensor():
     state = torch.tensor(
         [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
         dtype=torch.float64,
     )
 
-    proprio = select_proprio(state)
+    proprio = select_proprio(state, proprio_dim=2)
 
     assert proprio.dtype == torch.float32
-    torch.testing.assert_close(proprio, state.to(torch.float32))
+    torch.testing.assert_close(proprio, state[:, :2].to(torch.float32))
     assert resolve_proprio_dim(19, unused="ignored") == 19
 
     with pytest.raises(ValueError, match="2D tensor"):
-        select_proprio(torch.zeros((2, 3, 4)))
+        select_proprio(torch.zeros((2, 3, 4)), proprio_dim=2)
+    with pytest.raises(ValueError, match="enough real state dims"):
+        select_proprio(torch.zeros((2, 1)), proprio_dim=2)
 
 
 def test_stage2_policy_requires_explicit_full_state_proprio_dim():
@@ -411,6 +413,8 @@ def test_stage2_feature_preparation_uses_openpi_rlt_methods_and_full_state():
     policy.action_dim = 2
     policy.action_chunk_dim = 4
 
+    policy.proprio_dim = 5
+
     states = torch.arange(10, dtype=torch.float64).reshape(2, 5)
     env_obs = {
         "states": states,
@@ -432,6 +436,17 @@ def test_stage2_feature_preparation_uses_openpi_rlt_methods_and_full_state():
         torch.arange(8, dtype=torch.float32).reshape(2, 4),
     )
     assert processed["tokenized_prompt"].shape == (2, 4)
+
+    padded_states = torch.cat(
+        [
+            states.to(torch.float32),
+            torch.full((2, 3), 99.0, dtype=torch.float32),
+        ],
+        dim=1,
+    )
+    env_obs["states"] = padded_states
+    x_padded, _, _ = policy._prepare_features(env_obs)
+    torch.testing.assert_close(x_padded[:, 4:], states.to(torch.float32))
 
     env_obs["states"] = torch.zeros((2, 4), dtype=torch.float32)
     with pytest.raises(ValueError, match="proprio dimension mismatch"):

@@ -272,13 +272,17 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self._validate_action_chunk(a_tilde, name="a_tilde")
         a_tilde_flat = a_tilde.reshape(a_tilde.shape[0], -1)
         self._validate_flat_action(a_tilde_flat, name="a_tilde_flat")
-        state = select_proprio(observation.state).to(device=self.device)
-        if state.shape[1] != self.proprio_dim:
+        try:
+            state = select_proprio(
+                observation.state,
+                proprio_dim=self.proprio_dim,
+            ).to(device=self.device)
+        except ValueError as exc:
             raise ValueError(
                 "RLT Stage2 full-state proprio dimension mismatch: "
                 f"config proprio_dim={self.proprio_dim}, "
-                f"observation.state dim={state.shape[1]}."
-            )
+                f"observation.state dim={observation.state.shape[1]}."
+            ) from exc
         x = torch.cat([z_rl.to(torch.float32), state], dim=-1)
         return x, a_tilde_flat, processed_obs
 
