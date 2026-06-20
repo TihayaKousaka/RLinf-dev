@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay realworld RLT EE-action LeRobot demos on the original PegInsertionEnv."""
+"""Replay current realworld RLT 19D-state/7D-EE-action demos on PegInsertionEnv."""
 
 from __future__ import annotations
 
@@ -23,25 +23,18 @@ def _bootstrap_repo_paths() -> Path:
     return rlinf_root
 
 
-_bootstrap_repo_paths()
+REPO_ROOT = _bootstrap_repo_paths()
 
 
-STATE_DIM = 34
+STATE_DIM = 19
 ACTION_DIM = 7
-
-
-def _quat_xyzw_to_rpy(quat: np.ndarray) -> list[float]:
-    x, y, z, w = np.asarray(quat, dtype=np.float64).reshape(4)
-    norm = np.linalg.norm([x, y, z, w])
-    if norm <= 0:
-        raise ValueError(f"Invalid zero quaternion: {quat}")
-    x, y, z, w = x / norm, y / norm, z / norm, w / norm
-
-    roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
-    sinp = 2.0 * (w * y - z * x)
-    pitch = np.arcsin(np.clip(sinp, -1.0, 1.0))
-    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    return [float(roll), float(pitch), float(yaw)]
+DEFAULT_EVAL_CONFIG = (
+    REPO_ROOT / "examples/embodiment/config/rlt_realworld_ee_pi05_sft_eval.yaml"
+)
+DEFAULT_ENV_CONFIG = (
+    REPO_ROOT
+    / "examples/embodiment/config/env/realworld_rlt_ee_peg_insertion.yaml"
+)
 
 
 def _to_numpy(value: Any) -> np.ndarray:
@@ -86,7 +79,13 @@ def _load_episode(dataset_path: Path, episode_index: int) -> list[dict[str, Any]
     return rows
 
 
-def _row_array(row: dict[str, Any], names: tuple[str, ...], *, dim: int) -> np.ndarray:
+def _row_array(
+    row: dict[str, Any],
+    names: tuple[str, ...],
+    *,
+    dim: int | None = None,
+    allowed_dims: tuple[int, ...] | None = None,
+) -> np.ndarray:
     for name in names:
         if name in row:
             value = row[name]
@@ -103,13 +102,19 @@ def _row_array(row: dict[str, Any], names: tuple[str, ...], *, dim: int) -> np.n
             raise KeyError(f"Dataset row has none of {names}. Keys: {list(row)}")
 
     arr = _to_numpy(value).astype(np.float64).reshape(-1)
-    if arr.shape[0] != dim:
+    if dim is not None and arr.shape[0] != dim:
         raise RuntimeError(f"Expected {dim}D for {names}, got {arr.shape}")
+    if allowed_dims is not None and arr.shape[0] not in allowed_dims:
+        raise RuntimeError(f"Expected one of {allowed_dims}D for {names}, got {arr.shape}")
     return arr
 
 
 def _row_state(row: dict[str, Any]) -> np.ndarray:
-    return _row_array(row, ("state", "observation.state"), dim=STATE_DIM)
+    return _row_array(
+        row,
+        ("state", "observation.state"),
+        dim=STATE_DIM,
+    )
 
 
 def _row_action(row: dict[str, Any]) -> np.ndarray:
@@ -175,6 +180,138 @@ def _make_env(args: argparse.Namespace):
     )
 
 
+def _load_yaml(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Reading {path} requires PyYAML. Install it or pass all replay "
+            "calibration values explicitly."
+        ) from exc
+    with path.open() as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Expected mapping YAML at {path}, got {type(data).__name__}")
+    return data
+
+
+def _first_hardware_config(config: dict[str, Any]) -> dict[str, Any]:
+    for node_group in config.get("cluster", {}).get("node_groups", []) or []:
+        hardware = node_group.get("hardware") or {}
+        configs = hardware.get("configs") or []
+        if hardware.get("type") == "Franka" and configs:
+            return configs[0] or {}
+    return {}
+
+
+def _camera_config(
+    hardware_config: dict[str, Any],
+    name: str,
+) -> dict[str, Any]:
+    for camera in hardware_config.get("camera_infos", []) or []:
+        if camera.get("name") == name:
+            return camera
+    return {}
+
+
+def _eval_override_config(eval_config: dict[str, Any], env_config: dict[str, Any]) -> dict[str, Any]:
+    override = dict(env_config.get("override_cfg") or {})
+    override.update(eval_config.get("env", {}).get("eval", {}).get("override_cfg") or {})
+    return override
+
+
+def _configured_max_steps(eval_config: dict[str, Any], env_config: dict[str, Any]) -> int:
+    eval_cfg = _env_eval_config(eval_config)
+    eval_override = eval_cfg.get("override_cfg") or {}
+    env_override = env_config.get("override_cfg") or {}
+    value = (
+        eval_override.get(
+            "max_num_steps",
+            eval_cfg.get(
+                "max_episode_steps",
+                env_override.get(
+                    "max_num_steps",
+                    env_config.get("max_episode_steps", 20),
+                ),
+            ),
+        )
+    )
+    return int(value)
+
+
+def _env_eval_config(eval_config: dict[str, Any]) -> dict[str, Any]:
+    return eval_config.get("env", {}).get("eval", {}) or {}
+
+
+def _apply_config_defaults(args: argparse.Namespace) -> None:
+    eval_config = _load_yaml(args.eval_config)
+    env_config = _load_yaml(args.env_config)
+    hardware_config = _first_hardware_config(eval_config)
+    override_cfg = _eval_override_config(eval_config, env_config)
+    args.robot_ip = args.robot_ip or hardware_config.get("robot_ip")
+    args.node_rank = args.node_rank if args.node_rank is not None else hardware_config.get("node_rank")
+    args.gripper_type = args.gripper_type or hardware_config.get("gripper_type")
+    args.gripper_connection = args.gripper_connection or hardware_config.get("gripper_connection")
+
+    main_camera = _camera_config(hardware_config, args.main_camera_name)
+    wrist_camera = _camera_config(hardware_config, args.wrist_camera_name)
+    args.main_camera_serial = args.main_camera_serial or main_camera.get("serial_number")
+    args.main_camera_type = args.main_camera_type or main_camera.get("camera_type")
+    args.wrist_camera_serial = args.wrist_camera_serial or wrist_camera.get("serial_number")
+    args.wrist_camera_type = args.wrist_camera_type or wrist_camera.get("camera_type")
+
+    args.joint_reset_qpos = args.joint_reset_qpos or override_cfg.get("joint_reset_qpos")
+    args.target_ee_pose = args.target_ee_pose or override_cfg.get("target_ee_pose")
+    args.reward_threshold = args.reward_threshold or override_cfg.get("reward_threshold")
+    args.task_description = args.task_description or override_cfg.get(
+        "task_description",
+        env_config.get("default_prompt"),
+    )
+    if args.max_steps is None:
+        args.max_steps = _configured_max_steps(eval_config, env_config)
+
+    args.node_rank = int(args.node_rank if args.node_rank is not None else 0)
+    args.gripper_type = args.gripper_type or "robotiq"
+    args.gripper_connection = args.gripper_connection or "/dev/ttyUSB0"
+    args.main_camera_type = args.main_camera_type or "realsense"
+    args.wrist_camera_type = args.wrist_camera_type or "lumos"
+    args.reward_threshold = args.reward_threshold or [0.015, 0.015, 0.03, 0.2, 0.2, 0.2]
+    args.task_description = args.task_description or "insert the peg in the hole"
+
+
+def _validate_calibration_args(args: argparse.Namespace) -> None:
+    required = {
+        "--robot-ip": args.robot_ip,
+        "--main-camera-serial": args.main_camera_serial,
+        "--wrist-camera-serial": args.wrist_camera_serial,
+        "--joint-reset-qpos": args.joint_reset_qpos,
+        "--target-ee-pose": args.target_ee_pose,
+    }
+    missing = [name for name, value in required.items() if value is None or value == ""]
+    if missing:
+        raise SystemExit(
+            f"Missing required args/config values: {missing}. "
+            f"Checked eval config {args.eval_config} and env config {args.env_config}."
+        )
+
+    if len(args.joint_reset_qpos) != 7:
+        raise SystemExit(f"--joint-reset-qpos must be 7D, got {args.joint_reset_qpos}")
+    if len(args.target_ee_pose) != 6:
+        raise SystemExit(f"--target-ee-pose must be 6D, got {args.target_ee_pose}")
+    if len(args.reward_threshold) != 6:
+        raise SystemExit(f"--reward-threshold must be 6D, got {args.reward_threshold}")
+    if args.start < 0:
+        raise SystemExit(f"--start must be non-negative, got {args.start}")
+    if args.max_steps <= 0:
+        raise SystemExit(f"--max-steps must be positive, got {args.max_steps}")
+    if args.stride <= 0:
+        raise SystemExit(f"--stride must be positive, got {args.stride}")
+    if args.log_every <= 0:
+        raise SystemExit(f"--log-every must be positive, got {args.log_every}")
+
+
 def _parse_float_list(raw: str, *, length: int, name: str) -> list[float]:
     values = [float(x) for x in raw.split(",") if x.strip()]
     if len(values) != length:
@@ -201,30 +338,61 @@ def _parse_args() -> argparse.Namespace:
         description="Replay backfilled realworld EE actions on PegInsertionEnv."
     )
     parser.add_argument("--dataset-path", required=True)
+    parser.add_argument(
+        "--eval-config",
+        type=Path,
+        default=DEFAULT_EVAL_CONFIG,
+        help="Eval YAML used to fill robot/camera/task calibration defaults.",
+    )
+    parser.add_argument(
+        "--env-config",
+        type=Path,
+        default=DEFAULT_ENV_CONFIG,
+        help="Env YAML used as fallback for task calibration defaults.",
+    )
     parser.add_argument("--episode-index", type=int, default=0)
     parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help=(
+            "Maximum replay steps. Defaults to eval override max_num_steps, "
+            "then env.eval.max_episode_steps, then env YAML max_num_steps."
+        ),
+    )
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--sleep", type=float, default=0.2)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--yes", action="store_true", help="Skip destructive-test confirmation.")
 
-    parser.add_argument("--robot-ip", default="172.16.0.2")
-    parser.add_argument("--node-rank", type=int, default=int(os.environ.get("RLINF_NODE_RANK", "0")))
-    parser.add_argument("--gripper-type", default="robotiq")
-    parser.add_argument("--gripper-connection", default="/dev/ttyUSB0")
-    parser.add_argument("--main-camera-serial", default="141722070657")
-    parser.add_argument("--main-camera-type", default="realsense")
+    parser.add_argument("--robot-ip", default=None)
+    parser.add_argument(
+        "--node-rank",
+        type=int,
+        default=int(os.environ["RLINF_NODE_RANK"])
+        if "RLINF_NODE_RANK" in os.environ
+        else None,
+    )
+    parser.add_argument("--gripper-type", default=None)
+    parser.add_argument("--gripper-connection", default=None)
+    parser.add_argument("--main-camera-name", default="main_camera")
+    parser.add_argument("--wrist-camera-name", default="wrist_camera")
+    parser.add_argument("--main-camera-serial", default=None)
+    parser.add_argument("--main-camera-type", default=None)
     parser.add_argument(
         "--wrist-camera-serial",
-        default="usb-XVisio_Technology_XVisio_vSLAM_250801DR48FB26001216-video-index0",
+        default=None,
     )
-    parser.add_argument("--wrist-camera-type", default="lumos")
+    parser.add_argument("--wrist-camera-type", default=None)
     parser.add_argument(
         "--joint-reset-qpos",
         type=lambda raw: _parse_float_list(raw, length=7, name="joint_reset_qpos"),
         default=None,
-        help="Comma-separated 7D safe reset qpos. Defaults to first row state[1:8].",
+        help=(
+            "Comma-separated 7D safe reset qpos. Defaults to eval/env YAML. "
+            "This is not read from the dataset state."
+        ),
     )
     parser.add_argument(
         "--target-ee-pose",
@@ -235,19 +403,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reward-threshold",
         type=lambda raw: _parse_float_list(raw, length=6, name="reward_threshold"),
-        default=[0.015, 0.015, 0.03, 0.2, 0.2, 0.2],
+        default=None,
     )
-    parser.add_argument("--task-description", default="insert the peg in the hole")
+    parser.add_argument("--task-description", default=None)
     args = parser.parse_args()
-
-    required = {
-        "--robot-ip": args.robot_ip,
-        "--main-camera-serial": args.main_camera_serial,
-        "--wrist-camera-serial": args.wrist_camera_serial,
-    }
-    missing = [name for name, value in required.items() if not value]
-    if missing:
-        raise SystemExit(f"Missing required args/env vars: {missing}")
+    _apply_config_defaults(args)
+    _validate_calibration_args(args)
     return args
 
 
@@ -259,24 +420,21 @@ def main() -> None:
     if not selected_rows:
         raise RuntimeError("No rows selected for replay.")
     first_state = _row_state(selected_rows[0])
-
-    if args.joint_reset_qpos is None:
-        args.joint_reset_qpos = first_state[1:8].astype(float).tolist()
-    if args.target_ee_pose is None:
-        args.target_ee_pose = (
-            first_state[18:21].astype(float).tolist()
-            + _quat_xyzw_to_rpy(first_state[21:25])
-        )
-
+    state_dim = first_state.shape[0]
     first_action = _row_action(selected_rows[0])
     print(
         json.dumps(
             {
                 "dataset_path": str(dataset_path),
+                "eval_config": str(args.eval_config),
+                "env_config": str(args.env_config),
                 "episode_index": args.episode_index,
+                "episode_rows": len(rows),
                 "start": args.start,
+                "requested_max_steps": args.max_steps,
                 "num_selected_rows": len(selected_rows),
                 "stride": args.stride,
+                "state_dim": state_dim,
                 "mode": "actions[0:7] -> PegInsertionEnv EE delta action",
                 "joint_reset_qpos": np.round(args.joint_reset_qpos, 6).tolist(),
                 "target_ee_pose": np.round(args.target_ee_pose, 6).tolist(),

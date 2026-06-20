@@ -21,10 +21,8 @@ from typing import Any, Mapping
 import torch
 
 PROPRIO_MODE_TO_DIM = {
-    "joint_pos_gripper": 8,
-    "joint_pos_vel_gripper": 15,
+    "maniskill_joint": 9,
     "realworld_ee": 19,
-    "full_state": 34,
 }
 
 
@@ -72,9 +70,10 @@ def select_proprio(
 ) -> torch.Tensor:
     """Select proprio state columns for RLT Stage 2.
 
-    Realworld EE RLT uses the full 19D realworld state:
-    [gripper, tcp_force, tcp_pose(xyz+euler), tcp_torque, tcp_vel].
-    ManiSkill configs keep using the legacy ``proprio_dim`` prefix selection.
+    Explicit ``proprio_mode`` values describe complete current environment
+    state schemas. They must match the incoming state dimension exactly, so
+    stale raw layouts such as the old 34D realworld collection state fail fast
+    instead of being silently truncated.
     """
 
     if proprio_mode is not None:
@@ -107,5 +106,12 @@ def select_proprio(
             "RLT Stage 2 observation.state is too small for proprio selection: "
             f"state_dim={state.shape[1]}, required={proprio_dim}, "
             f"proprio_mode={proprio_mode!r}."
+        )
+    if proprio_mode is not None and state.shape[1] != proprio_dim:
+        raise ValueError(
+            "RLT Stage 2 observation.state dimension does not match proprio_mode: "
+            f"state_dim={state.shape[1]}, required={proprio_dim}, "
+            f"proprio_mode={proprio_mode!r}. Use the converted current state "
+            "schema instead of truncating legacy/raw state layouts."
         )
     return state[:, :proprio_dim]

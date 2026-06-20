@@ -36,6 +36,7 @@ from rlinf.models.embodiment.openpi.policies.rlt_joint_policy import (
 )
 from rlinf.models.embodiment.rlt_stage2.proprio import (
     resolve_proprio_dim,
+    select_proprio,
 )
 from toolkits.realworld_rlt.backfill_ee_delta_actions import (
     build_realworld_19d_state,
@@ -318,6 +319,7 @@ def test_rlt_maniskill_stage2_yaml_dimension_contract():
         action_horizon=10,
         num_images=2,
         proprio_dim=9,
+        proprio_mode="maniskill_joint",
     )
 
 
@@ -363,6 +365,13 @@ def test_rlt_realworld_ee_stage2_yaml_dimension_contract():
     assert cfg.env.eval.gello_action_mode == "ee_delta"
     assert cfg.env.train.keyboard_reward_wrapper is None
     assert cfg.env.eval.keyboard_reward_wrapper is None
+
+
+def test_rlt_stage2_explicit_proprio_mode_rejects_legacy_raw_state():
+    state = torch.zeros((2, 34), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="legacy/raw state layouts"):
+        select_proprio(state, proprio_mode="realworld_ee")
 
 
 def test_rlt_realworld_ee_sft_yaml_dimension_contract():
