@@ -35,10 +35,10 @@ from omegaconf import DictConfig
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 
 from .components import DirectGaussianActor, TwinQCritic, compute_td_target
-from .proprio import resolve_proprio_dim
+from .openpi_rlt_action_model import build_openpi_rlt_backbone
+from .proprio import resolve_proprio_dim, select_proprio
 from .rl_token import RLTokenModel
 from .rollout import RLTStage2RolloutRouteConfig, route_rlt_stage2_rollout
-from .vla_wrapper import Stage2VLAWrapper
 
 
 class RLTStage2Policy(torch.nn.Module, BasePolicy):
@@ -58,18 +58,19 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self.chunk_length = int(cfg.num_action_chunks)
         self.action_dim = int(cfg.action_dim)
         self.action_chunk_dim = self.chunk_length * self.action_dim
-        self.proprio_mode = stage2_cfg.get("proprio_mode", None)
-        if self.proprio_mode is not None:
-            self.proprio_mode = str(self.proprio_mode)
         self.replay_subsample_stride = int(
             stage2_cfg.get("replay_subsample_stride", 0)
         )
         self.replay_feature_batch_size = int(
             stage2_cfg.get("replay_feature_batch_size", 0)
         )
+        if "proprio_dim" not in stage2_cfg:
+            raise ValueError(
+                "RLT Stage2 requires rlt_stage2.proprio_dim to match the full "
+                "environment state dimension."
+            )
         self.proprio_dim = resolve_proprio_dim(
-            stage2_cfg,
-            default_dim=self.action_dim,
+            default_dim=int(stage2_cfg.proprio_dim),
         )
         self.act_as_vla_reference = bool(stage2_cfg.get("act_as_vla_reference", False))
         self.load_feature_backbones = bool(
@@ -110,7 +111,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self.vla = None
         self.rl_token_model = None
         if self.load_feature_backbones:
-            self.vla = Stage2VLAWrapper(
+            self.vla = build_openpi_rlt_backbone(
                 model_path=cfg.model_path,
                 config_name=stage2_cfg.config_name,
                 norm_stats_path=stage2_cfg.get("norm_stats_path", None),
@@ -119,6 +120,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 action_dim=self.action_dim,
                 num_steps=int(stage2_cfg.get("num_steps", cfg.get("num_steps", 5))),
                 device=self.device,
+                freeze=True,
             )
 
         if self.load_rl_token_model:
@@ -244,7 +246,9 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
-        raise NotImplementedError(f"Unsupported forward_type for RLT Stage 2: {forward_type}")
+        raise NotImplementedError(
+            f"Unsupported forward_type for RLT Stage 2: {forward_type}"
+        )
 
     def _encode_state_and_reference(
         self,
@@ -258,18 +262,23 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         env_obs: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         self._require_feature_backbones("_prepare_features")
-        observation, processed_obs = self.vla.prepare_obs(env_obs)
-        embeddings, pad_mask = self.vla.extract_embeddings(observation)
+        observation, processed_obs = self.vla.prepare_rlt_observation(env_obs)
+        embeddings, pad_mask = self.vla.extract_rlt_prefix_embeddings(
+            observation,
+            dtype=torch.float32,
+        )
         z_rl = self.rl_token_model.encode(embeddings, pad_mask)
-        a_tilde = self.vla.get_rl_chunk_reference(observation, self.chunk_length)
+        a_tilde = self.vla.predict_rlt_reference_action(observation, self.chunk_length)
         self._validate_action_chunk(a_tilde, name="a_tilde")
         a_tilde_flat = a_tilde.reshape(a_tilde.shape[0], -1)
         self._validate_flat_action(a_tilde_flat, name="a_tilde_flat")
-        state = self.vla.extract_proprio(
-            observation,
-            proprio_dim=self.proprio_dim,
-            proprio_mode=self.proprio_mode,
-        )
+        state = select_proprio(observation.state).to(device=self.device)
+        if state.shape[1] != self.proprio_dim:
+            raise ValueError(
+                "RLT Stage2 full-state proprio dimension mismatch: "
+                f"config proprio_dim={self.proprio_dim}, "
+                f"observation.state dim={state.shape[1]}."
+            )
         x = torch.cat([z_rl.to(torch.float32), state], dim=-1)
         return x, a_tilde_flat, processed_obs
 
@@ -503,8 +512,8 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 "RLT Stage2 VLA reference prediction requires the VLA backbone. "
                 "Do not call this method on actor-only training policies."
             )
-        observation, processed_obs = self.vla.prepare_obs(env_obs)
-        a_tilde = self.vla.get_rl_chunk_reference(observation, self.chunk_length)
+        observation, processed_obs = self.vla.prepare_rlt_observation(env_obs)
+        a_tilde = self.vla.predict_rlt_reference_action(observation, self.chunk_length)
         self._validate_action_chunk(a_tilde, name="expert vla_reference actions")
         action_flat = a_tilde.reshape(a_tilde.shape[0], -1)
         self._validate_flat_action(action_flat, name="expert vla_reference action_flat")
@@ -567,14 +576,19 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 "x": x.detach(),
                 "a_tilde": a_tilde.detach(),
                 "tokenized_prompt": processed_obs["tokenized_prompt"].detach(),
-                "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"].detach(),
+                "tokenized_prompt_mask": processed_obs[
+                    "tokenized_prompt_mask"
+                ].detach(),
             },
         }
         if not enable_rlt_route:
             return actions, result
 
         policy_info = None
-        if isinstance(env_infos, dict) and isinstance(env_infos.get("policy_info"), dict):
+        if isinstance(env_infos, dict) and isinstance(
+            env_infos.get("policy_info"),
+            dict,
+        ):
             policy_info = env_infos["policy_info"]
         ready_for_online = self.global_step >= self.online_gate_updates
         route = route_rlt_stage2_rollout(
@@ -606,7 +620,10 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 tokenized_prompt=processed_obs["tokenized_prompt"],
                 tokenized_prompt_mask=processed_obs["tokenized_prompt_mask"],
             )
-            if encoded_step_trace and encoded_step_trace["x"].shape[1] != self.chunk_length:
+            if (
+                encoded_step_trace
+                and encoded_step_trace["x"].shape[1] != self.chunk_length
+            ):
                 raise ValueError(
                     "RLT step trace length must match chunk_length "
                     f"{self.chunk_length}, got {encoded_step_trace['x'].shape[1]}."

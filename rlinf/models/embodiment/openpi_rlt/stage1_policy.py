@@ -24,7 +24,7 @@ from omegaconf import DictConfig
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 
 from .rl_token import RLTokenModel
-from .vla_wrapper import Stage1VLAWrapper
+from .openpi_rlt_action_model import build_openpi_rlt_backbone
 
 
 class RLTStage1Policy(torch.nn.Module, BasePolicy):
@@ -40,9 +40,8 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
         self._latest_stage1_metrics: dict[str, torch.Tensor] = {}
 
         stage1_cfg = cfg.rlt_stage1
-        self.alpha = float(stage1_cfg.get("vla_finetune_alpha", 0.0))
 
-        self.vla = Stage1VLAWrapper(
+        self.vla = build_openpi_rlt_backbone(
             model_path=cfg.model_path,
             config_name=stage1_cfg.config_name,
             norm_stats_path=stage1_cfg.get("norm_stats_path", None),
@@ -51,17 +50,8 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
             action_dim=int(cfg.action_dim),
             num_steps=int(stage1_cfg.get("num_steps", 5)),
             device=self.device,
+            freeze=True,
         )
-        if self.alpha <= 0:
-            self.vla.model.eval()
-            for param in self.vla.model.parameters():
-                param.requires_grad_(False)
-        else:
-            self.vla.unfreeze()
-            if bool(stage1_cfg.get("gradient_checkpointing", True)) and hasattr(
-                self.vla.model, "gradient_checkpointing_enable"
-            ):
-                self.vla.model.gradient_checkpointing_enable()
 
         self.rl_token_model = RLTokenModel(
             embedding_dim=int(stage1_cfg.get("embedding_dim", 2048)),
@@ -71,43 +61,23 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
             decoder_heads=int(stage1_cfg.get("decoder_heads", 8)),
         ).to(self.device)
 
-    @property
-    def trainable_vla_parameters(self):
-        return self.vla.trainable_parameters()
-
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.SFT:
             return self.sft_forward(**kwargs)
         if forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
-        raise NotImplementedError(f"Unsupported forward_type for RLT Stage 1: {forward_type}")
+        raise NotImplementedError(
+            f"Unsupported forward_type for RLT Stage 1: {forward_type}"
+        )
 
     def sft_forward(self, data: dict[str, Any], **kwargs) -> dict[str, torch.Tensor]:
         observation = data["observation"]
-        actions = data["actions"].to(self.device, dtype=torch.float32)
-
-        if self.alpha > 0:
-            z, pad_mask, l_vla = self.vla.compute_vla_loss_with_embeddings(
-                observation, actions
-            )
-            l_ro, z_rl, z_hat = self.rl_token_model(
-                z.to(self.device), pad_mask.to(self.device)
-            )
-            loss = l_ro + self.alpha * l_vla
-            metrics = {
-                "loss": loss,
-                "l_ro": l_ro.detach(),
-                "l_vla": l_vla.detach(),
-                "z_rl": z_rl.detach(),
-                "z_hat": z_hat.detach(),
-            }
-            self._latest_stage1_metrics = {
-                key: value for key, value in metrics.items() if key != "loss"
-            }
-            return metrics
 
         with torch.no_grad():
-            z, pad_mask = self.vla.extract_embeddings(observation)
+            z, pad_mask = self.vla.extract_rlt_prefix_embeddings(
+                observation,
+                dtype=torch.float32,
+            )
         l_ro, z_rl, z_hat = self.rl_token_model(
             z.to(self.device), pad_mask.to(self.device)
         )

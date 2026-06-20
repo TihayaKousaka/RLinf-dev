@@ -127,12 +127,12 @@ def _register_builtin_models():
         return get_model(cfg, torch_dtype)
 
     def _build_rlt_stage2(cfg: DictConfig, torch_dtype):
-        from rlinf.models.embodiment.rlt_stage2 import get_model
+        from rlinf.models.embodiment.openpi_rlt import get_model
 
         return get_model(cfg, torch_dtype)
 
     def _build_rlt_stage1(cfg: DictConfig, torch_dtype):
-        from rlinf.models.embodiment.rlt_stage1 import get_model
+        from rlinf.models.embodiment.openpi_rlt import get_model
 
         return get_model(cfg, torch_dtype)
 

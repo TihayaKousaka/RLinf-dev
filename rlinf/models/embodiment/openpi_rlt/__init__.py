@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RLT Stage 1 model package."""
+"""OpenPI-RLT model package."""
 
 from __future__ import annotations
 
 from omegaconf import DictConfig
 
-from .rlt_stage1_policy import RLTStage1Policy
-
 
 def get_model(cfg: DictConfig, torch_dtype=None):
     del torch_dtype
-    return RLTStage1Policy(cfg)
+    model_type = str(cfg.get("model_type", ""))
+    if model_type == "rlt_stage1":
+        from .stage1_policy import RLTStage1Policy
+
+        return RLTStage1Policy(cfg)
+    if model_type == "rlt_stage2":
+        from .stage2_policy import RLTStage2Policy
+
+        return RLTStage2Policy(cfg)
+    raise ValueError(
+        f"Unsupported OpenPI-RLT model_type: {model_type!r}. "
+        "Expected 'rlt_stage1' or 'rlt_stage2'."
+    )
+
+
+__all__ = ["get_model"]

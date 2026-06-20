@@ -60,8 +60,6 @@ actor:
       encoder_heads: 8
       decoder_layers: 2
       decoder_heads: 8
-      vla_finetune_alpha: 0.0
-      gradient_checkpointing: True
 
   openpi_data:
     repo_id: "/home/i-tingying/rlt_id3_id4_dataset/collected_data_id3_id4/rank_0/id_4_ee_action_state19"

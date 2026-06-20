@@ -58,8 +58,6 @@ actor:
       encoder_heads: 8
       decoder_layers: 2
       decoder_heads: 8
-      vla_finetune_alpha: 0.0
-      gradient_checkpointing: True
 
   openpi_data:
     repo_id: "/mnt/public2/xiekaizhi/rlt-openpi-sim/rlt_maniskill_joint"

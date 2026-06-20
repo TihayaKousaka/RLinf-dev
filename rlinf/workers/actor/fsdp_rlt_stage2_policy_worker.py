@@ -38,14 +38,14 @@ from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chu
 from rlinf.utils.utils import clear_memory, collect_param_names_need_sync
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
-from ...models.embodiment.rlt_stage2.components import actor_loss, critic_loss
-from ...models.embodiment.rlt_stage2.schedule import (
+from ...models.embodiment.openpi_rlt.components import actor_loss, critic_loss
+from ...models.embodiment.openpi_rlt.schedule import (
     RLTStage2TrainingScheduler,
     RLTTrainingPlan,
     resolve_actor_loss_weights,
     write_status_json,
 )
-from ...models.embodiment.rlt_stage2.trajectory_adapter import (
+from ...models.embodiment.openpi_rlt.trajectory_adapter import (
     RLTStage2TrajectoryReplayAdapter,
 )
 

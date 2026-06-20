@@ -22,5 +22,3 @@ rlt_stage1:
   encoder_heads: 8
   decoder_layers: 2
   decoder_heads: 8
-  vla_finetune_alpha: 0.0
-  gradient_checkpointing: True

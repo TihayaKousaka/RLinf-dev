@@ -531,6 +531,92 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     ).contiguous()
         return processed_obs
 
+    @staticmethod
+    def _has_pre_tokenized_rlt_obs(obs: dict[str, Any]) -> bool:
+        return (
+            "tokenized_prompt" in obs
+            and "tokenized_prompt_mask" in obs
+            and "main_images" in obs
+            and "states" in obs
+        )
+
+    @staticmethod
+    def _openpi_obs_from_pre_tokenized_rlt_obs(obs: dict[str, Any]) -> dict[str, Any]:
+        processed_obs = {
+            "observation/image": obs["main_images"],
+            "observation/state": obs["states"],
+            "tokenized_prompt": obs["tokenized_prompt"],
+            "tokenized_prompt_mask": obs["tokenized_prompt_mask"],
+        }
+        if obs.get("wrist_images") is not None:
+            processed_obs["observation/wrist_image"] = obs["wrist_images"]
+        if obs.get("extra_view_images") is not None:
+            processed_obs["observation/extra_view_image"] = obs["extra_view_images"]
+        elif obs.get("wrist_images") is not None:
+            processed_obs["observation/extra_view_image"] = obs["wrist_images"]
+        return processed_obs
+
+    def prepare_rlt_observation(
+        self,
+        obs: dict[str, Any],
+    ) -> tuple[_model.Observation, dict[str, Any]]:
+        """Prepare unified RLT env observations for OpenPI feature extraction."""
+        if self._has_pre_tokenized_rlt_obs(obs):
+            to_process_obs = self._openpi_obs_from_pre_tokenized_rlt_obs(obs)
+        elif "task_descriptions" in obs and obs["task_descriptions"] is not None:
+            to_process_obs = self.obs_processor(obs)
+        else:
+            raise KeyError(
+                "RLT OpenPI observation must contain task_descriptions or "
+                "pre-tokenized prompt tensors."
+            )
+        processed_obs = self.input_transform(to_process_obs, transpose=False)
+        processed_obs = self.precision_processor(processed_obs)
+        return _model.Observation.from_dict(processed_obs), processed_obs
+
+    def extract_rlt_prefix_embeddings(
+        self,
+        observation: _model.Observation,
+        *,
+        detach: bool = True,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return OpenPI prefix embeddings used by RLT's RL-token model."""
+        images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(
+            observation, train=False
+        )
+        device = next(self.parameters()).device
+        images = [img.to(device) for img in images]
+        img_masks = [mask.to(device) for mask in img_masks]
+        prefix_output, prefix_pad_masks, _ = self._build_prefix_cache(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        if detach:
+            prefix_output = prefix_output.detach()
+            prefix_pad_masks = prefix_pad_masks.detach()
+        if dtype is not None:
+            prefix_output = prefix_output.to(dtype)
+        return prefix_output, prefix_pad_masks
+
+    @torch.no_grad()
+    def predict_rlt_reference_action(
+        self,
+        observation: _model.Observation,
+        chunk_length: int,
+    ) -> torch.Tensor:
+        """Return the OpenPI reference action chunk used by RLT Stage 2."""
+        outputs = self.sample_actions(
+            observation,
+            mode="eval",
+            compute_values=False,
+        )
+        action_dict = self.output_transform(
+            {"actions": outputs["actions"], "state": observation.state}
+        )
+        device = next(self.parameters()).device
+        actions = action_dict["actions"].to(device=device, dtype=torch.float32)
+        return actions[:, :chunk_length]
+
     def predict_action_batch(
         self,
         env_obs,
