@@ -54,7 +54,6 @@ class CriticalPhaseWrapper(gym.Wrapper):
             record_prefix_before_critical_phase
         )
         self.in_critical_phase = self.task_mode == "critical_phase"
-        self.critical_phase_started_once = self.in_critical_phase
         base_env = getattr(env, "unwrapped", env)
         config = getattr(base_env, "config", None)
         self._listener = (
@@ -67,7 +66,6 @@ class CriticalPhaseWrapper(gym.Wrapper):
 
     def reset(self, *, seed=None, options=None):
         self.in_critical_phase = self.task_mode == "critical_phase"
-        self.critical_phase_started_once = self.in_critical_phase
         self._key_was_down = False
         observation, info = self.env.reset(seed=seed, options=options)
         self._inject_policy_info(info)
@@ -83,7 +81,6 @@ class CriticalPhaseWrapper(gym.Wrapper):
 
     def enter_critical_phase(self) -> None:
         self.in_critical_phase = True
-        self.critical_phase_started_once = True
 
     def _poll_critical_phase_key(self) -> None:
         if self._listener is None:
@@ -107,9 +104,6 @@ class CriticalPhaseWrapper(gym.Wrapper):
             policy_info = {}
             info["policy_info"] = policy_info
         policy_info["in_critical_phase"] = bool(self.in_critical_phase)
-        policy_info["critical_phase_started"] = bool(
-            self.critical_phase_started_once
-        )
         policy_info["record_transition"] = bool(record_transition)
         info["in_critical_phase"] = policy_info["in_critical_phase"]
         info["record_transition"] = policy_info["record_transition"]

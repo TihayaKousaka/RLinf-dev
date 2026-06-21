@@ -72,7 +72,7 @@ class LeRobotRealworldDataConfig(DataConfigFactory):
                 _transforms.RepackTransform(
                     {
                         "observation/image": "image",
-                        "observation/extra_view_image": "extra_view_image",
+                        "observation/wrist_image": "extra_view_image",
                         "observation/state": "state",
                         "actions": "actions",
                         "prompt": "prompt",

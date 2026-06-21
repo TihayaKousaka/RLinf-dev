@@ -118,7 +118,6 @@ env:
     auto_reset: True
     ignore_terminations: False
     reward_mode: raw
-    keyboard_reward_wrapper: null
     max_episode_steps: 100
     max_steps_per_rollout_epoch: 100
     # Teleoperation backend for human_override intervention.
@@ -127,7 +126,6 @@ env:
     # Keep disabled until a real GELLO serial port is known. /dev/ttyUSB0 is Robotiq.
     use_gello: False
     gello_port: null
-    gello_action_mode: ee_delta
     video_cfg:
       save_video: True
       fps: 10
@@ -139,7 +137,6 @@ env:
     auto_reset: True
     ignore_terminations: False
     reward_mode: raw
-    keyboard_reward_wrapper: null
     max_episode_steps: 100
     max_steps_per_rollout_epoch: 100
     policy_mode: eval
@@ -148,7 +145,6 @@ env:
     use_spacemouse: False
     use_gello: False
     gello_port: null
-    gello_action_mode: ee_delta
     video_cfg:
       save_video: True
       fps: 10

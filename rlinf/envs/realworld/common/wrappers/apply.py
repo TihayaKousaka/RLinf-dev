@@ -20,6 +20,7 @@ from typing import Any, Mapping, Optional
 
 import gymnasium as gym
 
+from rlinf.envs.realworld.common.wrappers.critical_phase import CriticalPhaseWrapper
 from rlinf.envs.realworld.common.wrappers.dual_euler_obs import (
     DualQuat2EulerWrapper,
 )
@@ -32,7 +33,6 @@ from rlinf.envs.realworld.common.wrappers.dual_relative_frame import (
 from rlinf.envs.realworld.common.wrappers.dual_spacemouse_intervention import (
     DualSpacemouseIntervention,
 )
-from rlinf.envs.realworld.common.wrappers.critical_phase import CriticalPhaseWrapper
 from rlinf.envs.realworld.common.wrappers.euler_obs import Quat2EulerWrapper
 from rlinf.envs.realworld.common.wrappers.gello_intervention import (
     GelloIntervention,
@@ -43,7 +43,6 @@ from rlinf.envs.realworld.common.wrappers.reward_done_wrapper import (
     KeyboardRewardDoneMultiStageWrapper,
     KeyboardRewardDoneWrapper,
 )
-from rlinf.envs.realworld.common.wrappers.rlt_joint_obs import RLTJointObsWrapper
 from rlinf.envs.realworld.common.wrappers.spacemouse_intervention import (
     SpacemouseIntervention,
 )
@@ -75,9 +74,7 @@ def _validate_teleop_mode(use_spacemouse: bool, use_gello: bool) -> None:
 
 
 def _apply_keyboard_reward(env: gym.Env, mode: Optional[str]) -> gym.Env:
-    base_env = getattr(env, "unwrapped", env)
-    config = getattr(base_env, "config", None)
-    if bool(getattr(config, "is_dummy", False)) or not mode:
+    if env.config.is_dummy or not mode:
         return env
     if mode == "multi_stage":
         return KeyboardRewardDoneMultiStageWrapper(env)
@@ -140,27 +137,14 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
                 "use_gello=True requires 'gello_port' in the env config "
                 "(e.g. env.eval.gello_port)."
             )
-        gello_action_mode = str(cfg.get("gello_action_mode", "ee_delta"))
-        if gello_action_mode != "ee_delta":
-            raise ValueError(
-                "Unsupported single-arm GELLO action mode. Realworld Franka "
-                f"supports only 'ee_delta', got {gello_action_mode!r}."
-            )
-        env = GelloIntervention(
-            env,
-            port=gello_port,
-            gripper_enabled=gripper_enabled,
-        )
+        env = GelloIntervention(env, port=gello_port, gripper_enabled=gripper_enabled)
 
-    env = _apply_rlt_critical_phase(env, cfg)
     env = _apply_keyboard_reward(env, cfg.get("keyboard_reward_wrapper", None))
+    env = _apply_rlt_critical_phase(env, cfg)
 
     if cfg.get("use_relative_frame", True):
         env = RelativeFrame(env)
-    if not cfg.get("use_quat_tcp_pose", False):
-        env = Quat2EulerWrapper(env)
-    if cfg.get("use_rlt_joint_obs", False):
-        env = RLTJointObsWrapper(env)
+    env = Quat2EulerWrapper(env)
     return env
 
 

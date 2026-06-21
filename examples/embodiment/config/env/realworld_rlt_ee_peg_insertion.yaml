@@ -15,30 +15,13 @@ no_gripper: False
 use_spacemouse: False
 use_gello: False
 gello_port: null
-gello_action_mode: ee_delta
 use_relative_frame: False
-use_quat_tcp_pose: False
-use_rlt_joint_obs: False
 main_image_key: "main_camera"
 wrist_image_key: "wrist_camera"
 default_prompt: "insert the peg in the hole"
-keyboard_reward_wrapper: null
-task_mode: critical_phase
+task_mode: full_task
 critical_phase_key: v
 record_prefix_before_critical_phase: false
-
-# Keep the RLinf realworld 19D state layout used by realworld_dataconfig:
-# state[0] gripper_position
-# state[1:4] tcp_force
-# state[4:10] tcp_pose (xyz + xyz-euler)
-# state[10:13] tcp_torque
-# state[13:19] tcp_vel
-state_key_order:
-  - gripper_position
-  - tcp_force
-  - tcp_pose
-  - tcp_torque
-  - tcp_vel
 
 video_cfg:
   save_video: False

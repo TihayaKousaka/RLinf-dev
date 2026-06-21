@@ -120,7 +120,6 @@ env:
     max_steps_per_rollout_epoch: 100
     use_gello: False
     use_spacemouse: False
-    gello_action_mode: ee_delta
 
   eval:
     total_num_envs: 1
@@ -135,7 +134,6 @@ env:
     group_size: 1
     use_gello: False
     use_spacemouse: False
-    gello_action_mode: ee_delta
     override_cfg:
       # Replace placeholders with calibrated realworld EE-task values before running hardware.
       target_ee_pose: [ 0.60283899, -0.30243948,  0.42646784,  2.93922733, -0.03996551, -1.67041543]
