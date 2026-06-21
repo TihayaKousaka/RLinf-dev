@@ -30,9 +30,7 @@ from rlinf.models.embodiment.openpi_rlt.components import (
     actor_loss,
     compute_td_target,
 )
-from rlinf.models.embodiment.openpi_rlt.openpi_rlt_action_model import (
-    build_openpi_rlt_backbone,
-)
+from rlinf.models.embodiment.openpi import build_openpi_rlt_backbone
 from rlinf.models.embodiment.openpi_rlt.proprio import (
     resolve_proprio_dim,
     select_proprio,
@@ -110,7 +108,7 @@ def _stage2_cfg(*, proprio_dim: int | None = 5):
             "gamma": 0.5,
             "is_lora": False,
             "rlt_stage2": {
-                "config_name": "pi05_rlt_joint",
+                "config_name": "pi05_rlt_maniskill_joint",
                 "num_images_in_input": 2,
                 "embedding_dim": 4,
                 "encoder_layers": 1,
@@ -186,8 +184,21 @@ def test_builtin_registry_dispatches_both_rlt_model_types_to_openpi_rlt(
     assert isinstance(stage2, FakeStage2)
 
 
+def test_rlt_maniskill_joint_dataconfig_is_the_only_joint_config():
+    from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+    from rlinf.models.embodiment.openpi.dataconfig.rlt_maniskill_joint_dataconfig import (
+        LeRobotRLTManiSkillJointDataConfig,
+    )
+
+    cfg = get_openpi_config("pi05_rlt_maniskill_joint")
+
+    assert isinstance(cfg.data, LeRobotRLTManiSkillJointDataConfig)
+    with pytest.raises(ValueError, match="pi05_rlt_joint"):
+        get_openpi_config("pi05_rlt_joint")
+
+
 def test_openpi_rlt_backbone_reuses_existing_openpi_loader(monkeypatch):
-    import rlinf.models.embodiment.openpi_rlt.openpi_rlt_action_model as loader
+    import rlinf.models.embodiment.openpi as openpi_module
 
     captured = {}
 
@@ -203,11 +214,11 @@ def test_openpi_rlt_backbone_reuses_existing_openpi_loader(monkeypatch):
         captured["torch_dtype"] = torch_dtype
         return fake_model
 
-    monkeypatch.setattr(loader, "get_openpi_model", fake_get_openpi_model)
+    monkeypatch.setattr(openpi_module, "get_model", fake_get_openpi_model)
 
     model = build_openpi_rlt_backbone(
         model_path="/tmp/openpi",
-        config_name="pi05_rlt_joint",
+        config_name="pi05_rlt_maniskill_joint",
         norm_stats_path="/tmp/norm_stats.json",
         num_images_in_input=2,
         num_action_chunks=10,
@@ -222,7 +233,7 @@ def test_openpi_rlt_backbone_reuses_existing_openpi_loader(monkeypatch):
     cfg = captured["cfg"]
     assert cfg.model_type == "openpi"
     assert cfg.model_path == "/tmp/openpi"
-    assert cfg.openpi.config_name == "pi05_rlt_joint"
+    assert cfg.openpi.config_name == "pi05_rlt_maniskill_joint"
     assert cfg.openpi.action_chunk == 10
     assert cfg.openpi.action_env_dim == 8
     assert cfg.openpi_data.norm_stats_path == "/tmp/norm_stats.json"

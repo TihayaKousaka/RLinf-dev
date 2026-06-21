@@ -16,121 +16,15 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-import numpy as np
 import torch
 from omegaconf import DictConfig
 
 from rlinf.data.embodied_io_struct import Trajectory
 
 from .rollout import (
-    COLLECTION_PHASE_UNKNOWN,
     TransitionSource,
     resolve_chunk_source,
 )
-
-
-def should_build_rlt_step_trace(model_cfg: Any) -> bool:
-    """Return whether rollout should attach per-step RLT trace observations."""
-    if model_cfg is None or str(model_cfg.get("model_type", "")) != "rlt_stage2":
-        return False
-    return int(model_cfg.get("rlt_stage2", {}).get("replay_subsample_stride", 0)) > 0
-
-
-def build_rlt_step_trace_obs(obs_list: Any) -> dict[str, Any] | None:
-    """Stack chunk-step observations needed by RLT stride replay."""
-    if not isinstance(obs_list, (list, tuple)) or not obs_list:
-        return None
-    first_obs = obs_list[0]
-    if not isinstance(first_obs, dict):
-        return None
-
-    trace_obs: dict[str, Any] = {}
-    for key in ("main_images", "wrist_images", "extra_view_images", "states"):
-        values = [obs.get(key, None) for obs in obs_list if isinstance(obs, dict)]
-        first_value = next((value for value in values if value is not None), None)
-        if first_value is None:
-            if key in first_obs:
-                trace_obs[key] = None
-            continue
-        if any(value is None for value in values):
-            raise ValueError(
-                f"RLT step trace obs field {key!r} is missing for some chunk steps."
-            )
-        if isinstance(first_value, torch.Tensor):
-            trace_obs[key] = torch.stack(values, dim=1).cpu().contiguous()
-        elif isinstance(first_value, np.ndarray):
-            trace_obs[key] = torch.from_numpy(np.stack(values, axis=1)).cpu()
-
-    if isinstance(first_obs.get("task_descriptions", None), list):
-        trace_obs["task_descriptions"] = list(first_obs["task_descriptions"])
-    return trace_obs
-
-
-def build_rlt_step_trace_infos(
-    infos_list: Any,
-    *,
-    expected_trace_len: int | None = None,
-) -> dict[str, Any] | None:
-    """Stack only the policy_info fields consumed by RLT stride replay."""
-    if not isinstance(infos_list, (list, tuple)) or not infos_list:
-        return None
-
-    record_transition = _stack_policy_info_record_transition(
-        infos_list,
-        expected_trace_len=expected_trace_len,
-    )
-    if record_transition is None:
-        return None
-    return {"policy_info": {"record_transition": record_transition}}
-
-
-def _stack_policy_info_record_transition(
-    infos_list: Any,
-    *,
-    expected_trace_len: int | None,
-) -> torch.Tensor | None:
-    last_info = infos_list[-1] if isinstance(infos_list[-1], dict) else None
-    last_policy_info = (
-        last_info.get("policy_info", None) if isinstance(last_info, dict) else None
-    )
-    if isinstance(last_policy_info, dict):
-        last_record = last_policy_info.get("record_transition", None)
-        if (
-            isinstance(last_record, torch.Tensor)
-            and last_record.ndim >= 2
-            and (
-                expected_trace_len is None
-                or int(last_record.shape[1]) == int(expected_trace_len)
-            )
-        ):
-            return last_record.cpu().contiguous()
-
-    per_step_values = []
-    for info in infos_list:
-        policy_info = info.get("policy_info", None) if isinstance(info, dict) else None
-        value = (
-            policy_info.get("record_transition", None)
-            if isinstance(policy_info, dict)
-            else None
-        )
-        per_step_values.append(value)
-
-    first_value = next(
-        (value for value in per_step_values if isinstance(value, torch.Tensor)),
-        None,
-    )
-    if first_value is None:
-        return None
-    if any(not isinstance(value, torch.Tensor) for value in per_step_values):
-        return None
-    stacked = torch.stack(per_step_values, dim=1).cpu().contiguous()
-    if expected_trace_len is not None and int(stacked.shape[1]) != int(
-        expected_trace_len
-    ):
-        return None
-    return stacked
 
 
 class RLTStage2TrajectoryReplayAdapter:
@@ -163,34 +57,17 @@ class RLTStage2TrajectoryReplayAdapter:
         done: torch.Tensor | float | bool,
         intervention: torch.Tensor,
         source_chunk: torch.Tensor,
-        source: int | None,
-        collection_phase_id: int | None,
+        source: int,
+        collection_phase_id: int,
         success: int | bool = 0,
-        intervention_flag: bool | None = None,
+        intervention_flag: bool,
         episode_id: int = 0,
         step_id: int = 0,
         model_weights_id: str = "",
     ) -> Trajectory:
         chunk_length = int(rewards.reshape(-1).shape[0])
         source_chunk = source_chunk.to(torch.uint8).reshape(chunk_length)
-        resolved_source = (
-            int(source) if source is not None else resolve_chunk_source(source_chunk.cpu().numpy())
-        )
         intervention = intervention.to(torch.float32).reshape(-1)
-        resolved_intervention = (
-            bool(intervention_flag)
-            if intervention_flag is not None
-            else bool(
-                intervention.any().item()
-                or (source_chunk == int(TransitionSource.HUMAN)).any().item()
-                or (source_chunk == int(TransitionSource.MIXED)).any().item()
-            )
-        )
-        phase = (
-            COLLECTION_PHASE_UNKNOWN
-            if collection_phase_id is None
-            else int(collection_phase_id)
-        )
 
         return Trajectory(
             max_episode_length=1,
@@ -243,14 +120,17 @@ class RLTStage2TrajectoryReplayAdapter:
                 .cpu()
                 .contiguous(),
                 "intervention": intervention.reshape(1, 1, -1).cpu().contiguous(),
-                "source": torch.as_tensor(resolved_source, dtype=torch.uint8)
+                "source": torch.as_tensor(int(source), dtype=torch.uint8)
                 .reshape(1, 1, 1)
                 .cpu()
                 .contiguous(),
                 "source_chunk": source_chunk.reshape(1, 1, chunk_length)
                 .cpu()
                 .contiguous(),
-                "collection_phase_id": torch.as_tensor(phase, dtype=torch.uint8)
+                "collection_phase_id": torch.as_tensor(
+                    int(collection_phase_id),
+                    dtype=torch.uint8,
+                )
                 .reshape(1, 1, 1)
                 .cpu()
                 .contiguous(),
@@ -259,7 +139,7 @@ class RLTStage2TrajectoryReplayAdapter:
                 .cpu()
                 .contiguous(),
                 "intervention_flag": torch.as_tensor(
-                    resolved_intervention,
+                    bool(intervention_flag),
                     dtype=torch.bool,
                 )
                 .reshape(1, 1, 1)
@@ -308,6 +188,26 @@ class RLTStage2TrajectoryReplayAdapter:
             f"action_dim={action_dim}."
         )
 
+    @staticmethod
+    def _require_forward_tensor(
+        traj: Trajectory,
+        key: str,
+        *,
+        context: str,
+    ) -> torch.Tensor:
+        if not traj.forward_inputs or key not in traj.forward_inputs:
+            raise RuntimeError(
+                f"RLT Stage2 {context} replay requires forward_inputs[{key!r}]. "
+                "Rollout must emit canonical RLT Stage2 fields."
+            )
+        value = traj.forward_inputs[key]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"RLT Stage2 {context} forward_inputs[{key!r}] must be a "
+                f"torch.Tensor, got {type(value).__name__}."
+            )
+        return value
+
     def _chunk_trajectory_to_transitions(self, traj: Trajectory) -> tuple[list[Trajectory], int]:
         if traj.actions is None or not traj.forward_inputs:
             return [], 0
@@ -328,50 +228,56 @@ class RLTStage2TrajectoryReplayAdapter:
         rewards_all = traj.rewards
         if dones_all is None or rewards_all is None:
             return [], 0
-        intervention_flags_all = traj.forward_inputs.get("intervention_flags")
-        if intervention_flags_all is None:
-            intervention_flags_all = traj.intervene_flags
-        source_chunk_all = traj.forward_inputs.get("source_chunk")
-        collection_phase_id_all = traj.forward_inputs.get("collection_phase_id")
-        record_transition_all = traj.forward_inputs.get("record_transition")
+        intervention_flags_all = self._require_forward_tensor(
+            traj,
+            "intervention_flags",
+            context="chunk",
+        )
+        source_chunk_all = self._require_forward_tensor(
+            traj,
+            "source_chunk",
+            context="chunk",
+        )
+        collection_phase_id_all = self._require_forward_tensor(
+            traj,
+            "collection_phase_id",
+            context="chunk",
+        )
+        record_transition_all = self._require_forward_tensor(
+            traj,
+            "record_transition",
+            context="chunk",
+        )
         auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
 
         for env_idx in range(bsz):
             for t in range(traj_len):
-                if record_transition_all is not None:
-                    record_transition = (
-                        record_transition_all[t, env_idx]
-                        .detach()
-                        .to(torch.bool)
-                        .reshape(-1)
-                    )
-                    if not bool(record_transition.all().item()):
-                        continue
+                record_transition = (
+                    record_transition_all[t, env_idx]
+                    .detach()
+                    .to(torch.bool)
+                    .reshape(-1)
+                )
+                if not bool(record_transition.all().item()):
+                    continue
                 done_idx = min(t + 1, dones_all.shape[0] - 1)
                 env_done = float(dones_all[done_idx, env_idx].any().item())
                 done = float(env_done > 0.0)
                 action = traj.actions[t, env_idx].detach()
-                intervention_mask = torch.zeros_like(action, dtype=torch.bool)
-                if intervention_flags_all is not None:
-                    intervention_mask = self._normalize_intervention_mask(
-                        intervention_flags_all[t, env_idx],
-                        action=action,
-                        chunk_len=chunk_len,
-                        action_dim=action_dim,
-                    )
-                source_chunk = None
-                source = None
-                if source_chunk_all is not None:
-                    source_chunk = source_chunk_all[t, env_idx].detach().to(torch.uint8)
-                collection_phase_id = None
-                if collection_phase_id_all is not None:
-                    collection_phase_id = int(
-                        collection_phase_id_all[t, env_idx]
-                        .reshape(-1)[0]
-                        .detach()
-                        .cpu()
-                        .item()
-                    )
+                intervention_mask = self._normalize_intervention_mask(
+                    intervention_flags_all[t, env_idx],
+                    action=action,
+                    chunk_len=chunk_len,
+                    action_dim=action_dim,
+                )
+                source_chunk = source_chunk_all[t, env_idx].detach().to(torch.uint8)
+                collection_phase_id = int(
+                    collection_phase_id_all[t, env_idx]
+                    .reshape(-1)[0]
+                    .detach()
+                    .cpu()
+                    .item()
+                )
 
                 x = x_all[t, env_idx].detach()
                 a_tilde = a_tilde_all[t, env_idx].detach()
@@ -394,37 +300,15 @@ class RLTStage2TrajectoryReplayAdapter:
                     next_x = x_all[t + 1, env_idx].detach()
                     next_a_tilde = a_tilde_all[t + 1, env_idx].detach()
 
-                if source_chunk is None:
-                    step_intervention = intervention_mask.reshape(
-                        chunk_len,
-                        action_dim,
-                    ).any(dim=-1)
-                    source_chunk = torch.where(
-                        step_intervention,
-                        torch.full(
-                            (chunk_len,),
-                            int(TransitionSource.HUMAN),
-                            dtype=torch.uint8,
-                            device=action.device,
-                        ),
-                        torch.full(
-                            (chunk_len,),
-                            int(TransitionSource.RL),
-                            dtype=torch.uint8,
-                            device=action.device,
-                        ),
-                    )
-                    source = resolve_chunk_source(source_chunk.cpu().numpy())
-                else:
-                    step_intervention = intervention_mask.reshape(
-                        chunk_len,
-                        action_dim,
-                    ).any(dim=-1)
-                    source_chunk = source_chunk.reshape(chunk_len).clone()
-                    source_chunk[step_intervention.to(source_chunk.device)] = int(
-                        TransitionSource.HUMAN
-                    )
-                    source = resolve_chunk_source(source_chunk.cpu().numpy())
+                step_intervention = intervention_mask.reshape(
+                    chunk_len,
+                    action_dim,
+                ).any(dim=-1)
+                source_chunk = source_chunk.reshape(chunk_len).clone()
+                source_chunk[step_intervention.to(source_chunk.device)] = int(
+                    TransitionSource.HUMAN
+                )
+                source = resolve_chunk_source(source_chunk.cpu().numpy())
 
                 replay_trajectories.append(
                     self._transition_trajectory(
@@ -512,12 +396,26 @@ class RLTStage2TrajectoryReplayAdapter:
         rewards_all = traj.rewards
         if dones_all is None or rewards_all is None:
             return [], 0
-        source_chunk_all = traj.forward_inputs.get("source_chunk")
-        intervention_flags_all = traj.forward_inputs.get("intervention_flags")
-        if intervention_flags_all is None:
-            intervention_flags_all = traj.intervene_flags
-        collection_phase_id_all = traj.forward_inputs.get("collection_phase_id")
-        record_transition_all = traj.forward_inputs.get("record_transition")
+        source_chunk_all = self._require_forward_tensor(
+            traj,
+            "source_chunk",
+            context="stride",
+        )
+        intervention_flags_all = self._require_forward_tensor(
+            traj,
+            "intervention_flags",
+            context="stride",
+        )
+        collection_phase_id_all = self._require_forward_tensor(
+            traj,
+            "collection_phase_id",
+            context="stride",
+        )
+        record_transition_all = self._require_forward_tensor(
+            traj,
+            "record_transition",
+            context="stride",
+        )
         auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
         step_trace_infos_all = traj.forward_inputs.get("rlt_step_trace_infos")
 
@@ -559,33 +457,19 @@ class RLTStage2TrajectoryReplayAdapter:
                         "RLT Stage2 stride replay has a gap in reconstructed "
                         f"state trace before rollout chunk {t}."
                     )
-                if record_transition_all is None:
-                    boundary_record = torch.ones(
-                        (),
-                        dtype=torch.bool,
-                        device=traj.actions.device,
-                    )
-                else:
-                    boundary_record = (
-                        record_transition_all[t, env_idx]
-                        .detach()
-                        .to(device=traj.actions.device, dtype=torch.bool)
-                        .reshape(-1)
-                        .all()
-                    )
-                if collection_phase_id_all is None:
-                    boundary_phase = torch.as_tensor(
-                        COLLECTION_PHASE_UNKNOWN,
-                        dtype=torch.uint8,
-                        device=traj.actions.device,
-                    )
-                else:
-                    boundary_phase = (
-                        collection_phase_id_all[t, env_idx]
-                        .detach()
-                        .to(device=traj.actions.device, dtype=torch.uint8)
-                        .reshape(-1)[0]
-                    )
+                boundary_record = (
+                    record_transition_all[t, env_idx]
+                    .detach()
+                    .to(device=traj.actions.device, dtype=torch.bool)
+                    .reshape(-1)
+                    .all()
+                )
+                boundary_phase = (
+                    collection_phase_id_all[t, env_idx]
+                    .detach()
+                    .to(device=traj.actions.device, dtype=torch.uint8)
+                    .reshape(-1)[0]
+                )
                 boundary_x = x_all[t, env_idx].detach()
                 boundary_ref = a_tilde_all[t, env_idx].detach().reshape(-1)
                 if len(state_by_step) == absolute_start:
@@ -630,25 +514,18 @@ class RLTStage2TrajectoryReplayAdapter:
                 rewards = rewards_all[t, env_idx].detach().reshape(chunk_len)
                 done_idx = min(t + 1, dones_all.shape[0] - 1)
                 dones = dones_all[done_idx, env_idx].detach().reshape(chunk_len)
-                intervention_mask = torch.zeros_like(action_chunk, dtype=torch.bool)
-                if intervention_flags_all is not None:
-                    intervention_mask = self._normalize_intervention_mask(
-                        intervention_flags_all[t, env_idx],
-                        action=action_chunk.reshape(-1),
-                        chunk_len=chunk_len,
-                        action_dim=action_dim,
-                    ).reshape(chunk_len, action_dim)
-                if source_chunk_all is not None:
-                    source_chunk = (
-                        source_chunk_all[t, env_idx].detach().to(torch.uint8).reshape(chunk_len)
-                    )
-                else:
-                    source_chunk = torch.full(
-                        (chunk_len,),
-                        int(TransitionSource.RL),
-                        dtype=torch.uint8,
-                        device=action_chunk.device,
-                    )
+                intervention_mask = self._normalize_intervention_mask(
+                    intervention_flags_all[t, env_idx],
+                    action=action_chunk.reshape(-1),
+                    chunk_len=chunk_len,
+                    action_dim=action_dim,
+                ).reshape(chunk_len, action_dim)
+                source_chunk = (
+                    source_chunk_all[t, env_idx]
+                    .detach()
+                    .to(torch.uint8)
+                    .reshape(chunk_len)
+                )
                 source_chunk = source_chunk.clone()
                 source_chunk[intervention_mask.any(dim=-1).to(source_chunk.device)] = (
                     int(TransitionSource.HUMAN)

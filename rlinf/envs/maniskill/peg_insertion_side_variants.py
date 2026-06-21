@@ -14,8 +14,11 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import gymnasium as gym
 import numpy as np
+import torch
 
 PEG_INSERTION_SIDE_WIDE_ENV_ID = "PegInsertionSideWideClearance-v1"
 PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID = (
@@ -24,6 +27,13 @@ PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID = (
 PANDA_WIDE_WRISTCAM_UID = "panda_wristcam_wide"
 PEG_INSERTION_SIDE_BASE_CLEARANCE = 0.003
 PEG_INSERTION_SIDE_WIDE_CLEARANCE = 0.02
+RLT_OPENPI_JOINT_WRAP_MODE = "rlt_openpi_joint"
+
+_RLT_JOINT_STATE_DIM = 9
+_RLT_MAIN_CAMERA_KEY = "3rd_view_camera"
+_RLT_WRIST_CAMERA_KEY = "wide_hand_camera"
+_RLT_DEFAULT_PROMPT = "insert the peg in the hole"
+_RLT_LEGACY_PEG_PROMPT = "insert the peg into the hole"
 
 _PEG_VARIANTS_REGISTERED = False
 
@@ -42,6 +52,259 @@ def get_joint_observer_env_id(env_id: str | None) -> str | None:
     }:
         return PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID
     return None
+
+
+def patch_rlt_openpi_joint_env_args(
+    env_args: dict[str, Any],
+    *,
+    wrap_obs_mode: str,
+) -> dict[str, Any]:
+    """Patch ManiSkill env args for the RLT OpenPI joint observer variant."""
+    if wrap_obs_mode != RLT_OPENPI_JOINT_WRAP_MODE:
+        return env_args
+    if not is_peg_insertion_side_env_id(env_args.get("id")):
+        return env_args
+
+    register_rlinf_peg_insertion_side_variants()
+    observer_env_id = get_joint_observer_env_id(env_args.get("id"))
+    if observer_env_id is not None:
+        env_args["id"] = observer_env_id
+    env_args.setdefault("robot_uids", PANDA_WIDE_WRISTCAM_UID)
+    sensor_configs = env_args.setdefault("sensor_configs", {})
+    sensor_configs.setdefault("width", 384)
+    sensor_configs.setdefault("height", 384)
+    return env_args
+
+
+def normalize_peg_instruction(instruction):
+    if isinstance(instruction, str) and instruction == _RLT_LEGACY_PEG_PROMPT:
+        return _RLT_DEFAULT_PROMPT
+    return instruction
+
+
+def normalize_peg_instructions(instructions, *, num_envs: int):
+    if isinstance(instructions, str):
+        return [normalize_peg_instruction(instructions) for _ in range(num_envs)]
+    return [normalize_peg_instruction(item) for item in instructions]
+
+
+def default_peg_instruction(*, num_envs: int) -> list[str]:
+    return [_RLT_DEFAULT_PROMPT for _ in range(num_envs)]
+
+
+def wrap_rlt_openpi_joint_obs(
+    raw_obs: dict[str, Any],
+    *,
+    infos: dict[str, Any] | None,
+    task_descriptions,
+    num_envs: int,
+    device: torch.device,
+    is_peg_insertion_side: bool,
+) -> dict[str, Any]:
+    sensor_data = raw_obs.pop("sensor_data")
+    raw_obs.pop("sensor_param")
+
+    main_images = sensor_data[_RLT_MAIN_CAMERA_KEY]["rgb"]
+    wrist_images = sensor_data[_RLT_WRIST_CAMERA_KEY]["rgb"]
+
+    if infos is not None and "prompt" in infos:
+        task_descriptions = infos["prompt"]
+        if is_peg_insertion_side:
+            task_descriptions = normalize_peg_instructions(
+                task_descriptions,
+                num_envs=num_envs,
+            )
+
+    return {
+        "main_images": main_images,
+        "wrist_images": wrist_images,
+        "extra_view_images": None,
+        "states": extract_rlt_joint_states(
+            raw_obs,
+            batch_size=main_images.shape[0],
+            device=device,
+        ),
+        "task_descriptions": task_descriptions,
+    }
+
+
+def extract_rlt_joint_states(raw_obs: dict[str, Any], *, batch_size: int, device):
+    qpos = raw_obs["agent"]["qpos"]
+    return torch.stack(
+        [
+            _extract_rlt_joint_state(qpos[index], device)
+            for index in range(batch_size)
+        ],
+        dim=0,
+    )
+
+
+def init_peg_insertion_event_state(*, num_envs: int, device) -> dict[str, torch.Tensor]:
+    return {
+        "grasp_count": torch.zeros(num_envs, device=device, dtype=torch.int32),
+        "consecutive_grasp_once": torch.zeros(
+            num_envs,
+            device=device,
+            dtype=torch.bool,
+        ),
+        "prealign_once": torch.zeros(num_envs, device=device, dtype=torch.bool),
+        "partial_insert_once": torch.zeros(num_envs, device=device, dtype=torch.bool),
+        "success_once": torch.zeros(num_envs, device=device, dtype=torch.bool),
+    }
+
+
+def reset_peg_insertion_event_state(
+    state: dict[str, torch.Tensor],
+    *,
+    env_idx=None,
+) -> None:
+    if env_idx is None:
+        for value in state.values():
+            value.zero_()
+        return
+
+    for value in state.values():
+        value[env_idx] = 0
+
+
+def snapshot_peg_insertion_event_state(
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {key: value.clone() for key, value in state.items()}
+
+
+def restore_peg_insertion_event_state(
+    state: dict[str, torch.Tensor],
+    snapshot: dict[str, torch.Tensor],
+    mask: torch.Tensor,
+) -> None:
+    for key, value in snapshot.items():
+        state[key][mask] = value[mask]
+
+
+def augment_peg_insertion_info(
+    *,
+    env,
+    infos: dict[str, Any],
+    event_state: dict[str, torch.Tensor],
+    device,
+) -> dict[str, Any]:
+    peg_head_pos_at_hole = infos.get("peg_head_pos_at_hole")
+    if peg_head_pos_at_hole is None:
+        peg_head_pos_at_hole = (env.box_hole_pose.inv() * env.peg_head_pose).p
+    peg_head_pos_at_hole = peg_head_pos_at_hole.to(device, dtype=torch.float32)
+
+    peg_head_wrt_goal = env.goal_pose.inv() * env.peg_head_pose
+    peg_wrt_goal = env.goal_pose.inv() * env.peg.pose
+    peg_head_goal_yz_dist = torch.linalg.norm(
+        peg_head_wrt_goal.p[:, 1:],
+        dim=1,
+    ).to(torch.float32)
+    peg_body_goal_yz_dist = torch.linalg.norm(
+        peg_wrt_goal.p[:, 1:],
+        dim=1,
+    ).to(torch.float32)
+    tcp_pos = env.agent.tcp.pose.p.to(device, dtype=torch.float32)
+    peg_pos = env.peg.pose.p.to(device, dtype=torch.float32)
+    tcp_peg_dist = torch.linalg.norm(tcp_pos - peg_pos, dim=1).to(torch.float32)
+
+    is_grasped_current = env.agent.is_grasping(env.peg, max_angle=20)
+    event_state["grasp_count"] = torch.where(
+        is_grasped_current,
+        event_state["grasp_count"] + 1,
+        torch.zeros_like(event_state["grasp_count"]),
+    )
+    consecutive_grasp_current = event_state["grasp_count"] >= 5
+
+    prealigned_current = (peg_head_goal_yz_dist < 0.01) & (
+        peg_body_goal_yz_dist < 0.01
+    )
+
+    hole_radii = env.box_hole_radii.to(device, dtype=torch.float32)
+    peg_head_hole_x = peg_head_pos_at_hole[:, 0]
+    peg_head_hole_abs_y = torch.abs(peg_head_pos_at_hole[:, 1])
+    peg_head_hole_abs_z = torch.abs(peg_head_pos_at_hole[:, 2])
+    partial_insert_current = (
+        prealigned_current
+        & (peg_head_hole_x >= -0.05)
+        & (peg_head_hole_abs_y <= 1.25 * hole_radii)
+        & (peg_head_hole_abs_z <= 1.25 * hole_radii)
+    )
+
+    success_current = infos.get("success")
+    if success_current is None:
+        success_current = (
+            (peg_head_hole_x >= -0.015)
+            & (peg_head_hole_abs_y <= hole_radii)
+            & (peg_head_hole_abs_z <= hole_radii)
+        )
+    success_current = success_current.to(device, dtype=torch.bool)
+
+    consecutive_grasp_event = (
+        consecutive_grasp_current & (~event_state["consecutive_grasp_once"])
+    )
+    prealign_event = prealigned_current & (~event_state["prealign_once"])
+    partial_insert_event = (
+        partial_insert_current & (~event_state["partial_insert_once"])
+    )
+    success_event = success_current & (~event_state["success_once"])
+
+    event_state["consecutive_grasp_once"] |= consecutive_grasp_current
+    event_state["prealign_once"] |= prealigned_current
+    event_state["partial_insert_once"] |= partial_insert_current
+    event_state["success_once"] |= success_current
+
+    infos.update(
+        {
+            "peg_head_pos_at_hole": peg_head_pos_at_hole,
+            "peg_head_hole_x": peg_head_hole_x,
+            "peg_head_hole_abs_y": peg_head_hole_abs_y,
+            "peg_head_hole_abs_z": peg_head_hole_abs_z,
+            "peg_head_goal_yz_dist": peg_head_goal_yz_dist,
+            "peg_body_goal_yz_dist": peg_body_goal_yz_dist,
+            "tcp_peg_dist": tcp_peg_dist,
+            "is_grasped_current": is_grasped_current,
+            "consecutive_grasp_current": consecutive_grasp_current,
+            "prealigned_current": prealigned_current,
+            "partial_insert_current": partial_insert_current,
+            "success_current": success_current,
+            "consecutive_grasp_event": consecutive_grasp_event,
+            "prealign_event": prealign_event,
+            "partial_insert_event": partial_insert_event,
+            "success_event": success_event,
+            "consecutive_grasp_once": event_state[
+                "consecutive_grasp_once"
+            ].clone(),
+            "prealign_once": event_state["prealign_once"].clone(),
+            "partial_insert_once": event_state["partial_insert_once"].clone(),
+            "success_once": event_state["success_once"].clone(),
+            "success": success_current,
+        }
+    )
+    return infos
+
+
+def _to_numpy(x):
+    if hasattr(x, "detach"):
+        x = x.detach().cpu().numpy()
+    arr = np.asarray(x)
+    if arr.ndim > 0 and arr.shape[0] == 1:
+        arr = arr[0]
+    return arr
+
+
+def _extract_rlt_joint_state(qpos, device):
+    qpos = _to_numpy(qpos).astype(np.float32)
+    if qpos.shape[0] < _RLT_JOINT_STATE_DIM:
+        raise ValueError(
+            f"Expected Panda qpos with at least {_RLT_JOINT_STATE_DIM} dims, "
+            f"got {qpos.shape}"
+        )
+    return torch.as_tensor(
+        qpos[:_RLT_JOINT_STATE_DIM],
+        device=device,
+        dtype=torch.float32,
+    )
 
 
 def register_rlinf_peg_insertion_side_variants() -> None:

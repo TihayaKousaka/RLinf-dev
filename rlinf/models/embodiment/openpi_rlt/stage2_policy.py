@@ -33,9 +33,9 @@ import torch
 from omegaconf import DictConfig
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.openpi import build_openpi_rlt_backbone
 
 from .components import DirectGaussianActor, TwinQCritic, compute_td_target
-from .openpi_rlt_action_model import build_openpi_rlt_backbone
 from .proprio import resolve_proprio_dim, select_proprio
 from .rl_token import RLTokenModel
 from .rollout import RLTStage2RolloutRouteConfig, route_rlt_stage2_rollout
@@ -43,6 +43,7 @@ from .rollout import RLTStage2RolloutRouteConfig, route_rlt_stage2_rollout
 
 class RLTStage2Policy(torch.nn.Module, BasePolicy):
     ROLLOUT_SYNC_PREFIXES = ("actor.",)
+    accepts_rollout_context = True
 
     def __init__(
         self,
@@ -516,7 +517,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 "RLT Stage2 VLA reference prediction requires the VLA backbone. "
                 "Do not call this method on actor-only training policies."
             )
-        observation, processed_obs = self.vla.prepare_rlt_observation(env_obs)
+        observation, _ = self.vla.prepare_rlt_observation(env_obs)
         a_tilde = self.vla.predict_rlt_reference_action(observation, self.chunk_length)
         self._validate_action_chunk(a_tilde, name="expert vla_reference actions")
         action_flat = a_tilde.reshape(a_tilde.shape[0], -1)
@@ -530,10 +531,6 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             "forward_inputs": {
                 "action": action_flat.detach(),
                 "a_tilde": action_flat.detach(),
-                "tokenized_prompt": processed_obs["tokenized_prompt"].detach(),
-                "tokenized_prompt_mask": processed_obs[
-                    "tokenized_prompt_mask"
-                ].detach(),
             },
         }
         return a_tilde, result
@@ -579,10 +576,6 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 "action": action_flat.detach(),
                 "x": x.detach(),
                 "a_tilde": a_tilde.detach(),
-                "tokenized_prompt": processed_obs["tokenized_prompt"].detach(),
-                "tokenized_prompt_mask": processed_obs[
-                    "tokenized_prompt_mask"
-                ].detach(),
             },
         }
         if not enable_rlt_route:
@@ -604,7 +597,6 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             cfg=RLTStage2RolloutRouteConfig(
                 ready_for_online=ready_for_online,
                 online_gate_step=self.online_gate_updates,
-                intervention_enabled=self.intervention_enabled,
                 allow_expert=(
                     mode == "train"
                     and allow_expert
@@ -694,27 +686,6 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 },
             }
         return route.actions, route.result
-
-    def predict_rollout_action_batch(
-        self,
-        *,
-        env_output: dict[str, Any],
-        mode: Literal["train", "eval"] = "train",
-        allow_expert: bool = True,
-        expert_model_getter=None,
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Model-owned rollout entrypoint for RLT-specific routing metadata."""
-        actions, result = self.predict_action_batch(
-            env_obs=env_output["obs"],
-            mode=mode,
-            env_infos=env_output.get("env_infos", None),
-            allow_expert=allow_expert,
-            expert_model_getter=expert_model_getter,
-        )
-        save_flags = result.get("forward_inputs", {}).get("intervention_flags", None)
-        if save_flags is not None:
-            result["save_flags"] = save_flags
-        return actions, result
 
     def get_rollout_policy_mode(
         self,

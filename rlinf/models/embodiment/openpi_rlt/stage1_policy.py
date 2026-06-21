@@ -22,9 +22,9 @@ import torch
 from omegaconf import DictConfig
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.openpi import build_openpi_rlt_backbone
 
 from .rl_token import RLTokenModel
-from .openpi_rlt_action_model import build_openpi_rlt_backbone
 
 
 class RLTStage1Policy(torch.nn.Module, BasePolicy):

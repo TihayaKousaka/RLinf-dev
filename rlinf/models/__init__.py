@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from omegaconf import DictConfig
 
@@ -312,6 +312,18 @@ def get_model(cfg: DictConfig):
                 param.requires_grad = True
 
     return model
+
+
+def get_env_worker_handler(model_cfg: DictConfig) -> Any | None:
+    """Return an optional model-specific EnvWorker handler."""
+    if model_cfg is None:
+        return None
+    model_type = str(model_cfg.get("model_type", ""))
+    if model_type == SupportedModel.RLT_STAGE2.value:
+        from rlinf.models.embodiment.openpi_rlt import get_env_worker_handler
+
+        return get_env_worker_handler(model_cfg)
+    return None
 
 
 def tag_vlm_subtree(model, is_vlm: bool):

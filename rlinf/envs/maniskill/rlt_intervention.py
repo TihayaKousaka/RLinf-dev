@@ -22,6 +22,29 @@ import torch
 from omegaconf import DictConfig
 
 
+def apply_rlt_intervention_policy_info(
+    *,
+    controller: "ManiSkillLocalCorrectionController | None",
+    infos_list: list[dict[str, Any]],
+    chunk_dones: torch.Tensor,
+    intervention_enabled: bool = True,
+) -> None:
+    """Attach RLT policy_info to the last chunk info in-place."""
+    if controller is None:
+        return
+    infos_last = infos_list[-1]
+    policy_info = controller.update(
+        infos=infos_last,
+        chunk_dones=chunk_dones,
+        intervention_enabled=intervention_enabled,
+    )
+    infos_last["policy_info"] = policy_info
+    for key, value in policy_info.items():
+        if isinstance(value, torch.Tensor):
+            infos_last[key] = value
+    infos_list[-1] = infos_last
+
+
 class ManiSkillLocalCorrectionController:
     """State machine that requests expert takeover in peg-insertion phase."""
 

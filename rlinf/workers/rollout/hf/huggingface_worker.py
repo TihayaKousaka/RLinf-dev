@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
+    EnvOutput,
     RolloutResult,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
@@ -299,7 +300,12 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("predict")
     def predict(
-        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
+        self,
+        env_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+        *,
+        allow_expert: bool = True,
+        env_infos: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = (
             self._train_sampling_params
@@ -335,6 +341,7 @@ class MultiStepRolloutWorker(Worker):
 
         if (
             mode == "train"
+            and allow_expert
             and self._use_dagger_expert_sampling()
             and self.expert_model is not None
         ):
@@ -344,17 +351,30 @@ class MultiStepRolloutWorker(Worker):
 
         with torch.no_grad():
             expert_label_flag = False
+            context_kwargs = self._predict_context_kwargs(
+                mode=mode,
+                allow_expert=allow_expert,
+                env_infos=env_infos,
+            )
+            context_kwargs = {
+                key: value
+                for key, value in context_kwargs.items()
+                if key not in kwargs
+            }
             if use_expert:
                 actions, result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
+                    **context_kwargs,
                 )
                 expert_label_flag = True
             else:
                 actions, result = self.hf_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
+                    **context_kwargs,
                 )
+                expert_label_flag = bool(result.get("expert_label_flag", False))
 
             # Decide re-label or not
             if (
@@ -367,6 +387,7 @@ class MultiStepRolloutWorker(Worker):
                 _, expert_result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
+                    **context_kwargs,
                 )
                 expert_forward_inputs = expert_result["forward_inputs"]
                 expert_target = expert_forward_inputs.get(
@@ -382,26 +403,25 @@ class MultiStepRolloutWorker(Worker):
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
 
-    def predict_rollout(
+    def _predict_context_kwargs(
         self,
-        env_output: dict[str, Any],
         *,
         mode: Literal["train", "eval"] = "train",
         allow_expert: bool = True,
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        method = getattr(self.hf_model, "predict_rollout_action_batch", None)
-        if method is None:
-            return self.predict(env_output["obs"], mode=mode)
-        return method(
-            env_output=env_output,
-            mode=mode,
-            allow_expert=allow_expert,
-            expert_model_getter=(
+        env_infos: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not getattr(self.hf_model, "accepts_rollout_context", False):
+            return {}
+        return {
+            "mode": mode,
+            "env_infos": env_infos,
+            "allow_expert": allow_expert,
+            "expert_model_getter": (
                 self._ensure_expert_model_loaded
                 if self._has_expert_model_config
                 else None
             ),
-        )
+        }
 
     def get_policy_mode(
         self, mode: Literal["train", "eval"]
@@ -511,9 +531,14 @@ class MultiStepRolloutWorker(Worker):
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
-                actions, result = self.predict_rollout(env_output)
+                actions, result = self.predict(
+                    env_output["obs"],
+                    env_infos=env_output.get("env_infos", None),
+                )
 
-                save_flags = result.get("save_flags", None)
+                save_flags = result.get("forward_inputs", {}).get(
+                    "intervention_flags", None
+                )
                 if save_flags is None and result.get("expert_label_flag", False):
                     save_flags = torch.full(
                         (actions.shape[0], self.cfg.actor.model.num_action_chunks),
@@ -543,7 +568,11 @@ class MultiStepRolloutWorker(Worker):
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
         for _ in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
-            actions, result = self.predict_rollout(env_output, allow_expert=False)
+            actions, result = self.predict(
+                env_output["obs"],
+                allow_expert=False,
+                env_infos=env_output.get("env_infos", None),
+            )
 
             rollout_result = RolloutResult(
                 actions=actions,
@@ -586,10 +615,11 @@ class MultiStepRolloutWorker(Worker):
             for _ in range(self.n_eval_chunk_steps):
                 for _ in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
-                    actions, _ = self.predict_rollout(
-                        env_output,
+                    actions, _ = self.predict(
+                        env_output["obs"],
                         mode=eval_policy_mode,
                         allow_expert=False,
+                        env_infos=env_output.get("env_infos", None),
                     )
                     self.send_chunk_actions(output_channel, actions, mode="eval")
 
@@ -681,63 +711,11 @@ class MultiStepRolloutWorker(Worker):
     def _merge_obs_batches(obs_batches: list[dict[str, Any]]) -> dict[str, Any]:
         if not obs_batches:
             return {}
-        obs_dicts = [
-            obs_batch["obs"] if "obs" in obs_batch else obs_batch
+        normalized_batches = [
+            obs_batch if "obs" in obs_batch else {"obs": obs_batch}
             for obs_batch in obs_batches
         ]
-        final_obs_list = [obs_batch.get("final_obs", None) for obs_batch in obs_batches]
-
-        def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
-            merged: dict[str, Any] = {}
-            for key in dicts[0].keys():
-                values = [obs_dict[key] for obs_dict in dicts]
-                first_non_none = next(
-                    (value for value in values if value is not None), None
-                )
-                if first_non_none is None:
-                    merged[key] = None
-                elif isinstance(first_non_none, torch.Tensor):
-                    merged[key] = torch.cat(values, dim=0)
-                elif isinstance(first_non_none, list):
-                    merged[key] = [item for sublist in values for item in sublist]
-                else:
-                    merged[key] = values
-            return merged
-
-        def _merge_nested_values(values: list[Any]) -> Any:
-            first_non_none = next((value for value in values if value is not None), None)
-            if first_non_none is None:
-                return None
-            if any(value is None for value in values):
-                raise ValueError(
-                    "Inconsistent env_infos field: some shards are None while "
-                    "others are present."
-                )
-            if isinstance(first_non_none, torch.Tensor):
-                return torch.cat(values, dim=0)
-            if isinstance(first_non_none, list):
-                return [item for value in values for item in value]
-            if isinstance(first_non_none, dict):
-                return {
-                    key: _merge_nested_values([value.get(key) for value in values])
-                    for key in set().union(*(value.keys() for value in values))
-                }
-            return values
-
-        merged_obs = _merge_obs_dicts(obs_dicts)
-        merged_final_obs = None
-        if any(final_obs is not None for final_obs in final_obs_list):
-            final_obs_or_obs = [
-                final_obs if final_obs is not None else obs_dict
-                for obs_dict, final_obs in zip(obs_dicts, final_obs_list)
-            ]
-            merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
-
-        merged = {"obs": merged_obs, "final_obs": merged_final_obs}
-        env_infos_list = [obs_batch.get("env_infos", None) for obs_batch in obs_batches]
-        if any(env_infos is not None for env_infos in env_infos_list):
-            merged["env_infos"] = _merge_nested_values(env_infos_list)
-        return merged
+        return EnvOutput.merge_env_outputs(normalized_batches)
 
     @Worker.timer("rollout/send_actions")
     def send_chunk_actions(

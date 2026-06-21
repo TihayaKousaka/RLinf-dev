@@ -25,20 +25,24 @@ from mani_skill.utils.visualization.misc import put_info_on_image, tile_images
 from omegaconf import open_dict
 from omegaconf.omegaconf import OmegaConf
 from rlinf.envs.maniskill.peg_insertion_side_variants import (
-    PANDA_WIDE_WRISTCAM_UID,
-    get_joint_observer_env_id,
+    RLT_OPENPI_JOINT_WRAP_MODE,
+    augment_peg_insertion_info,
+    default_peg_instruction,
+    init_peg_insertion_event_state,
     is_peg_insertion_side_env_id,
-    register_rlinf_peg_insertion_side_variants,
+    normalize_peg_instruction,
+    patch_rlt_openpi_joint_env_args,
+    reset_peg_insertion_event_state,
+    restore_peg_insertion_event_state,
+    snapshot_peg_insertion_event_state,
+    wrap_rlt_openpi_joint_obs,
 )
-from rlinf.envs.maniskill.rlt_intervention import ManiSkillLocalCorrectionController
+from rlinf.envs.maniskill.rlt_intervention import (
+    ManiSkillLocalCorrectionController,
+    apply_rlt_intervention_policy_info,
+)
 
 __all__ = ["ManiskillEnv"]
-
-_RLT_JOINT_STATE_DIM = 9
-_RLT_MAIN_CAMERA_KEY = "3rd_view_camera"
-_RLT_WRIST_CAMERA_KEY = "wide_hand_camera"
-_RLT_DEFAULT_PROMPT = "insert the peg in the hole"
-_RLT_LEGACY_PEG_PROMPT = "insert the peg into the hole"
 
 def _to_bool_tensor(value, *, num_envs, device):
     if isinstance(value, bool):
@@ -71,125 +75,6 @@ def extract_termination_from_info(info, num_envs, device, fallback=None):
                 return torch.zeros(num_envs, dtype=bool, device=device)
             terminated = _to_bool_tensor(fallback, num_envs=num_envs, device=device)
     return terminated
-
-
-def _to_numpy(x):
-    if hasattr(x, "detach"):
-        x = x.detach().cpu().numpy()
-    arr = np.asarray(x)
-    if arr.ndim > 0 and arr.shape[0] == 1:
-        arr = arr[0]
-    return arr
-
-
-def _normalize_peg_instruction(instruction):
-    if isinstance(instruction, str) and instruction == _RLT_LEGACY_PEG_PROMPT:
-        return _RLT_DEFAULT_PROMPT
-    return instruction
-
-
-def _normalize_peg_instructions(instructions, *, num_envs):
-    if isinstance(instructions, str):
-        return [_normalize_peg_instruction(instructions) for _ in range(num_envs)]
-    return [_normalize_peg_instruction(item) for item in instructions]
-
-
-def _extract_rlt_joint_state(qpos, device):
-    qpos = _to_numpy(qpos).astype(np.float32)
-    if qpos.shape[0] < _RLT_JOINT_STATE_DIM:
-        raise ValueError(
-            f"Expected Panda qpos with at least {_RLT_JOINT_STATE_DIM} dims, got {qpos.shape}"
-        )
-    return torch.as_tensor(
-        qpos[:_RLT_JOINT_STATE_DIM], device=device, dtype=torch.float32
-    )
-
-
-def _extract_rlt_joint_states(raw_obs, *, batch_size, device):
-    qpos = raw_obs["agent"]["qpos"]
-    return torch.stack(
-        [
-            _extract_rlt_joint_state(qpos[index], device)
-            for index in range(batch_size)
-        ],
-        dim=0,
-    )
-
-
-def _quat_wxyz_to_rotvec(quat_wxyz):
-    quat = np.asarray(quat_wxyz, dtype=np.float64)
-    quat_norm = np.linalg.norm(quat)
-    if quat_norm < 1e-8:
-        return np.zeros(3, dtype=np.float32)
-
-    quat = quat / quat_norm
-    # Canonicalize to the shortest axis-angle representation.
-    if quat[0] < 0:
-        quat = -quat
-
-    w = np.clip(quat[0], -1.0, 1.0)
-    xyz = quat[1:]
-    sin_half_angle = np.linalg.norm(xyz)
-    if sin_half_angle < 1e-8:
-        return (2.0 * xyz).astype(np.float32)
-
-    angle = 2.0 * np.arctan2(sin_half_angle, w)
-    return (xyz / sin_half_angle * angle).astype(np.float32)
-
-
-def _extract_tcp_pose(obs):
-    extra = obs.get("extra", {})
-    tcp_pose = extra.get("tcp_pose")
-    if tcp_pose is not None:
-        pose = _to_numpy(tcp_pose).astype(np.float32)
-        return pose[:3], pose[3:]
-
-    agent = obs.get("agent", {})
-    if "tcp_pose" in agent:
-        pose = _to_numpy(agent["tcp_pose"]).astype(np.float32)
-        return pose[:3], pose[3:]
-
-    raise KeyError(
-        "Could not find TCP pose in ManiSkill observation. "
-        "Expected obs['extra']['tcp_pose'] or obs['agent']['tcp_pose']."
-    )
-
-
-def _select_batch_item(value, index):
-    if value is None:
-        return None
-    if hasattr(value, "shape"):
-        try:
-            if len(value.shape) > 1 and value.shape[0] > index:
-                return value[index]
-        except Exception:
-            return value
-    return value
-
-
-def _extract_tcp_pose_at_robot_base(env, env_index):
-    agent = getattr(env, "agent", None)
-    if agent is None:
-        return None
-
-    pose = getattr(agent, "ee_pose_at_robot_base", None)
-    if pose is None:
-        robot = getattr(agent, "robot", None)
-        tcp = getattr(agent, "tcp", None)
-        robot_pose = getattr(robot, "pose", None)
-        tcp_pose = getattr(tcp, "pose", None)
-        if robot_pose is None or tcp_pose is None:
-            return None
-        try:
-            pose = robot_pose.inv() * tcp_pose
-        except Exception:
-            return None
-
-    raw_pose = getattr(pose, "raw_pose", pose)
-    pose_np = _to_numpy(_select_batch_item(raw_pose, env_index)).astype(np.float32)
-    if pose_np.shape[-1] != 7:
-        return None
-    return pose_np[:3], pose_np[3:]
 
 
 def _shape_str(value):
@@ -229,18 +114,10 @@ class ManiskillEnv(gym.Env):
         with open_dict(cfg):
             cfg.init_params.num_envs = num_envs
         env_args = OmegaConf.to_container(cfg.init_params, resolve=True)
-        if (
-            getattr(cfg, "wrap_obs_mode", "default") == "rlt_openpi_joint"
-            and is_peg_insertion_side_env_id(env_args.get("id"))
-        ):
-            register_rlinf_peg_insertion_side_variants()
-            observer_env_id = get_joint_observer_env_id(env_args.get("id"))
-            if observer_env_id is not None:
-                env_args["id"] = observer_env_id
-            env_args.setdefault("robot_uids", PANDA_WIDE_WRISTCAM_UID)
-            sensor_configs = env_args.setdefault("sensor_configs", {})
-            sensor_configs.setdefault("width", 384)
-            sensor_configs.setdefault("height", 384)
+        env_args = patch_rlt_openpi_joint_env_args(
+            env_args,
+            wrap_obs_mode=getattr(cfg, "wrap_obs_mode", "default"),
+        )
         self.env: BaseEnv = gym.make(**env_args)
         self.prev_step_reward = torch.zeros(self.num_envs, dtype=torch.float32).to(
             self.device
@@ -260,7 +137,10 @@ class ManiskillEnv(gym.Env):
                 "peg_head_goal_yz_dist",
                 "peg_body_goal_yz_dist",
             ]
-            self._init_peg_insertion_event_state()
+            self.peg_event_state = init_peg_insertion_event_state(
+                num_envs=self.num_envs,
+                device=self.device,
+            )
         else:
             self.info_logging_keys = [
                 "is_src_obj_grasped",
@@ -309,12 +189,12 @@ class ManiskillEnv(gym.Env):
             if instruction is not None:
                 if isinstance(instruction, str):
                     return [
-                        _normalize_peg_instruction(instruction)
+                        normalize_peg_instruction(instruction)
                         for _ in range(self.num_envs)
                     ]
                 if self._is_peg_insertion_side:
                     return [
-                        _normalize_peg_instruction(item)
+                        normalize_peg_instruction(item)
                         for item in instruction
                     ]
                 return instruction
@@ -332,48 +212,19 @@ class ManiskillEnv(gym.Env):
                 continue
             if isinstance(instruction, str):
                 return [
-                    _normalize_peg_instruction(instruction)
+                    normalize_peg_instruction(instruction)
                     for _ in range(self.num_envs)
                 ]
             if self._is_peg_insertion_side:
                 return [
-                    _normalize_peg_instruction(item)
+                    normalize_peg_instruction(item)
                     for item in instruction
                 ]
             return instruction
 
         if self._is_peg_insertion_side:
-            return [_RLT_DEFAULT_PROMPT for _ in range(self.num_envs)]
+            return default_peg_instruction(num_envs=self.num_envs)
         return ["" for _ in range(self.num_envs)]
-
-    def _wrap_rlt_openpi_joint_obs(self, raw_obs, infos=None):
-        sensor_data = raw_obs.pop("sensor_data")
-        raw_obs.pop("sensor_param")
-
-        main_images = sensor_data[_RLT_MAIN_CAMERA_KEY]["rgb"]
-        wrist_images = sensor_data[_RLT_WRIST_CAMERA_KEY]["rgb"]
-
-        if infos is not None and "prompt" in infos:
-            task_descriptions = infos["prompt"]
-            if self._is_peg_insertion_side:
-                task_descriptions = _normalize_peg_instructions(
-                    task_descriptions,
-                    num_envs=self.num_envs,
-                )
-        else:
-            task_descriptions = self.instruction
-
-        return {
-            "main_images": main_images,
-            "wrist_images": wrist_images,
-            "extra_view_images": None,
-            "states": _extract_rlt_joint_states(
-                raw_obs,
-                batch_size=main_images.shape[0],
-                device=self.device,
-            ),
-            "task_descriptions": task_descriptions,
-        }
 
     def _init_reset_state_ids(self):
         self._generator = torch.Generator()
@@ -436,12 +287,19 @@ class ManiskillEnv(gym.Env):
                     "states": state,
                 }
 
-        if wrap_obs_mode == "rlt_openpi_joint":
+        if wrap_obs_mode == RLT_OPENPI_JOINT_WRAP_MODE:
             if self.env.unwrapped.obs_mode != "rgb":
                 raise ValueError(
                     "wrap_obs_mode='rlt_openpi_joint' requires ManiSkill obs_mode='rgb'."
                 )
-            return self._wrap_rlt_openpi_joint_obs(raw_obs, infos=infos)
+            return wrap_rlt_openpi_joint_obs(
+                raw_obs,
+                infos=infos,
+                task_descriptions=self.instruction,
+                num_envs=self.num_envs,
+                device=self.device,
+                is_peg_insertion_side=self._is_peg_insertion_side,
+            )
 
         # Default
         obs_image = raw_obs["sensor_data"]["3rd_view_camera"]["rgb"].to(
@@ -471,23 +329,6 @@ class ManiskillEnv(gym.Env):
                 state_obs, use_torch=True, device=self.device
             )
         return state_obs
-
-    def _init_peg_insertion_event_state(self):
-        self.peg_grasp_count = torch.zeros(
-            self.num_envs, device=self.device, dtype=torch.int32
-        )
-        self.peg_consecutive_grasp_once = torch.zeros(
-            self.num_envs, device=self.device, dtype=torch.bool
-        )
-        self.peg_prealign_once = torch.zeros(
-            self.num_envs, device=self.device, dtype=torch.bool
-        )
-        self.peg_partial_insert_once = torch.zeros(
-            self.num_envs, device=self.device, dtype=torch.bool
-        )
-        self.peg_success_once = torch.zeros(
-            self.num_envs, device=self.device, dtype=torch.bool
-        )
 
     def _init_rlt_intervention_controller(self):
         if self.rlt_intervention_cfg is None:
@@ -526,119 +367,6 @@ class ManiskillEnv(gym.Env):
     def _reset_rlt_intervention_controller(self):
         if self.rlt_intervention_controller is not None:
             self._init_rlt_intervention_controller()
-
-    def _reset_peg_insertion_event_state(self, env_idx=None):
-        if not self._is_peg_insertion_side:
-            return
-
-        if env_idx is None:
-            self.peg_grasp_count.zero_()
-            self.peg_consecutive_grasp_once.zero_()
-            self.peg_prealign_once.zero_()
-            self.peg_partial_insert_once.zero_()
-            self.peg_success_once.zero_()
-            return
-
-        self.peg_grasp_count[env_idx] = 0
-        self.peg_consecutive_grasp_once[env_idx] = False
-        self.peg_prealign_once[env_idx] = False
-        self.peg_partial_insert_once[env_idx] = False
-        self.peg_success_once[env_idx] = False
-
-    def _augment_peg_insertion_info(self, infos):
-        if not self._is_peg_insertion_side:
-            return infos
-
-        env = self.env.unwrapped
-        peg_head_pos_at_hole = infos.get("peg_head_pos_at_hole")
-        if peg_head_pos_at_hole is None:
-            peg_head_pos_at_hole = (env.box_hole_pose.inv() * env.peg_head_pose).p
-        peg_head_pos_at_hole = peg_head_pos_at_hole.to(self.device, dtype=torch.float32)
-
-        peg_head_wrt_goal = env.goal_pose.inv() * env.peg_head_pose
-        peg_wrt_goal = env.goal_pose.inv() * env.peg.pose
-        peg_head_goal_yz_dist = torch.linalg.norm(
-            peg_head_wrt_goal.p[:, 1:], dim=1
-        ).to(torch.float32)
-        peg_body_goal_yz_dist = torch.linalg.norm(
-            peg_wrt_goal.p[:, 1:], dim=1
-        ).to(torch.float32)
-        tcp_pos = env.agent.tcp.pose.p.to(self.device, dtype=torch.float32)
-        peg_pos = env.peg.pose.p.to(self.device, dtype=torch.float32)
-        tcp_peg_dist = torch.linalg.norm(tcp_pos - peg_pos, dim=1).to(torch.float32)
-
-        is_grasped_current = env.agent.is_grasping(env.peg, max_angle=20)
-        self.peg_grasp_count = torch.where(
-            is_grasped_current,
-            self.peg_grasp_count + 1,
-            torch.zeros_like(self.peg_grasp_count),
-        )
-        consecutive_grasp_current = self.peg_grasp_count >= 5
-
-        prealigned_current = (peg_head_goal_yz_dist < 0.01) & (
-            peg_body_goal_yz_dist < 0.01
-        )
-
-        hole_radii = env.box_hole_radii.to(self.device, dtype=torch.float32)
-        peg_head_hole_x = peg_head_pos_at_hole[:, 0]
-        peg_head_hole_abs_y = torch.abs(peg_head_pos_at_hole[:, 1])
-        peg_head_hole_abs_z = torch.abs(peg_head_pos_at_hole[:, 2])
-        partial_insert_current = (
-            prealigned_current
-            & (peg_head_hole_x >= -0.05)
-            & (peg_head_hole_abs_y <= 1.25 * hole_radii)
-            & (peg_head_hole_abs_z <= 1.25 * hole_radii)
-        )
-
-        success_current = infos.get("success")
-        if success_current is None:
-            success_current = (
-                (peg_head_hole_x >= -0.015)
-                & (peg_head_hole_abs_y <= hole_radii)
-                & (peg_head_hole_abs_z <= hole_radii)
-            )
-        success_current = success_current.to(self.device, dtype=torch.bool)
-
-        consecutive_grasp_event = (
-            consecutive_grasp_current & (~self.peg_consecutive_grasp_once)
-        )
-        prealign_event = prealigned_current & (~self.peg_prealign_once)
-        partial_insert_event = (
-            partial_insert_current & (~self.peg_partial_insert_once)
-        )
-        success_event = success_current & (~self.peg_success_once)
-
-        self.peg_consecutive_grasp_once |= consecutive_grasp_current
-        self.peg_prealign_once |= prealigned_current
-        self.peg_partial_insert_once |= partial_insert_current
-        self.peg_success_once |= success_current
-
-        infos.update(
-            {
-                "peg_head_pos_at_hole": peg_head_pos_at_hole,
-                "peg_head_hole_x": peg_head_hole_x,
-                "peg_head_hole_abs_y": peg_head_hole_abs_y,
-                "peg_head_hole_abs_z": peg_head_hole_abs_z,
-                "peg_head_goal_yz_dist": peg_head_goal_yz_dist,
-                "peg_body_goal_yz_dist": peg_body_goal_yz_dist,
-                "tcp_peg_dist": tcp_peg_dist,
-                "is_grasped_current": is_grasped_current,
-                "consecutive_grasp_current": consecutive_grasp_current,
-                "prealigned_current": prealigned_current,
-                "partial_insert_current": partial_insert_current,
-                "success_current": success_current,
-                "consecutive_grasp_event": consecutive_grasp_event,
-                "prealign_event": prealign_event,
-                "partial_insert_event": partial_insert_event,
-                "success_event": success_event,
-                "consecutive_grasp_once": self.peg_consecutive_grasp_once.clone(),
-                "prealign_once": self.peg_prealign_once.clone(),
-                "partial_insert_once": self.peg_partial_insert_once.clone(),
-                "success_once": self.peg_success_once.clone(),
-                "success": success_current,
-            }
-        )
-        return infos
 
     def _calc_step_reward(self, reward, info):
         if getattr(self.cfg, "reward_mode", "default") == "raw":
@@ -773,10 +501,15 @@ class ManiskillEnv(gym.Env):
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
         if "env_idx" in options:
             env_idx = options["env_idx"]
-            self._reset_peg_insertion_event_state(env_idx)
+            if self._is_peg_insertion_side:
+                reset_peg_insertion_event_state(
+                    self.peg_event_state,
+                    env_idx=env_idx,
+                )
             self._reset_metrics(env_idx)
         else:
-            self._reset_peg_insertion_event_state()
+            if self._is_peg_insertion_side:
+                reset_peg_insertion_event_state(self.peg_event_state)
             self._reset_metrics()
         self._reset_persistent_done_state(options.get("env_idx"))
         self._reset_rlt_intervention_controller()
@@ -786,7 +519,13 @@ class ManiskillEnv(gym.Env):
         self, actions: Union[Array, dict] = None, auto_reset=True
     ) -> tuple[Array, Array, Array, Array, dict]:
         raw_obs, _reward, terminations, truncations, infos = self.env.step(actions)
-        infos = self._augment_peg_insertion_info(infos)
+        if self._is_peg_insertion_side:
+            infos = augment_peg_insertion_info(
+                env=self.env.unwrapped,
+                infos=infos,
+                event_state=self.peg_event_state,
+                device=self.device,
+            )
         terminations = extract_termination_from_info(
             infos,
             num_envs=self.num_envs,
@@ -829,14 +568,8 @@ class ManiskillEnv(gym.Env):
                 }
             )
         if self._is_peg_insertion_side:
-            state.update(
-                {
-                    "peg_grasp_count": self.peg_grasp_count.clone(),
-                    "peg_consecutive_grasp_once": self.peg_consecutive_grasp_once.clone(),
-                    "peg_prealign_once": self.peg_prealign_once.clone(),
-                    "peg_partial_insert_once": self.peg_partial_insert_once.clone(),
-                    "peg_success_once": self.peg_success_once.clone(),
-                }
+            state["peg_event_state"] = snapshot_peg_insertion_event_state(
+                self.peg_event_state
             )
         return state
 
@@ -847,13 +580,11 @@ class ManiskillEnv(gym.Env):
             self.fail_once[mask] = state["fail_once"][mask]
             self.returns[mask] = state["returns"][mask]
         if self._is_peg_insertion_side:
-            self.peg_grasp_count[mask] = state["peg_grasp_count"][mask]
-            self.peg_consecutive_grasp_once[mask] = state[
-                "peg_consecutive_grasp_once"
-            ][mask]
-            self.peg_prealign_once[mask] = state["peg_prealign_once"][mask]
-            self.peg_partial_insert_once[mask] = state["peg_partial_insert_once"][mask]
-            self.peg_success_once[mask] = state["peg_success_once"][mask]
+            restore_peg_insertion_event_state(
+                self.peg_event_state,
+                state["peg_event_state"],
+                mask,
+            )
 
     def _zero_frozen_actions(self, actions, mask):
         if not mask.any():
@@ -1015,21 +746,15 @@ class ManiskillEnv(gym.Env):
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
-        if self.rlt_intervention_controller is not None:
-            infos_last = infos_list[-1]
-            policy_info = self.rlt_intervention_controller.update(
-                infos=infos_last,
-                chunk_dones=torch.logical_or(
-                    raw_chunk_terminations,
-                    raw_chunk_truncations,
-                ),
-                intervention_enabled=True,
-            )
-            infos_last["policy_info"] = policy_info
-            for key, value in policy_info.items():
-                if isinstance(value, torch.Tensor):
-                    infos_last[key] = value
-            infos_list[-1] = infos_last
+        apply_rlt_intervention_policy_info(
+            controller=self.rlt_intervention_controller,
+            infos_list=infos_list,
+            chunk_dones=torch.logical_or(
+                raw_chunk_terminations,
+                raw_chunk_truncations,
+            ),
+            intervention_enabled=True,
+        )
 
         if past_dones.any() and self.auto_reset:
             obs_list[-1], infos_list[-1] = self._handle_auto_reset(

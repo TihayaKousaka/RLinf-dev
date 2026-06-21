@@ -33,12 +33,7 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
-from rlinf.models.embodiment.openpi_rlt.rollout import extract_rlt_env_metrics
-from rlinf.models.embodiment.openpi_rlt.trajectory_adapter import (
-    build_rlt_step_trace_infos,
-    build_rlt_step_trace_obs,
-    should_build_rlt_step_trace,
-)
+from rlinf.models import get_env_worker_handler
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.metric_utils import compute_split_num
@@ -63,6 +58,7 @@ class EnvWorker(Worker):
         Worker.__init__(self)
 
         self.cfg = cfg
+        self.model_env_handler = get_env_worker_handler(self.cfg.actor.model)
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
@@ -528,13 +524,21 @@ class EnvWorker(Worker):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
-            if isinstance(infos, dict) and should_build_rlt_step_trace(
-                self.cfg.actor.model
+            if (
+                isinstance(infos, dict)
+                and self.model_env_handler is not None
+                and self.model_env_handler.should_build_step_trace()
             ):
-                infos["rlt_step_trace_obs"] = build_rlt_step_trace_obs(obs_list)
-                infos["rlt_step_trace_infos"] = build_rlt_step_trace_infos(
-                    infos_list,
-                    expected_trace_len=int(self.cfg.actor.model.num_action_chunks),
+                infos["rlt_step_trace_obs"] = (
+                    self.model_env_handler.build_step_trace_obs(obs_list)
+                )
+                infos["rlt_step_trace_infos"] = (
+                    self.model_env_handler.build_step_trace_infos(
+                        infos_list,
+                        expected_trace_len=int(
+                            self.cfg.actor.model.num_action_chunks
+                        ),
+                    )
                 )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         final_obs = (
@@ -586,7 +590,8 @@ class EnvWorker(Worker):
                 intervene_actions = final_info["intervene_action"]
                 intervene_flags = final_info["intervene_flag"]
 
-        env_info.update(extract_rlt_env_metrics(env_infos=infos))
+        if self.model_env_handler is not None:
+            env_info.update(self.model_env_handler.extract_env_metrics(env_infos=infos))
 
         env_output = EnvOutput(
             obs=extracted_obs,
@@ -1228,10 +1233,11 @@ class EnvWorker(Worker):
                     rollout_result = self.recv_rollout_results(
                         input_channel, mode="train"
                     )
-                    for key, value in extract_rlt_env_metrics(
-                        forward_inputs=rollout_result.forward_inputs,
-                    ).items():
-                        env_metrics[key].append(value)
+                    if self.model_env_handler is not None:
+                        for key, value in self.model_env_handler.extract_env_metrics(
+                            forward_inputs=rollout_result.forward_inputs,
+                        ).items():
+                            env_metrics[key].append(value)
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
