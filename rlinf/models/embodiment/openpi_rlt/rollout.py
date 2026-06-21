@@ -66,6 +66,36 @@ def human_source_mask(source_chunk) -> np.ndarray:
     )
 
 
+def extract_rlt_env_metrics(
+    *,
+    forward_inputs: dict[str, Any] | None = None,
+    env_infos: dict[str, Any] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Extract RLT rollout status metrics without teaching env worker RLT fields."""
+    metrics: dict[str, torch.Tensor] = {}
+
+    if isinstance(forward_inputs, dict):
+        metric_keys = (
+            ("intervention_flags", "expert_intervention_actual_rate"),
+            ("intervention_requested", "expert_intervention_requested_rate"),
+            ("ready_for_online", "rlt_ready_for_online"),
+            ("in_critical_phase", "rlt_in_critical_phase"),
+            ("record_transition", "rlt_record_transition"),
+            ("student_control", "student_control_rate"),
+        )
+        for forward_key, metric_key in metric_keys:
+            value = forward_inputs.get(forward_key)
+            if isinstance(value, torch.Tensor):
+                metrics[metric_key] = value.detach().float().reshape(-1).cpu()
+
+    policy_info = env_infos.get("policy_info") if isinstance(env_infos, dict) else None
+    deviation = policy_info.get("deviation") if isinstance(policy_info, dict) else None
+    if isinstance(deviation, torch.Tensor):
+        metrics["deviation_rate"] = deviation.detach().float().mean().reshape(1).cpu()
+
+    return metrics
+
+
 REQUIRED_RLT_STAGE2_FORWARD_INPUTS = (
     "x",
     "a_tilde",

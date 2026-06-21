@@ -694,3 +694,47 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 },
             }
         return route.actions, route.result
+
+    def predict_rollout_action_batch(
+        self,
+        *,
+        env_output: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+        allow_expert: bool = True,
+        expert_model_getter=None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Model-owned rollout entrypoint for RLT-specific routing metadata."""
+        actions, result = self.predict_action_batch(
+            env_obs=env_output["obs"],
+            mode=mode,
+            env_infos=env_output.get("env_infos", None),
+            allow_expert=allow_expert,
+            expert_model_getter=expert_model_getter,
+        )
+        save_flags = result.get("forward_inputs", {}).get("intervention_flags", None)
+        if save_flags is not None:
+            result["save_flags"] = save_flags
+        return actions, result
+
+    def get_rollout_policy_mode(
+        self,
+        *,
+        mode: Literal["train", "eval"],
+        env_cfg: Any | None = None,
+    ) -> str:
+        """Return the policy mode used by the generic HF rollout worker."""
+        if mode == "eval" and env_cfg is not None:
+            return str(env_cfg.get("policy_mode", mode))
+        return mode
+
+    def get_rollout_action_exec_chunks(
+        self,
+        *,
+        mode: Literal["train", "eval"],
+        env_cfg: Any | None = None,
+        default: int,
+    ) -> int:
+        """Return how many actions the env executes per rollout prediction."""
+        if mode == "eval" and env_cfg is not None:
+            return int(env_cfg.get("action_exec_chunks", default))
+        return int(default)

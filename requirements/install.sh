@@ -743,7 +743,7 @@ setup_mirror() {
     if [ "$USE_MIRRORS" -eq 1 ]; then
         export UV_PYTHON_INSTALL_MIRROR=https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download
         export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple
-        export HF_ENDPOINT=https://hf-mirror.com
+        export HF_ENDPOINT=https://hub.opencsg.com/hf
         export GITHUB_PREFIX="https://ghfast.top/"
         git config --global url."${GITHUB_PREFIX}github.com/".insteadOf "https://github.com/"
     fi

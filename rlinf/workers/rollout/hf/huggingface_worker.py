@@ -14,7 +14,6 @@
 
 import copy
 import gc
-import inspect
 import os
 from typing import Any, Literal
 
@@ -25,7 +24,6 @@ from tqdm import tqdm
 
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
-    EnvOutput,
     RolloutResult,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
@@ -76,35 +74,12 @@ class MultiStepRolloutWorker(Worker):
         )
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
         self.enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
-        self.eval_policy_mode = str(cfg.env.eval.get("policy_mode", "eval"))
-        if self.eval_policy_mode not in {"train", "eval"}:
-            raise ValueError(
-                "env.eval.policy_mode must be either 'train' or 'eval', got "
-                f"{self.eval_policy_mode!r}"
-            )
-        self.eval_action_exec_chunks = int(
-            cfg.env.eval.get("action_exec_chunks", cfg.actor.model.num_action_chunks)
-        )
-        if self.eval_action_exec_chunks <= 0:
-            raise ValueError(
-                "env.eval.action_exec_chunks must be positive, got "
-                f"{self.eval_action_exec_chunks}"
-            )
-        if cfg.env.eval.max_steps_per_rollout_epoch % self.eval_action_exec_chunks != 0:
-            raise ValueError(
-                "env.eval.max_steps_per_rollout_epoch must be divisible by "
-                "env.eval.action_exec_chunks, got "
-                f"{cfg.env.eval.max_steps_per_rollout_epoch} and "
-                f"{self.eval_action_exec_chunks}"
-            )
 
         self.n_train_chunk_steps = (
             cfg.env.train.max_steps_per_rollout_epoch
             // cfg.actor.model.num_action_chunks
         )
-        self.n_eval_chunk_steps = (
-            cfg.env.eval.max_steps_per_rollout_epoch // self.eval_action_exec_chunks
-        )
+        self.n_eval_chunk_steps = 0
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
@@ -136,6 +111,11 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model.eval()
         if self.expert_model is not None:
             self.expert_model.eval()
+        if self.enable_eval:
+            self.n_eval_chunk_steps = (
+                self.cfg.env.eval.max_steps_per_rollout_epoch
+                // self.get_action_exec_chunks("eval")
+            )
 
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
@@ -246,13 +226,8 @@ class MultiStepRolloutWorker(Worker):
         }
 
         if self._has_expert_model_config and self._use_dagger_expert_sampling():
-            intervention_cfg = self.cfg.algorithm.get("intervention", {})
-            default_beta = intervention_cfg.get(
-                "probability",
-                self.cfg.algorithm.get("dagger", {}).get("init_beta", 0.5),
-            )
             self._dagger_sampling_params = {
-                "beta": default_beta,
+                "beta": self.cfg.algorithm.get("dagger", {}).get("init_beta", 0.5),
                 "beta_schedule": self.cfg.algorithm.get("dagger", {}).get(
                     "beta_schedule", "exponential"
                 ),
@@ -287,15 +262,6 @@ class MultiStepRolloutWorker(Worker):
         if method is not None:
             return method()
         return self.hf_model.state_dict()
-
-    @staticmethod
-    def _filter_predict_kwargs(method, kwargs: dict[str, Any]) -> dict[str, Any]:
-        signature = inspect.signature(method)
-        return {
-            key: value
-            for key, value in kwargs.items()
-            if key in signature.parameters
-        }
 
     def _setup_dst_ranks(self, batch_size: int) -> list[tuple[int, int]]:
         """Compute env peer ranks for this rollout worker.
@@ -333,12 +299,7 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("predict")
     def predict(
-        self,
-        env_obs: dict[str, Any],
-        mode: Literal["train", "eval"] = "train",
-        *,
-        allow_expert: bool = True,
-        env_infos: dict[str, Any] | None = None,
+        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = (
             self._train_sampling_params
@@ -374,9 +335,8 @@ class MultiStepRolloutWorker(Worker):
 
         if (
             mode == "train"
-            and allow_expert
-            and self._has_expert_model_config
             and self._use_dagger_expert_sampling()
+            and self.expert_model is not None
         ):
             use_expert = torch.rand(1).item() < self._dagger_sampling_params["beta"]
         else:
@@ -384,73 +344,29 @@ class MultiStepRolloutWorker(Worker):
 
         with torch.no_grad():
             expert_label_flag = False
-            extra_kwargs = self._filter_predict_kwargs(
-                self.hf_model.predict_action_batch,
-                {
-                    "mode": mode,
-                    "env_infos": env_infos,
-                    "allow_expert": allow_expert,
-                    "expert_model_getter": (
-                        self._ensure_expert_model_loaded
-                        if self._has_expert_model_config
-                        else None
-                    ),
-                },
-            )
-            extra_kwargs = {
-                key: value for key, value in extra_kwargs.items() if key not in kwargs
-            }
             if use_expert:
-                expert_model = self._ensure_expert_model_loaded()
-                expert_kwargs = self._filter_predict_kwargs(
-                    expert_model.predict_action_batch,
-                    {
-                        "mode": mode,
-                    },
-                )
-                expert_kwargs = {
-                    key: value
-                    for key, value in expert_kwargs.items()
-                    if key not in kwargs
-                }
-                actions, result = expert_model.predict_action_batch(
+                actions, result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
-                    **expert_kwargs,
                 )
                 expert_label_flag = True
             else:
                 actions, result = self.hf_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
-                    **extra_kwargs,
                 )
-                expert_label_flag = bool(result.get("expert_label_flag", False))
 
             # Decide re-label or not
             if (
-                self._use_dagger_expert_sampling()
-                and not only_save_expert  # only re-label in classic dagger mode
+                not only_save_expert  # only re-label in classic dagger mode
                 and not use_expert  # only re-label if not using expert
-                and self._has_expert_model_config  # only re-label if expert exists
+                and self._use_dagger_expert_sampling()
+                and self.expert_model is not None  # only re-label if expert exists
                 and mode == "train"  # only re-label in train mode
             ):
-                expert_model = self._ensure_expert_model_loaded()
-                expert_kwargs = self._filter_predict_kwargs(
-                    expert_model.predict_action_batch,
-                    {
-                        "mode": mode,
-                    },
-                )
-                expert_kwargs = {
-                    key: value
-                    for key, value in expert_kwargs.items()
-                    if key not in kwargs
-                }
-                _, expert_result = expert_model.predict_action_batch(
+                _, expert_result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
-                    **expert_kwargs,
                 )
                 expert_forward_inputs = expert_result["forward_inputs"]
                 expert_target = expert_forward_inputs.get(
@@ -465,6 +381,64 @@ class MultiStepRolloutWorker(Worker):
 
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
+
+    def predict_rollout(
+        self,
+        env_output: dict[str, Any],
+        *,
+        mode: Literal["train", "eval"] = "train",
+        allow_expert: bool = True,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        method = getattr(self.hf_model, "predict_rollout_action_batch", None)
+        if method is None:
+            return self.predict(env_output["obs"], mode=mode)
+        return method(
+            env_output=env_output,
+            mode=mode,
+            allow_expert=allow_expert,
+            expert_model_getter=(
+                self._ensure_expert_model_loaded
+                if self._has_expert_model_config
+                else None
+            ),
+        )
+
+    def get_policy_mode(
+        self, mode: Literal["train", "eval"]
+    ) -> Literal["train", "eval"]:
+        env_cfg = self.cfg.env.eval if mode == "eval" else self.cfg.env.train
+        method = getattr(self.hf_model, "get_rollout_policy_mode", None)
+        policy_mode = (
+            method(mode=mode, env_cfg=env_cfg) if method is not None else mode
+        )
+        if policy_mode not in {"train", "eval"}:
+            raise ValueError(
+                "rollout policy mode must be either 'train' or 'eval', got "
+                f"{policy_mode!r}"
+            )
+        return policy_mode
+
+    def get_action_exec_chunks(self, mode: Literal["train", "eval"]) -> int:
+        env_cfg = self.cfg.env.eval if mode == "eval" else self.cfg.env.train
+        default = int(self.cfg.actor.model.num_action_chunks)
+        method = getattr(self.hf_model, "get_rollout_action_exec_chunks", None)
+        action_exec_chunks = (
+            method(mode=mode, env_cfg=env_cfg, default=default)
+            if method is not None
+            else default
+        )
+        action_exec_chunks = int(action_exec_chunks)
+        if action_exec_chunks <= 0:
+            raise ValueError(
+                f"rollout action_exec_chunks must be positive, got {action_exec_chunks}."
+            )
+        max_steps = int(env_cfg.max_steps_per_rollout_epoch)
+        if max_steps % action_exec_chunks != 0:
+            raise ValueError(
+                "env max_steps_per_rollout_epoch must be divisible by rollout "
+                f"action_exec_chunks, got {max_steps} and {action_exec_chunks}."
+            )
+        return action_exec_chunks
 
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
@@ -537,14 +511,9 @@ class MultiStepRolloutWorker(Worker):
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
-                actions, result = self.predict(
-                    env_output["obs"],
-                    env_infos=env_output.get("env_infos", None),
-                )
+                actions, result = self.predict_rollout(env_output)
 
-                save_flags = result.get("forward_inputs", {}).get(
-                    "intervention_flags", None
-                )
+                save_flags = result.get("save_flags", None)
                 if save_flags is None and result.get("expert_label_flag", False):
                     save_flags = torch.full(
                         (actions.shape[0], self.cfg.actor.model.num_action_chunks),
@@ -574,11 +543,7 @@ class MultiStepRolloutWorker(Worker):
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
         for _ in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
-            actions, result = self.predict(
-                env_output["obs"],
-                allow_expert=False,
-                env_infos=env_output.get("env_infos", None),
-            )
+            actions, result = self.predict_rollout(env_output, allow_expert=False)
 
             rollout_result = RolloutResult(
                 actions=actions,
@@ -612,6 +577,7 @@ class MultiStepRolloutWorker(Worker):
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
+        eval_policy_mode = self.get_policy_mode("eval")
         for _ in tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",
@@ -620,11 +586,10 @@ class MultiStepRolloutWorker(Worker):
             for _ in range(self.n_eval_chunk_steps):
                 for _ in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
-                    actions, _ = self.predict(
-                        env_output["obs"],
-                        mode=self.eval_policy_mode,
+                    actions, _ = self.predict_rollout(
+                        env_output,
+                        mode=eval_policy_mode,
                         allow_expert=False,
-                        env_infos=env_output.get("env_infos", None),
                     )
                     self.send_chunk_actions(output_channel, actions, mode="eval")
 
@@ -716,11 +681,63 @@ class MultiStepRolloutWorker(Worker):
     def _merge_obs_batches(obs_batches: list[dict[str, Any]]) -> dict[str, Any]:
         if not obs_batches:
             return {}
-        normalized_batches = [
-            obs_batch if "obs" in obs_batch else {"obs": obs_batch}
+        obs_dicts = [
+            obs_batch["obs"] if "obs" in obs_batch else obs_batch
             for obs_batch in obs_batches
         ]
-        return EnvOutput.merge_env_outputs(normalized_batches)
+        final_obs_list = [obs_batch.get("final_obs", None) for obs_batch in obs_batches]
+
+        def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
+            merged: dict[str, Any] = {}
+            for key in dicts[0].keys():
+                values = [obs_dict[key] for obs_dict in dicts]
+                first_non_none = next(
+                    (value for value in values if value is not None), None
+                )
+                if first_non_none is None:
+                    merged[key] = None
+                elif isinstance(first_non_none, torch.Tensor):
+                    merged[key] = torch.cat(values, dim=0)
+                elif isinstance(first_non_none, list):
+                    merged[key] = [item for sublist in values for item in sublist]
+                else:
+                    merged[key] = values
+            return merged
+
+        def _merge_nested_values(values: list[Any]) -> Any:
+            first_non_none = next((value for value in values if value is not None), None)
+            if first_non_none is None:
+                return None
+            if any(value is None for value in values):
+                raise ValueError(
+                    "Inconsistent env_infos field: some shards are None while "
+                    "others are present."
+                )
+            if isinstance(first_non_none, torch.Tensor):
+                return torch.cat(values, dim=0)
+            if isinstance(first_non_none, list):
+                return [item for value in values for item in value]
+            if isinstance(first_non_none, dict):
+                return {
+                    key: _merge_nested_values([value.get(key) for value in values])
+                    for key in set().union(*(value.keys() for value in values))
+                }
+            return values
+
+        merged_obs = _merge_obs_dicts(obs_dicts)
+        merged_final_obs = None
+        if any(final_obs is not None for final_obs in final_obs_list):
+            final_obs_or_obs = [
+                final_obs if final_obs is not None else obs_dict
+                for obs_dict, final_obs in zip(obs_dicts, final_obs_list)
+            ]
+            merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
+
+        merged = {"obs": merged_obs, "final_obs": merged_final_obs}
+        env_infos_list = [obs_batch.get("env_infos", None) for obs_batch in obs_batches]
+        if any(env_infos is not None for env_infos in env_infos_list):
+            merged["env_infos"] = _merge_nested_values(env_infos_list)
+        return merged
 
     @Worker.timer("rollout/send_actions")
     def send_chunk_actions(
