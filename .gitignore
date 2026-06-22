@@ -26,3 +26,4 @@ openpi-RLT/*
 tmp/*
 tmp
 openpi-RLT
+.claude/settings.json
