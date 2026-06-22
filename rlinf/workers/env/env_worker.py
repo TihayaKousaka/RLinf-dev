@@ -611,22 +611,6 @@ class EnvWorker(Worker):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
-            if (
-                isinstance(infos, dict)
-                and self.model_env_handler is not None
-                and self.model_env_handler.should_build_step_trace()
-            ):
-                infos["rlt_step_trace_obs"] = (
-                    self.model_env_handler.build_step_trace_obs(obs_list)
-                )
-                infos["rlt_step_trace_infos"] = (
-                    self.model_env_handler.build_step_trace_infos(
-                        infos_list,
-                        expected_trace_len=int(
-                            self.cfg.actor.model.num_action_chunks
-                        ),
-                    )
-                )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         final_obs = (
             self._build_chunk_final_obs(obs_list, infos_list)

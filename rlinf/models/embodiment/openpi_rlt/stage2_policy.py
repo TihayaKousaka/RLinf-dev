@@ -59,12 +59,6 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self.chunk_length = int(cfg.num_action_chunks)
         self.action_dim = int(cfg.action_dim)
         self.action_chunk_dim = self.chunk_length * self.action_dim
-        self.replay_subsample_stride = int(
-            stage2_cfg.get("replay_subsample_stride", 0)
-        )
-        self.replay_feature_batch_size = int(
-            stage2_cfg.get("replay_feature_batch_size", 0)
-        )
         if "proprio_dim" not in stage2_cfg:
             raise ValueError(
                 "RLT Stage2 requires rlt_stage2.proprio_dim to match the full "
@@ -255,15 +249,15 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self,
         env_obs: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x, a_tilde_flat, _ = self._prepare_features(env_obs)
+        x, a_tilde_flat = self._prepare_features(env_obs)
         return x, a_tilde_flat
 
     def _prepare_features(
         self,
         env_obs: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         self._require_feature_backbones("_prepare_features")
-        observation, processed_obs = self.vla.prepare_rlt_observation(env_obs)
+        observation, _ = self.vla.prepare_rlt_observation(env_obs)
         embeddings, pad_mask = self.vla.extract_rlt_prefix_embeddings(
             observation,
             dtype=torch.float32,
@@ -285,140 +279,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 f"observation.state dim={observation.state.shape[1]}."
             ) from exc
         x = torch.cat([z_rl.to(torch.float32), state], dim=-1)
-        return x, a_tilde_flat, processed_obs
-
-    @torch.no_grad()
-    def _encode_step_trace(
-        self,
-        trace_obs: dict[str, Any] | None,
-        *,
-        tokenized_prompt: torch.Tensor | None = None,
-        tokenized_prompt_mask: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        if not isinstance(trace_obs, dict) or not trace_obs:
-            return {}
-        states = trace_obs.get("states", None)
-        if not isinstance(states, torch.Tensor) or states.ndim < 3:
-            raise ValueError(
-                "RLT step trace obs must contain states with shape [B, S, ...], "
-                f"got {self._shape_str(states)}."
-            )
-        batch_size = int(states.shape[0])
-        trace_len = int(states.shape[1])
-        expected_batch = batch_size * trace_len
-        flat_obs: dict[str, Any] = {}
-        for key, value in trace_obs.items():
-            if key == "task_descriptions":
-                if value is None:
-                    flat_obs[key] = None
-                elif isinstance(value, list):
-                    flat_obs[key] = [
-                        item for item in value for _ in range(trace_len)
-                    ]
-                else:
-                    flat_obs[key] = value
-                continue
-            if isinstance(value, torch.Tensor):
-                if value.shape[0] != batch_size or value.shape[1] != trace_len:
-                    raise ValueError(
-                        f"RLT step trace obs[{key!r}] must have leading shape "
-                        f"[{batch_size}, {trace_len}], got {self._shape_str(value)}."
-                    )
-                flat_obs[key] = value.reshape(batch_size * trace_len, *value.shape[2:])
-            else:
-                flat_obs[key] = value
-        if (tokenized_prompt is None) != (tokenized_prompt_mask is None):
-            raise ValueError(
-                "RLT step trace prompt reuse requires both tokenized_prompt and "
-                "tokenized_prompt_mask."
-            )
-        if tokenized_prompt is not None and tokenized_prompt_mask is not None:
-            if tokenized_prompt.shape[0] != batch_size:
-                raise ValueError(
-                    "RLT step trace tokenized_prompt must have batch size "
-                    f"{batch_size}, got {self._shape_str(tokenized_prompt)}."
-                )
-            if tokenized_prompt_mask.shape[0] != batch_size:
-                raise ValueError(
-                    "RLT step trace tokenized_prompt_mask must have batch size "
-                    f"{batch_size}, got {self._shape_str(tokenized_prompt_mask)}."
-                )
-            flat_obs["tokenized_prompt"] = (
-                tokenized_prompt[:, None, ...]
-                .expand(batch_size, trace_len, *tokenized_prompt.shape[1:])
-                .reshape(expected_batch, *tokenized_prompt.shape[1:])
-            )
-            flat_obs["tokenized_prompt_mask"] = (
-                tokenized_prompt_mask[:, None, ...]
-                .expand(batch_size, trace_len, *tokenized_prompt_mask.shape[1:])
-                .reshape(expected_batch, *tokenized_prompt_mask.shape[1:])
-            )
-
-        def _slice_flat_obs(start: int, end: int) -> dict[str, Any]:
-            sliced: dict[str, Any] = {}
-            for key, value in flat_obs.items():
-                if isinstance(value, torch.Tensor) and value.shape[0] == expected_batch:
-                    sliced[key] = value[start:end]
-                elif isinstance(value, list) and len(value) == expected_batch:
-                    sliced[key] = value[start:end]
-                else:
-                    sliced[key] = value
-            return sliced
-
-        feature_batch_size = self.replay_feature_batch_size
-        if feature_batch_size > 0 and expected_batch > feature_batch_size:
-            x_batches: list[torch.Tensor] = []
-            a_tilde_batches: list[torch.Tensor] = []
-            for start in range(0, expected_batch, feature_batch_size):
-                end = min(start + feature_batch_size, expected_batch)
-                x_batch, a_tilde_batch, _ = self._prepare_features(
-                    _slice_flat_obs(start, end)
-                )
-                x_batches.append(x_batch)
-                a_tilde_batches.append(a_tilde_batch)
-            x = torch.cat(x_batches, dim=0)
-            a_tilde = torch.cat(a_tilde_batches, dim=0)
-        else:
-            x, a_tilde, _ = self._prepare_features(flat_obs)
-        if x.shape[0] != expected_batch or a_tilde.shape[0] != expected_batch:
-            raise ValueError(
-                "RLT step trace feature encoder must preserve flattened batch size "
-                f"{expected_batch}, got x={self._shape_str(x)} and "
-                f"a_tilde={self._shape_str(a_tilde)}."
-            )
-        return {
-            "x": x.reshape(batch_size, trace_len, -1).detach(),
-            "a_tilde": a_tilde.reshape(batch_size, trace_len, -1).detach(),
-        }
-
-    @staticmethod
-    def _normalize_step_record_trace(
-        record_trace: torch.Tensor | None,
-        *,
-        fallback_record: torch.Tensor,
-        chunk_length: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        batch_size = int(fallback_record.shape[0])
-        if not isinstance(record_trace, torch.Tensor):
-            record_trace = fallback_record
-        record_trace = record_trace.to(dtype=torch.bool, device=device)
-        if record_trace.numel() == 1:
-            return record_trace.reshape(1, 1, 1).expand(
-                batch_size,
-                chunk_length,
-                1,
-            )
-        record_trace = record_trace.reshape(batch_size, -1)
-        if record_trace.shape[1] == 1:
-            record_trace = record_trace.expand(-1, chunk_length)
-        if record_trace.shape[1] != chunk_length:
-            raise ValueError(
-                "RLT step trace record_transition must have shape [B], [B, 1], "
-                f"[B, {chunk_length}], or [B, {chunk_length}, 1], got "
-                f"{tuple(record_trace.shape)} after normalization."
-            )
-        return record_trace[:, :, None]
+        return x, a_tilde_flat
 
     def default_forward(self, **kwargs):
         raise NotImplementedError(
@@ -548,7 +409,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         del kwargs
 
-        x, a_tilde, processed_obs = self._prepare_features(env_obs)
+        x, a_tilde = self._prepare_features(env_obs)
         deterministic = mode == "eval"
         if deterministic or self.act_as_vla_reference:
             self.actor.eval()
@@ -609,82 +470,6 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             student_prediction=(actions, result),
         )
         route.result["expert_label_flag"] = route.expert_label_flag
-        forward_inputs = route.result["forward_inputs"]
-        if self.replay_subsample_stride > 0 and isinstance(env_infos, dict):
-            encoded_step_trace = self._encode_step_trace(
-                env_infos.get("rlt_step_trace_obs", None),
-                tokenized_prompt=processed_obs["tokenized_prompt"],
-                tokenized_prompt_mask=processed_obs["tokenized_prompt_mask"],
-            )
-            if (
-                encoded_step_trace
-                and encoded_step_trace["x"].shape[1] != self.chunk_length
-            ):
-                raise ValueError(
-                    "RLT step trace length must match chunk_length "
-                    f"{self.chunk_length}, got {encoded_step_trace['x'].shape[1]}."
-                )
-            if encoded_step_trace:
-                forward_inputs["rlt_step_trace"] = encoded_step_trace
-                forward_inputs["rlt_step_trace_valid"] = torch.ones(
-                    (action_flat.shape[0], 1),
-                    dtype=torch.bool,
-                    device=action_flat.device,
-                )
-            trace_infos = env_infos.get("rlt_step_trace_infos", None)
-            policy_trace_infos = (
-                trace_infos.get("policy_info", {})
-                if isinstance(trace_infos, dict)
-                else {}
-            )
-            record_trace = (
-                policy_trace_infos.get("record_transition")
-                if isinstance(policy_trace_infos, dict)
-                else None
-            )
-            record_trace = self._normalize_step_record_trace(
-                record_trace,
-                fallback_record=forward_inputs["record_transition"],
-                chunk_length=self.chunk_length,
-                device=action_flat.device,
-            )
-            forward_inputs["rlt_step_trace_infos"] = {
-                "policy_info": {
-                    "record_transition": record_trace.detach(),
-                },
-            }
-        if self.replay_subsample_stride > 0 and "rlt_step_trace" not in forward_inputs:
-            # The first rollout step has no previous chunk trace. Keep a typed
-            # placeholder so trajectory stacking preserves the trace schema; the
-            # adapter only consumes entries marked valid.
-            forward_inputs["rlt_step_trace"] = {
-                "x": x[:, None, :].expand(-1, self.chunk_length, -1).detach(),
-                "a_tilde": a_tilde[:, None, :].expand(
-                    -1,
-                    self.chunk_length,
-                    -1,
-                ).detach(),
-            }
-            forward_inputs["rlt_step_trace_valid"] = torch.zeros(
-                (action_flat.shape[0], 1),
-                dtype=torch.bool,
-                device=action_flat.device,
-            )
-        if (
-            self.replay_subsample_stride > 0
-            and "rlt_step_trace_infos" not in forward_inputs
-        ):
-            record_trace = self._normalize_step_record_trace(
-                None,
-                fallback_record=forward_inputs["record_transition"],
-                chunk_length=self.chunk_length,
-                device=action_flat.device,
-            )
-            forward_inputs["rlt_step_trace_infos"] = {
-                "policy_info": {
-                    "record_transition": record_trace.detach(),
-                },
-            }
         return route.actions, route.result
 
     def get_rollout_policy_mode(

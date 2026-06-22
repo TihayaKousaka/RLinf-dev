@@ -202,9 +202,6 @@ actor:
       online_q_weight: 0.15
       delta_weight: 0.1
       critic_updates_per_actor: 2
-      replay_subsample_stride: 0
-      replay_allow_terminal_partial: True
-      replay_feature_batch_size: 8
       buffer_capacity: 20000
       tau: 0.005
       gamma: 0.99

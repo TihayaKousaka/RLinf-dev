@@ -203,9 +203,6 @@ actor:
       online_q_weight: 0.15  # Q weight after ramp.
       delta_weight: 0.1  # Within-chunk delta penalty.
       critic_updates_per_actor: 2  # TD3 critic-to-actor ratio.
-      replay_subsample_stride: 0  # 0 keeps boundary-only replay.
-      replay_allow_terminal_partial: True  # Allow partial chunks only at terminal.
-      replay_feature_batch_size: 32  # Feature re-encode micro batch.
       buffer_capacity: 50000  # Replay cap for x/action/reward/reference.
       tau: 0.005
       gamma: 0.99

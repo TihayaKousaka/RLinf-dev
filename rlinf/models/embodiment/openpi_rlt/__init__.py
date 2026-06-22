@@ -21,12 +21,7 @@ from typing import Any
 
 from omegaconf import DictConfig
 
-from .rollout import (
-    build_rlt_step_trace_infos,
-    build_rlt_step_trace_obs,
-    extract_rlt_env_metrics,
-    should_build_rlt_step_trace,
-)
+from .rollout import extract_rlt_env_metrics
 
 
 @dataclass(frozen=True)
@@ -34,23 +29,6 @@ class OpenPIRLTEnvWorkerHandler:
     """Model-side EnvWorker extension for RLT Stage 2 metadata."""
 
     model_cfg: DictConfig
-
-    def should_build_step_trace(self) -> bool:
-        return should_build_rlt_step_trace(self.model_cfg)
-
-    def build_step_trace_obs(self, obs_list: Any) -> dict[str, Any] | None:
-        return build_rlt_step_trace_obs(obs_list)
-
-    def build_step_trace_infos(
-        self,
-        infos_list: Any,
-        *,
-        expected_trace_len: int | None = None,
-    ) -> dict[str, Any] | None:
-        return build_rlt_step_trace_infos(
-            infos_list,
-            expected_trace_len=expected_trace_len,
-        )
 
     def extract_env_metrics(
         self,

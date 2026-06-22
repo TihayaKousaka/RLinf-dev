@@ -143,16 +143,13 @@ def _scheduler_cfg() -> AttrDict:
     )
 
 
-def _replay_cfg(*, replay_subsample_stride: int = 0) -> AttrDict:
+def _replay_cfg() -> AttrDict:
     return AttrDict(
         actor=AttrDict(
             model=AttrDict(
                 num_action_chunks=2,
                 action_dim=2,
-                rlt_stage2=AttrDict(
-                    replay_subsample_stride=replay_subsample_stride,
-                    replay_allow_terminal_partial=True,
-                ),
+                rlt_stage2=AttrDict(),
             ),
         ),
         env=AttrDict(train=AttrDict(auto_reset=True)),
@@ -432,7 +429,7 @@ def test_stage2_feature_preparation_uses_openpi_rlt_methods_and_full_state():
         "tokenized_prompt": torch.ones((2, 4), dtype=torch.int64),
         "tokenized_prompt_mask": torch.ones((2, 4), dtype=torch.bool),
     }
-    x, a_tilde, processed = policy._prepare_features(env_obs)
+    x, a_tilde = policy._prepare_features(env_obs)
 
     assert [call[0] for call in policy.vla.calls] == [
         "prepare",
@@ -446,8 +443,6 @@ def test_stage2_feature_preparation_uses_openpi_rlt_methods_and_full_state():
         a_tilde,
         torch.arange(8, dtype=torch.float32).reshape(2, 4),
     )
-    assert processed["tokenized_prompt"].shape == (2, 4)
-
     padded_states = torch.cat(
         [
             states.to(torch.float32),
@@ -456,7 +451,7 @@ def test_stage2_feature_preparation_uses_openpi_rlt_methods_and_full_state():
         dim=1,
     )
     env_obs["states"] = padded_states
-    x_padded, _, _ = policy._prepare_features(env_obs)
+    x_padded, _ = policy._prepare_features(env_obs)
     torch.testing.assert_close(x_padded[:, 4:], states.to(torch.float32))
 
     env_obs["states"] = torch.zeros((2, 4), dtype=torch.float32)
@@ -746,11 +741,3 @@ def test_trajectory_adapter_emits_standard_replay_trajectories():
         second_inputs["action_chunk"].reshape(-1),
         torch.tensor([5.0, 6.0, 7.0, 8.0]),
     )
-
-
-def test_trajectory_adapter_requires_step_trace_for_stride_replay():
-    adapter = RLTStage2TrajectoryReplayAdapter(
-        _replay_cfg(replay_subsample_stride=1),
-    )
-    with pytest.raises(RuntimeError, match="rlt_step_trace"):
-        adapter.build_replay_trajectories(_synthetic_rollout_trajectory())
