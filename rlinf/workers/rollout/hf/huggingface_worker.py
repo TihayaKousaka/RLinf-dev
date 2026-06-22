@@ -450,8 +450,10 @@ class MultiStepRolloutWorker(Worker):
     ) -> dict[str, Any]:
         if not getattr(self.hf_model, "accepts_rollout_context", False):
             return {}
+        env_cfg = self.cfg.env.eval if mode == "eval" else self.cfg.env.train
         return {
             "mode": mode,
+            "env_cfg": env_cfg,
             "env_infos": env_infos,
             "allow_expert": allow_expert,
             "expert_model_getter": (

@@ -579,6 +579,78 @@ class EnvWorker(Worker):
             rewards=rewards,
         )
 
+    @staticmethod
+    def _mark_last_record_transition_if_env_recorded(
+        rollout_result: EmbodiedRolloutResult,
+        env_infos: dict[str, Any] | None,
+    ) -> None:
+        """Keep realworld boundary chunks when critical phase starts mid-chunk."""
+
+        if not rollout_result.forward_inputs or not isinstance(env_infos, dict):
+            return
+        last_forward_inputs = rollout_result.forward_inputs[-1]
+        previous_record = last_forward_inputs.get("record_transition")
+        if not isinstance(previous_record, torch.Tensor) or previous_record.numel() == 0:
+            return
+
+        batch_size = int(previous_record.reshape(previous_record.shape[0], -1).shape[0])
+        chunk_recorded = torch.zeros((batch_size, 1), dtype=torch.bool)
+        found_record_transition = False
+        policy_infos = [env_infos.get("policy_info")]
+        final_info = env_infos.get("final_info")
+        if isinstance(final_info, dict):
+            policy_infos.append(final_info.get("policy_info"))
+
+        for policy_info in policy_infos:
+            if not isinstance(policy_info, dict) or "record_transition" not in policy_info:
+                continue
+            env_record = torch.as_tensor(policy_info["record_transition"])
+            if env_record.numel() == 0:
+                continue
+            found_record_transition = True
+            if env_record.numel() == 1:
+                env_chunk_recorded = torch.full(
+                    (batch_size, 1),
+                    bool(env_record.reshape(-1)[0].item()),
+                    dtype=torch.bool,
+                )
+            else:
+                if env_record.numel() % batch_size != 0:
+                    raise ValueError(
+                        "Realworld RLT record_transition policy_info must be scalar or "
+                        f"reshape to batch size {batch_size}, got "
+                        f"{tuple(env_record.shape)}."
+                    )
+                env_chunk_recorded = env_record.reshape(batch_size, -1).to(
+                    torch.bool
+                ).any(
+                    dim=1,
+                    keepdim=True,
+                )
+            chunk_recorded |= env_chunk_recorded
+        if not found_record_transition:
+            return
+
+        previous_recorded = previous_record.reshape(batch_size, -1).to(torch.bool).any(
+            dim=1,
+            keepdim=True,
+        )
+        last_forward_inputs["record_transition"] = (
+            previous_recorded.cpu() | chunk_recorded.cpu()
+        ).contiguous()
+
+    def _mark_last_realworld_record_transition(
+        self,
+        stage_id: int,
+        env_output: EnvOutput,
+    ) -> None:
+        if str(self.cfg.env.train.env_type) != "realworld":
+            return
+        self._mark_last_record_transition_if_env_recorded(
+            self.rollout_results[stage_id],
+            env_output.env_infos,
+        )
+
     @Worker.timer("env_interact_step")
     def env_interact_step(
         self,
@@ -1280,6 +1352,7 @@ class EnvWorker(Worker):
                             env_output.intervene_actions,
                             env_output.intervene_flags,
                         )
+                    self._mark_last_realworld_record_transition(stage_id, env_output)
 
                     reward_model_output = None
                     if reward_channel is not None and chunk_step_idx != 0:
@@ -1359,6 +1432,7 @@ class EnvWorker(Worker):
                         env_output.intervene_actions,
                         env_output.intervene_flags,
                     )
+                self._mark_last_realworld_record_transition(stage_id, env_output)
 
                 reward_model_output = None
                 if reward_channel is not None:

@@ -393,6 +393,7 @@ class RLTStage2RolloutRouteConfig:
     allow_expert: bool
     chunk_length: int
     action_dim: int
+    in_critical_phase_default: bool = True
 
 
 @dataclass(frozen=True)
@@ -448,7 +449,7 @@ def route_rlt_stage2_rollout(
         "in_critical_phase",
         batch_size=batch_size,
         device=student_actions.device,
-        default=True,
+        default=cfg.in_critical_phase_default,
     )
     record_transition = _bool_policy_info(
         policy_info,

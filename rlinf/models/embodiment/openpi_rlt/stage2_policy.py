@@ -401,6 +401,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self,
         env_obs,
         mode: Literal["train", "eval"] = "train",
+        env_cfg: Any | None = None,
         env_infos: dict[str, Any] | None = None,
         allow_expert: bool = True,
         expert_model_getter=None,
@@ -466,6 +467,11 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 ),
                 chunk_length=self.chunk_length,
                 action_dim=self.action_dim,
+                in_critical_phase_default=not (
+                    mode == "train"
+                    and env_cfg is not None
+                    and str(env_cfg.get("env_type", "")) == "realworld"
+                ),
             ),
             student_prediction=(actions, result),
         )
