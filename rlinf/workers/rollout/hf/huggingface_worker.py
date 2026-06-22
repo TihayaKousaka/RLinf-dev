@@ -101,22 +101,9 @@ class MultiStepRolloutWorker(Worker):
 
         self.n_train_chunk_steps = (
             cfg.env.train.max_steps_per_rollout_epoch
-<<<<<<< HEAD
             // cfg.actor.model.num_action_chunks
         )
         self.n_eval_chunk_steps = 0
-=======
-            // self.model_cfg.num_action_chunks
-            if self.enable_train
-            else 0
-        )
-        self.n_eval_chunk_steps = 0
-        if self.enable_eval:
-            self.n_eval_chunk_steps = (
-                cfg.env.eval.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
-            )
->>>>>>> upstream/main
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
@@ -143,12 +130,10 @@ class MultiStepRolloutWorker(Worker):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             self.hf_model.load_state_dict(model_dict)
 
-<<<<<<< HEAD
         if self._has_expert_model_config:
             self._expert_model_config = self._build_expert_model_config()
             if self._use_dagger_expert_sampling():
                 self._ensure_expert_model_loaded()
-=======
         if self.cfg.rollout.get("expert_model", None):
             expert_model_config = copy.deepcopy(self.model_cfg)
             with open_dict(expert_model_config):
@@ -161,7 +146,6 @@ class MultiStepRolloutWorker(Worker):
             if self.cfg.runner.get("expert_ckpt_path", None):
                 expert_model_dict = torch.load(self.cfg.runner.expert_ckpt_path)
                 self.expert_model.load_state_dict(expert_model_dict)
->>>>>>> upstream/main
 
         self.hf_model.eval()
         if self.expert_model is not None:

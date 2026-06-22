@@ -117,42 +117,34 @@ class EnvWorker(Worker):
             if train_env_cfg is not None
             else False
         )
-<<<<<<< HEAD
-        self.enable_eval = self.cfg.runner.val_check_interval > 0 or self.only_eval
-        self.eval_action_exec_chunks = int(
-            self.cfg.env.eval.get(
-                "action_exec_chunks", self.cfg.actor.model.num_action_chunks
-            )
-        )
-        if self.eval_action_exec_chunks <= 0:
-            raise ValueError(
-                "env.eval.action_exec_chunks must be positive, got "
-                f"{self.eval_action_exec_chunks}"
-            )
-        if (
-            self.cfg.env.eval.max_steps_per_rollout_epoch
-            % self.eval_action_exec_chunks
-            != 0
-        ):
-            raise ValueError(
-                "env.eval.max_steps_per_rollout_epoch must be divisible by "
-                "env.eval.action_exec_chunks, got "
-                f"{self.cfg.env.eval.max_steps_per_rollout_epoch} and "
-                f"{self.eval_action_exec_chunks}"
-            )
-        if not self.only_eval:
-            if train_env_cfg is None:
-                raise ValueError(
-                    "env.train config is required when runner.only_eval=False."
-                )
-=======
         self.eval_enable_offload = (
             eval_env_cfg.get("enable_offload", False)
             if eval_env_cfg is not None
             else False
         )
+        if self.enable_eval:
+            self.eval_action_exec_chunks = int(
+                self.cfg.env.eval.get(
+                    "action_exec_chunks", self.cfg.actor.model.num_action_chunks
+                )
+            )
+            if self.eval_action_exec_chunks <= 0:
+                raise ValueError(
+                    "env.eval.action_exec_chunks must be positive, got "
+                    f"{self.eval_action_exec_chunks}"
+                )
+            if (
+                self.cfg.env.eval.max_steps_per_rollout_epoch
+                % self.eval_action_exec_chunks
+                != 0
+            ):
+                raise ValueError(
+                    "env.eval.max_steps_per_rollout_epoch must be divisible by "
+                    "env.eval.action_exec_chunks, got "
+                    f"{self.cfg.env.eval.max_steps_per_rollout_epoch} and "
+                    f"{self.eval_action_exec_chunks}"
+                )
         if self.enable_train:
->>>>>>> upstream/main
             self.train_num_envs_per_stage = (
                 self.cfg.env.train.total_num_envs // self._world_size // self.stage_num
             )
@@ -166,20 +158,14 @@ class EnvWorker(Worker):
                 self.cfg.env.train.max_steps_per_rollout_epoch
                 // self.model_cfg.num_action_chunks
             )
-<<<<<<< HEAD
-        self.n_eval_chunk_steps = (
-            self.cfg.env.eval.max_steps_per_rollout_epoch
-            // self.eval_action_exec_chunks
-=======
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
             self.n_eval_chunk_steps = (
                 self.cfg.env.eval.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+                // self.eval_action_exec_chunks
             )
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
->>>>>>> upstream/main
         )
         if self.use_training_pipeline and self.enable_train:
             self._init_pipeline_params()
@@ -229,7 +215,6 @@ class EnvWorker(Worker):
                 env_cfg=self.cfg.env.eval,
                 num_envs_per_stage=self.eval_num_envs_per_stage,
             )
-<<<<<<< HEAD
             self.log_info(
                 "Eval action scheduling: "
                 f"model_num_action_chunks={self.cfg.actor.model.num_action_chunks}, "
@@ -240,16 +225,12 @@ class EnvWorker(Worker):
                 f"max_steps_per_rollout_epoch="
                 f"{self.cfg.env.eval.max_steps_per_rollout_epoch}"
             )
-        if not self.only_eval:
-            self._init_env()
-=======
             if self.eval_enable_offload:
                 assert all(hasattr(env, "offload") for env in self.eval_env_list), (
                     "eval envs must have an offload method to enable offload!"
                 )
 
         if self.enable_train:
->>>>>>> upstream/main
             if self.reward_mode == "history_buffer":
                 self.train_history_managers = [
                     HistoryManager(self.cfg.reward, self.train_num_envs_per_stage)
@@ -524,21 +505,13 @@ class EnvWorker(Worker):
 
     def _init_env(self):
         for i in range(self.stage_num):
-<<<<<<< HEAD
-            if self.cfg.env.train.auto_reset:
-                extracted_obs, infos = self.env_list[i].reset()
-                self.last_obs_list.append(extracted_obs)
-                self.last_env_infos_list.append(
-                    infos if isinstance(infos, dict) else None
-                )
-                self.last_intervened_info_list.append((None, None))
-            if self.enable_offload and hasattr(self.env_list[i], "offload"):
-                self.env_list[i].offload()
-=======
             if self.enable_train:
                 if self.cfg.env.train.auto_reset:
-                    extracted_obs, _ = self.env_list[i].reset()
+                    extracted_obs, infos = self.env_list[i].reset()
                     self.last_obs_list.append(extracted_obs)
+                    self.last_env_infos_list.append(
+                        infos if isinstance(infos, dict) else None
+                    )
                     self.last_intervened_info_list.append((None, None))
                 if self.train_enable_offload and self.cfg.env.train.get(
                     "enable_init_offload", True
@@ -547,7 +520,6 @@ class EnvWorker(Worker):
             if self.enable_eval:
                 if self.eval_enable_offload:
                     self.eval_env_list[i].offload()
->>>>>>> upstream/main
 
     @staticmethod
     def _shape_str(value) -> str:
