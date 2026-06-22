@@ -276,6 +276,9 @@ def test_stage1_policy_trains_only_rl_token_reconstruction(monkeypatch):
     assert not hasattr(policy, "trainable_vla_parameters")
     assert output["loss"].requires_grad is True
     assert output["z_rl"].shape == (2, 4)
+    assert "vla" not in policy._modules
+    assert "rl_token_model" in policy._modules
+    assert all(name.startswith("rl_token_model.") for name, _ in policy.named_parameters())
 
 
 def test_vla_sft_worker_handles_rlt_stage1_openpi_batches():

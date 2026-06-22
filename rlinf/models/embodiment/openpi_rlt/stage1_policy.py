@@ -41,7 +41,7 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
 
         stage1_cfg = cfg.rlt_stage1
 
-        self.vla = build_openpi_rlt_backbone(
+        vla = build_openpi_rlt_backbone(
             model_path=cfg.model_path,
             config_name=stage1_cfg.config_name,
             norm_stats_path=stage1_cfg.get("norm_stats_path", None),
@@ -52,6 +52,10 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
             device=self.device,
             freeze=True,
         )
+        # Keep the frozen VLA out of PyTorch's module tree so FSDP only flattens
+        # the trainable RL-token module. The backbone is already on-device and
+        # remains accessible through ``self.vla`` for feature extraction.
+        object.__setattr__(self, "vla", vla)
 
         self.rl_token_model = RLTokenModel(
             embedding_dim=int(stage1_cfg.get("embedding_dim", 2048)),
@@ -69,6 +73,32 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
         raise NotImplementedError(
             f"Unsupported forward_type for RLT Stage 1: {forward_type}"
         )
+
+    def named_parameters(
+        self,
+        prefix: str = "",
+        recurse: bool = True,
+        remove_duplicate: bool = True,
+    ):
+        """Expose only RL-token parameters to FSDP/optimizer.
+
+        The VLA backbone is a frozen feature extractor in Stage 1. Keeping it out
+        of FSDP flattening avoids mixing its bf16 parameters with the fp32
+        RL-token module while preserving the same forward computation.
+        """
+
+        rl_token_prefix = f"{prefix}.rl_token_model" if prefix else "rl_token_model"
+        yield from self.rl_token_model.named_parameters(
+            prefix=rl_token_prefix,
+            recurse=recurse,
+            remove_duplicate=remove_duplicate,
+        )
+
+    def parameters(self, recurse: bool = True):
+        yield from self.rl_token_model.parameters(recurse=recurse)
+
+    def trainable_parameters(self):
+        return self.rl_token_model.parameters()
 
     def sft_forward(self, data: dict[str, Any], **kwargs) -> dict[str, torch.Tensor]:
         observation = data["observation"]
