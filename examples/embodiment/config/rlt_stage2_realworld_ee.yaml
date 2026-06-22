@@ -122,7 +122,7 @@ env:
     max_steps_per_rollout_epoch: 100
     # Teleoperation backend for human_override intervention.
     # Current realworld Franka wrappers support SpaceMouse and GELLO.
-    use_spacemouse: False
+    use_spacemouse: True
     # Keep disabled until a real GELLO serial port is known. /dev/ttyUSB0 is Robotiq.
     use_gello: False
     gello_port: null

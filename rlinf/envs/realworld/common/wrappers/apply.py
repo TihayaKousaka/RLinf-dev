@@ -21,18 +21,6 @@ from typing import Any, Mapping, Optional
 import gymnasium as gym
 
 from rlinf.envs.realworld.common.wrappers.critical_phase import CriticalPhaseWrapper
-from rlinf.envs.realworld.common.wrappers.dual_euler_obs import (
-    DualQuat2EulerWrapper,
-)
-from rlinf.envs.realworld.common.wrappers.dual_gello_intervention import (
-    DualGelloIntervention,
-)
-from rlinf.envs.realworld.common.wrappers.dual_relative_frame import (
-    DualRelativeFrame,
-)
-from rlinf.envs.realworld.common.wrappers.dual_spacemouse_intervention import (
-    DualSpacemouseIntervention,
-)
 from rlinf.envs.realworld.common.wrappers.dual_gello_joint_intervention import (
     DualGelloJointIntervention,
 )
@@ -153,7 +141,6 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
             )
         env = GelloIntervention(env, port=gello_port, gripper_enabled=gripper_enabled)
 
-    env = _apply_keyboard_reward(env, cfg.get("keyboard_reward_wrapper", None))
     env = _apply_rlt_critical_phase(env, cfg)
 
     if cfg.get("use_relative_frame", True):
