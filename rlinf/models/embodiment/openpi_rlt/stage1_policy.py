@@ -74,29 +74,6 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
             f"Unsupported forward_type for RLT Stage 1: {forward_type}"
         )
 
-    def named_parameters(
-        self,
-        prefix: str = "",
-        recurse: bool = True,
-        remove_duplicate: bool = True,
-    ):
-        """Expose only RL-token parameters to FSDP/optimizer.
-
-        The VLA backbone is a frozen feature extractor in Stage 1. Keeping it out
-        of FSDP flattening avoids mixing its bf16 parameters with the fp32
-        RL-token module while preserving the same forward computation.
-        """
-
-        rl_token_prefix = f"{prefix}.rl_token_model" if prefix else "rl_token_model"
-        yield from self.rl_token_model.named_parameters(
-            prefix=rl_token_prefix,
-            recurse=recurse,
-            remove_duplicate=remove_duplicate,
-        )
-
-    def parameters(self, recurse: bool = True):
-        yield from self.rl_token_model.parameters(recurse=recurse)
-
     def trainable_parameters(self):
         return self.rl_token_model.parameters()
 
