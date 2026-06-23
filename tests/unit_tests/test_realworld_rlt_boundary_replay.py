@@ -22,7 +22,14 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("omegaconf")
 
+if "gymnasium" not in sys.modules:
+    sys.modules["gymnasium"] = MagicMock()
+if "rlinf.envs.wrappers" not in sys.modules:
+    sys.modules["rlinf.envs.wrappers"] = MagicMock()
+
 from rlinf.data.embodied_io_struct import ChunkStepResult, EmbodiedRolloutResult
+from rlinf.envs.realworld.common.wrappers import critical_phase as critical_phase_module
+from rlinf.envs.realworld.common.wrappers.critical_phase import CriticalPhaseWrapper
 from rlinf.models.embodiment.openpi_rlt.rollout import (
     COLLECTION_PHASE_ONLINE,
     COLLECTION_PHASE_WARMUP,
@@ -36,11 +43,6 @@ from rlinf.models.embodiment.openpi_rlt.trajectory_adapter import (
     RLTStage2TrajectoryReplayAdapter,
 )
 
-if "gymnasium" not in sys.modules:
-    sys.modules["gymnasium"] = MagicMock()
-if "rlinf.envs.wrappers" not in sys.modules:
-    sys.modules["rlinf.envs.wrappers"] = MagicMock()
-
 from rlinf.workers.env.env_worker import EnvWorker  # noqa: E402
 
 
@@ -50,6 +52,32 @@ class AttrDict(dict):
             return self[item]
         except KeyError as exc:
             raise AttributeError(item) from exc
+
+
+class DummyRealWorldEnv:
+    def __init__(self):
+        self.config = AttrDict(is_dummy=False)
+        self.unwrapped = self
+        self.step_count = 0
+
+    def reset(self, *, seed=None, options=None):
+        del seed, options
+        return {}, {}
+
+    def step(self, action):
+        self.step_count += 1
+        return {}, 0.0, False, False, {}
+
+
+class FakeKeyboardListener:
+    def __init__(self):
+        self.press_batches: list[list[str]] = [["v"]]
+        self.drained_on_reset = False
+
+    def pop_pressed_keys(self) -> list[str]:
+        if self.press_batches:
+            return self.press_batches.pop(0)
+        return []
 
 
 class FakeStage2Student:
@@ -159,6 +187,33 @@ def _append_routed_chunk(
             intervene_actions=human_action,
             intervene_flags=human_flags,
         )
+
+
+def test_critical_phase_key_uses_edge_press_queue(monkeypatch):
+    listeners: list[FakeKeyboardListener] = []
+
+    def _make_listener():
+        listener = FakeKeyboardListener()
+        listeners.append(listener)
+        return listener
+
+    monkeypatch.setattr(critical_phase_module, "KeyboardListener", _make_listener)
+
+    env = CriticalPhaseWrapper(
+        DummyRealWorldEnv(),
+        task_mode="full_task",
+        critical_phase_key="v",
+        record_prefix_before_critical_phase=False,
+    )
+    _obs, info = env.reset()
+    assert info["record_transition"] is False
+    assert listeners[0].press_batches == []
+
+    listeners[0].press_batches.append(["v"])
+    _obs, _reward, _terminated, _truncated, info = env.step(None)
+
+    assert info["in_critical_phase"] is True
+    assert info["record_transition"] is True
 
 
 def test_realworld_boundary_chunk_enters_replay_without_faking_rl_source():

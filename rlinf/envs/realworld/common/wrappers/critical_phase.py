@@ -62,11 +62,11 @@ class CriticalPhaseWrapper(gym.Wrapper):
             or self.task_mode != "full_task"
             else KeyboardListener()
         )
-        self._key_was_down = False
 
     def reset(self, *, seed=None, options=None):
         self.in_critical_phase = self.task_mode == "critical_phase"
-        self._key_was_down = False
+        if self._listener is not None:
+            self._listener.pop_pressed_keys()
         observation, info = self.env.reset(seed=seed, options=options)
         self._inject_policy_info(info)
         return observation, info
@@ -85,15 +85,16 @@ class CriticalPhaseWrapper(gym.Wrapper):
     def _poll_critical_phase_key(self) -> None:
         if self._listener is None:
             return
-        key = self._listener.get_key()
-        is_down = key == self.critical_phase_key
-        if is_down and not self._key_was_down:
-            self.enter_critical_phase()
-            print(
-                "Critical phase entered via key "
-                f"{self.critical_phase_key!r}; actor control/replay is now enabled."
-            )
-        self._key_was_down = is_down
+        for key in self._listener.pop_pressed_keys():
+            if key != self.critical_phase_key:
+                continue
+            if not self.in_critical_phase:
+                self.enter_critical_phase()
+                print(
+                    "Critical phase entered via key "
+                    f"{self.critical_phase_key!r}; actor control/replay is now enabled."
+                )
+            break
 
     def _inject_policy_info(self, info: dict[str, Any]) -> None:
         record_transition = (

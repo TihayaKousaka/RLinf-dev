@@ -20,7 +20,9 @@ from rlinf.config import EMBODIED_MODEL, SupportedModel, torch_dtype_from_precis
 from rlinf.scheduler import Worker
 
 ModelBuilder = Callable[[DictConfig, Optional[object]], object]
+EnvWorkerHandlerBuilder = Callable[[DictConfig], Any | None]
 _MODEL_REGISTRY: dict[str, ModelBuilder] = {}
+_ENV_WORKER_HANDLER_REGISTRY: dict[str, EnvWorkerHandlerBuilder] = {}
 
 
 def register_model(
@@ -28,18 +30,27 @@ def register_model(
     model_builder: ModelBuilder,
     category: str = "embodied",
     force: bool = False,
+    env_worker_handler_builder: EnvWorkerHandlerBuilder | None = None,
 ):
     """Register a model builder for cfg.model_type."""
     if not model_type:
         raise ValueError("model_type must be a non-empty string.")
     if not callable(model_builder):
         raise TypeError("model_builder must be callable.")
+    if env_worker_handler_builder is not None and not callable(
+        env_worker_handler_builder
+    ):
+        raise TypeError("env_worker_handler_builder must be callable.")
     if not force and model_type in _MODEL_REGISTRY:
         raise ValueError(
             f"Model type `{model_type}` is already registered. "
             "Set force=True to override it."
         )
     _MODEL_REGISTRY[model_type] = model_builder
+    if env_worker_handler_builder is None:
+        _ENV_WORKER_HANDLER_REGISTRY.pop(model_type, None)
+    else:
+        _ENV_WORKER_HANDLER_REGISTRY[model_type] = env_worker_handler_builder
     SupportedModel.register(model_type, force=force)
     if category == "embodied":
         EMBODIED_MODEL.add(SupportedModel(model_type))
@@ -140,6 +151,11 @@ def _register_builtin_models():
         from rlinf.models.embodiment.openpi_rlt import get_model
 
         return get_model(cfg, torch_dtype)
+
+    def _build_rlt_stage2_env_worker_handler(model_cfg: DictConfig):
+        from rlinf.models.embodiment.openpi_rlt import get_env_worker_handler
+
+        return get_env_worker_handler(model_cfg)
 
     register_model(
         SupportedModel.OPENVLA.value,
@@ -248,6 +264,7 @@ def _register_builtin_models():
         _build_rlt_stage2,
         category="embodied",
         force=True,
+        env_worker_handler_builder=_build_rlt_stage2_env_worker_handler,
     )
     register_model(    
         SupportedModel.GR00T_N1D7.value,
@@ -330,11 +347,10 @@ def get_env_worker_handler(model_cfg: DictConfig) -> Any | None:
     if model_cfg is None:
         return None
     model_type = str(model_cfg.get("model_type", ""))
-    if model_type == SupportedModel.RLT_STAGE2.value:
-        from rlinf.models.embodiment.openpi_rlt import get_env_worker_handler
-
-        return get_env_worker_handler(model_cfg)
-    return None
+    handler_builder = _ENV_WORKER_HANDLER_REGISTRY.get(model_type)
+    if handler_builder is None:
+        return None
+    return handler_builder(model_cfg)
 
 
 def tag_vlm_subtree(model, is_vlm: bool):

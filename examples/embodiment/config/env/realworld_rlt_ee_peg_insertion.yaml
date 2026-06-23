@@ -40,7 +40,7 @@ override_cfg:
   task_description: "insert the peg in the hole"
   target_ee_pose: [0.60283899, -0.30243948, 0.42646784, 2.93922733, -0.03996551, -1.67041543]
   joint_reset_qpos: [0.0677, 0.1155, 0.1334, -1.5898, 0.1972, 2.1341, -0.5112]
-  reward_threshold: [0.015, 0.015, 0.03, 0.2, 0.2, 0.2]
+  reward_threshold: [0.01, 0.01, 0.01, 0.2, 0.2, 0.2]
   use_dense_reward: false
   reward_scale: 1.0
   enable_gripper_penalty: false
