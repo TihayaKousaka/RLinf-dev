@@ -249,10 +249,10 @@ cd /Users/lixiaoqun/Downloads/pixiv/rlt-openpi-sim/RLinf-dev
 
 PYTHONPATH=$(pwd) \
 python toolkits/realworld_rlt/evaluate_stage1_reconstruction.py \
-  --dataset-path <你的数据集路径> \
-  --vla-checkpoint logs/rlt_realworld_ee_pi05_sft/checkpoints/global_step_5000/actor \
-  --rl-token-checkpoint logs/rlt_stage1_realworld_ee/checkpoints/global_step_5000/actor/rl_token/rl_token_model.pt \
-  --norm-stats-path <你的 norm_stats.json 路径>
+  --dataset-path /mnt/public2/xiekaizhi/rlt-openpi-sim/data/realworld_ee_lerobot \
+  --vla-checkpoint /mnt/public2/xiekaizhi/rlt-openpi-sim/tmp/RLinf-dev/logs/rlt-realworld-ee-sft-step-2500/global_step_5000/actor \
+  --rl-token-checkpoint /mnt/public2/xiekaizhi/rlt-openpi-sim/tmp/RLinf-dev/logs/20260622-20:22:35/rlt_stage1_realworld_ee/checkpoints/global_step_15000/actor/rl_token/rl_token_model.pt \
+  --norm-stats-path /mnt/public2/xiekaizhi/rlt-openpi-sim/data/realworld_ee_lerobot/norm_stats.json
 ```
 
 ## 六、Stage2

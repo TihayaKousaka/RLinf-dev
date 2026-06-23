@@ -15,7 +15,7 @@
 import asyncio
 import gc
 from collections import defaultdict
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -959,6 +959,23 @@ class EnvWorker(Worker):
             reward_env_infos[key] = clone_nested_to_cpu(env_infos[key])
         return reward_env_infos
 
+    def _select_rollout_env_infos(
+        self, env_infos: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Keep only rollout-safe env info fields needed by RLT policies.
+
+        Upstream batch routing only supports tensors/arrays/lists/dicts. Realworld
+        ``env_infos`` may still contain raw Python bools nested under unrelated
+        fields, so only forward the normalized ``policy_info`` subtree that
+        Stage2 rollout actually consumes.
+        """
+        if not isinstance(env_infos, dict):
+            return None
+        policy_info = env_infos.get("policy_info")
+        if not isinstance(policy_info, dict):
+            return None
+        return {"policy_info": clone_nested_to_cpu(policy_info)}
+
     def _scatter_terminal_reward_output(
         self,
         env_output: EnvOutput,
@@ -1066,7 +1083,7 @@ class EnvWorker(Worker):
                 data={
                     "obs": env_batch["obs"],
                     "final_obs": env_batch["final_obs"],
-                    "env_infos": env_batch["env_infos"],
+                    "env_infos": self._select_rollout_env_infos(env_batch["env_infos"]),
                 },
                 mode="train",
                 tag="rollout_results",
@@ -1218,7 +1235,9 @@ class EnvWorker(Worker):
                         data={
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
-                            "env_infos": env_batch["env_infos"],
+                            "env_infos": self._select_rollout_env_infos(
+                                env_batch["env_infos"]
+                            ),
                         },
                         mode="train",
                         tag="rollout_results",
@@ -1368,7 +1387,9 @@ class EnvWorker(Worker):
                         data={
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
-                            "env_infos": env_batch["env_infos"],
+                            "env_infos": self._select_rollout_env_infos(
+                                env_batch["env_infos"]
+                            ),
                         },
                         mode="eval",
                         tag="rollout_results",
@@ -1419,7 +1440,9 @@ class EnvWorker(Worker):
                         data={
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
-                            "env_infos": env_batch["env_infos"],
+                            "env_infos": self._select_rollout_env_infos(
+                                env_batch["env_infos"]
+                            ),
                         },
                         mode="eval",
                         tag="rollout_results",
