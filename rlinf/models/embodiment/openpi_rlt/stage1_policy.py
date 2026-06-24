@@ -68,6 +68,23 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
             decoder_layers=int(stage1_cfg.get("decoder_layers", 2)),
             decoder_heads=int(stage1_cfg.get("decoder_heads", 8)),
         ).to(self.device)
+        # Keep the RL-token block as its own FSDP wrap unit so joint Stage 1
+        # finetuning does not flatten its float32 parameters together with the
+        # OpenPI backbone's bfloat16 parameters.
+        self.rl_token_model._fsdp_wrap_name = "rl_token_model"
+
+    @property
+    def _no_split_modules(self) -> list[str]:
+        if self.alpha <= 0.0:
+            return []
+        return list(getattr(self.vla, "_no_split_modules", []))
+
+    @property
+    def _no_split_names(self) -> list[str]:
+        names = ["rl_token_model"]
+        if self.alpha > 0.0:
+            names.extend(getattr(self.vla, "_no_split_names", []))
+        return list(dict.fromkeys(names))
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.SFT:

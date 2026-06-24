@@ -13,7 +13,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0-0
+    actor,env,rollout: all
 
 runner:
   task_type: sft
@@ -39,13 +39,13 @@ algorithm:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 8
-  global_batch_size: 64
+  micro_batch_size: 32
+  global_batch_size: 256
   seed: 0
 
   model:
     precision: null
-    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260530-22:57:46/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_2000/actor"
+    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/pi05_base"
     num_action_chunks: 10
     action_dim: 8
     rlt_stage1:
@@ -61,7 +61,7 @@ actor:
       decoder_heads: 8
 
   openpi_data:
-    repo_id: "/mnt/public2/xiekaizhi/rlt-openpi-sim/rlt_maniskill_joint"
+    repo_id: "rlt_maniskill_joint"
     norm_stats_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/rlt_maniskill_joint/norm_stats.json"
     default_prompt: "insert the peg in the hole"
 
