@@ -140,7 +140,6 @@ env:
     max_episode_steps: 250
     max_steps_per_rollout_epoch: 250
     policy_mode: eval
-    action_exec_chunks: 10
     # Teleoperation backend for optional eval-time intervention/debugging.
     use_spacemouse: False
     use_gello: False

@@ -76,6 +76,7 @@ class CriticalPhaseWrapper(gym.Wrapper):
     ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
         self._poll_critical_phase_key()
         observation, reward, terminated, truncated, info = self.env.step(action)
+        self._poll_critical_phase_key()
         self._inject_policy_info(info)
         return observation, reward, terminated, truncated, info
 

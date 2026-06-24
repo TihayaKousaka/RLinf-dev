@@ -126,7 +126,6 @@ env:
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
     policy_mode: eval  # Deterministic eval; use train only for diagnostics.
-    action_exec_chunks: 10  # Execute the full 10-step chunk.
     group_size: 1
     video_cfg:
       save_video: False

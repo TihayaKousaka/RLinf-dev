@@ -36,6 +36,9 @@ class RLTStage2TrajectoryReplayAdapter:
 
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
+        self.is_realworld = (
+            str(cfg.env.train.get("env_type", "")).lower() == "realworld"
+        )
 
     def build_replay_trajectories(self, traj: Trajectory) -> tuple[list[Trajectory], int]:
         """Returns replay trajectories and completed episode count."""
@@ -205,6 +208,32 @@ class RLTStage2TrajectoryReplayAdapter:
             )
         return value
 
+    def _chunk_intervention_mask(
+        self,
+        traj: Trajectory,
+        *,
+        t: int,
+        env_idx: int,
+        action: torch.Tensor,
+        fallback_intervention: torch.Tensor,
+        chunk_len: int,
+        action_dim: int,
+    ) -> torch.Tensor:
+        if not self.is_realworld or traj.intervene_flags is None:
+            return self._normalize_intervention_mask(
+                fallback_intervention,
+                action=action,
+                chunk_len=chunk_len,
+                action_dim=action_dim,
+            )
+
+        return self._normalize_intervention_mask(
+            traj.intervene_flags[t, env_idx],
+            action=action,
+            chunk_len=chunk_len,
+            action_dim=action_dim,
+        )
+
     def _chunk_trajectory_to_transitions(self, traj: Trajectory) -> tuple[list[Trajectory], int]:
         if traj.actions is None or not traj.forward_inputs:
             return [], 0
@@ -261,9 +290,12 @@ class RLTStage2TrajectoryReplayAdapter:
                 env_done = float(dones_all[done_idx, env_idx].any().item())
                 done = float(env_done > 0.0)
                 action = traj.actions[t, env_idx].detach()
-                intervention_mask = self._normalize_intervention_mask(
-                    intervention_flags_all[t, env_idx],
+                intervention_mask = self._chunk_intervention_mask(
+                    traj,
+                    t=t,
+                    env_idx=env_idx,
                     action=action,
+                    fallback_intervention=intervention_flags_all[t, env_idx],
                     chunk_len=chunk_len,
                     action_dim=action_dim,
                 )
@@ -297,14 +329,11 @@ class RLTStage2TrajectoryReplayAdapter:
                     next_x = x_all[t + 1, env_idx].detach()
                     next_a_tilde = a_tilde_all[t + 1, env_idx].detach()
 
-                step_intervention = intervention_mask.reshape(
-                    chunk_len,
-                    action_dim,
-                ).any(dim=-1)
                 source_chunk = source_chunk.reshape(chunk_len).clone()
-                source_chunk[step_intervention.to(source_chunk.device)] = int(
-                    TransitionSource.HUMAN
-                )
+                if self.is_realworld and bool(
+                    intervention_mask.reshape(-1).any().item()
+                ):
+                    source_chunk[:] = int(TransitionSource.HUMAN)
                 source = resolve_chunk_source(source_chunk.cpu().numpy())
 
                 replay_trajectories.append(
@@ -320,7 +349,9 @@ class RLTStage2TrajectoryReplayAdapter:
                         source_chunk=source_chunk,
                         source=source,
                         collection_phase_id=collection_phase_id,
-                        intervention_flag=bool(intervention_mask.reshape(-1).any().item()),
+                        intervention_flag=bool(
+                            intervention_mask.reshape(-1).any().item()
+                        ),
                         step_id=t,
                         model_weights_id=traj.model_weights_id,
                     )

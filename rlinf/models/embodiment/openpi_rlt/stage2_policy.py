@@ -450,6 +450,11 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         ):
             policy_info = env_infos["policy_info"]
         ready_for_online = self.global_step >= self.online_gate_updates
+        is_realworld_train = (
+            mode == "train"
+            and env_cfg is not None
+            and str(env_cfg.get("env_type", "")) == "realworld"
+        )
         route = route_rlt_stage2_rollout(
             env_obs=env_obs,
             policy_info=policy_info,
@@ -467,11 +472,8 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 ),
                 chunk_length=self.chunk_length,
                 action_dim=self.action_dim,
-                in_critical_phase_default=not (
-                    mode == "train"
-                    and env_cfg is not None
-                    and str(env_cfg.get("env_type", "")) == "realworld"
-                ),
+                in_critical_phase_default=not is_realworld_train,
+                record_transition_default=not is_realworld_train,
             ),
             student_prediction=(actions, result),
         )
@@ -488,15 +490,3 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         if mode == "eval" and env_cfg is not None:
             return str(env_cfg.get("policy_mode", mode))
         return mode
-
-    def get_rollout_action_exec_chunks(
-        self,
-        *,
-        mode: Literal["train", "eval"],
-        env_cfg: Any | None = None,
-        default: int,
-    ) -> int:
-        """Return how many actions the env executes per rollout prediction."""
-        if mode == "eval" and env_cfg is not None:
-            return int(env_cfg.get("action_exec_chunks", default))
-        return int(default)

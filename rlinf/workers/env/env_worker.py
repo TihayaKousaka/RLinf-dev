@@ -33,7 +33,6 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
-from rlinf.models import get_env_worker_handler
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
@@ -58,7 +57,6 @@ class EnvWorker(Worker):
         Worker.__init__(self)
 
         self.cfg = cfg
-        self.model_env_handler = get_env_worker_handler(self.cfg.actor.model)
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
@@ -121,28 +119,6 @@ class EnvWorker(Worker):
             if eval_env_cfg is not None
             else False
         )
-        if self.enable_eval:
-            self.eval_action_exec_chunks = int(
-                self.cfg.env.eval.get(
-                    "action_exec_chunks", self.cfg.actor.model.num_action_chunks
-                )
-            )
-            if self.eval_action_exec_chunks <= 0:
-                raise ValueError(
-                    "env.eval.action_exec_chunks must be positive, got "
-                    f"{self.eval_action_exec_chunks}"
-                )
-            if (
-                self.cfg.env.eval.max_steps_per_rollout_epoch
-                % self.eval_action_exec_chunks
-                != 0
-            ):
-                raise ValueError(
-                    "env.eval.max_steps_per_rollout_epoch must be divisible by "
-                    "env.eval.action_exec_chunks, got "
-                    f"{self.cfg.env.eval.max_steps_per_rollout_epoch} and "
-                    f"{self.eval_action_exec_chunks}"
-                )
         if self.enable_train:
             self.train_num_envs_per_stage = (
                 self.cfg.env.train.total_num_envs // self._world_size // self.stage_num
@@ -163,7 +139,7 @@ class EnvWorker(Worker):
         if self.enable_eval:
             self.n_eval_chunk_steps = (
                 self.cfg.env.eval.max_steps_per_rollout_epoch
-                // self.eval_action_exec_chunks
+                // self.model_cfg.num_action_chunks
             )
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
@@ -221,16 +197,6 @@ class EnvWorker(Worker):
                 env_cls=eval_env_cls,
                 env_cfg=self.cfg.env.eval,
                 num_envs_per_stage=self.eval_num_envs_per_stage,
-            )
-            self.log_info(
-                "Eval action scheduling: "
-                f"model_num_action_chunks={self.cfg.actor.model.num_action_chunks}, "
-                f"action_exec_chunks={self.eval_action_exec_chunks}, "
-                f"n_eval_chunk_steps={self.n_eval_chunk_steps}, "
-                f"expected_env_steps="
-                f"{self.n_eval_chunk_steps * self.eval_action_exec_chunks}, "
-                f"max_steps_per_rollout_epoch="
-                f"{self.cfg.env.eval.max_steps_per_rollout_epoch}"
             )
             if self.eval_enable_offload:
                 assert all(hasattr(env, "offload") for env in self.eval_env_list), (
@@ -424,136 +390,6 @@ class EnvWorker(Worker):
                 if self.eval_enable_offload:
                     self.eval_env_list[i].offload()
 
-    @staticmethod
-    def _shape_str(value) -> str:
-        return "None" if value is None else str(tuple(getattr(value, "shape", ())))
-
-    def _validate_env_action_chunk(
-        self,
-        chunk_actions,
-        *,
-        mode: Literal["train", "eval"],
-        expected_chunks: int,
-    ) -> None:
-        expected_action_dim = int(self.cfg.actor.model.action_dim)
-        if (
-            not hasattr(chunk_actions, "shape")
-            or len(chunk_actions.shape) != 3
-            or int(chunk_actions.shape[1]) != int(expected_chunks)
-            or int(chunk_actions.shape[2]) != expected_action_dim
-        ):
-            raise ValueError(
-                f"Invalid {mode} env action chunk shape before chunk_step: "
-                f"expected [B, {expected_chunks}, {expected_action_dim}], got "
-                f"{self._shape_str(chunk_actions)}. Refuse to execute actions; "
-                "check actor.model.num_action_chunks/action_dim, "
-                "env.eval.action_exec_chunks, policy_setup, and action preparation."
-            )
-
-    def _build_chunk_step_result(
-        self,
-        rollout_result: RolloutResult,
-        env_output: EnvOutput,
-        rewards: torch.Tensor | None,
-        *,
-        final_forward_inputs: dict[str, Any] | None = None,
-        include_action: bool = True,
-    ) -> ChunkStepResult:
-        forward_inputs = (
-            rollout_result.forward_inputs
-            if final_forward_inputs is None
-            else final_forward_inputs
-        )
-        return ChunkStepResult(
-            actions=(
-                rollout_result.forward_inputs.get("action", None)
-                if include_action
-                else None
-            ),
-            prev_logprobs=(
-                rollout_result.prev_logprobs if self.collect_prev_infos else None
-            ),
-            prev_values=rollout_result.prev_values if self.collect_prev_infos else None,
-            forward_inputs=forward_inputs,
-            versions=rollout_result.versions,
-            dones=env_output.dones,
-            truncations=env_output.truncations,
-            terminations=env_output.terminations,
-            rewards=rewards,
-        )
-
-    @staticmethod
-    def _mark_last_record_transition_if_env_recorded(
-        rollout_result: EmbodiedRolloutResult,
-        env_infos: dict[str, Any] | None,
-    ) -> None:
-        """Keep realworld boundary chunks when critical phase starts mid-chunk."""
-
-        if not rollout_result.forward_inputs or not isinstance(env_infos, dict):
-            return
-        last_forward_inputs = rollout_result.forward_inputs[-1]
-        previous_record = last_forward_inputs.get("record_transition")
-        if not isinstance(previous_record, torch.Tensor) or previous_record.numel() == 0:
-            return
-
-        batch_size = int(previous_record.reshape(previous_record.shape[0], -1).shape[0])
-        chunk_recorded = torch.zeros((batch_size, 1), dtype=torch.bool)
-        found_record_transition = False
-        policy_infos = [env_infos.get("policy_info")]
-        final_info = env_infos.get("final_info")
-        if isinstance(final_info, dict):
-            policy_infos.append(final_info.get("policy_info"))
-
-        for policy_info in policy_infos:
-            if not isinstance(policy_info, dict) or "record_transition" not in policy_info:
-                continue
-            env_record = torch.as_tensor(policy_info["record_transition"])
-            if env_record.numel() == 0:
-                continue
-            found_record_transition = True
-            if env_record.numel() == 1:
-                env_chunk_recorded = torch.full(
-                    (batch_size, 1),
-                    bool(env_record.reshape(-1)[0].item()),
-                    dtype=torch.bool,
-                )
-            else:
-                if env_record.numel() % batch_size != 0:
-                    raise ValueError(
-                        "Realworld RLT record_transition policy_info must be scalar or "
-                        f"reshape to batch size {batch_size}, got "
-                        f"{tuple(env_record.shape)}."
-                    )
-                env_chunk_recorded = env_record.reshape(batch_size, -1).to(
-                    torch.bool
-                ).any(
-                    dim=1,
-                    keepdim=True,
-                )
-            chunk_recorded |= env_chunk_recorded
-        if not found_record_transition:
-            return
-
-        previous_recorded = previous_record.reshape(batch_size, -1).to(torch.bool).any(
-            dim=1,
-            keepdim=True,
-        )
-        last_forward_inputs["record_transition"] = (
-            previous_recorded.cpu() | chunk_recorded.cpu()
-        ).contiguous()
-
-    def _mark_last_realworld_record_transition(
-        self,
-        stage_id: int,
-        env_output: EnvOutput,
-    ) -> None:
-        if str(self.cfg.env.train.env_type) != "realworld":
-            return
-        self._mark_last_record_transition_if_env_recorded(
-            self.rollout_results[stage_id],
-            env_output.env_infos,
-        )
-
     @Worker.timer("env_interact_step")
     def env_interact_step(
         self,
@@ -571,11 +407,6 @@ class EnvWorker(Worker):
             action_dim=self.model_cfg.action_dim,
             policy=self.model_cfg.get("policy_setup", None),
             wm_env_type=self.cfg.env.train.get("wm_env_type", None),
-        )
-        self._validate_env_action_chunk(
-            chunk_actions,
-            mode="train",
-            expected_chunks=int(self.cfg.actor.model.num_action_chunks),
         )
         env_info = {}
 
@@ -636,9 +467,6 @@ class EnvWorker(Worker):
                 intervene_actions = final_info["intervene_action"]
                 intervene_flags = final_info["intervene_flag"]
 
-        if self.model_env_handler is not None:
-            env_info.update(self.model_env_handler.extract_env_metrics(env_infos=infos))
-
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
@@ -666,17 +494,6 @@ class EnvWorker(Worker):
             action_dim=self.model_cfg.action_dim,
             policy=self.model_cfg.get("policy_setup", None),
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),
-        )
-        if chunk_actions.shape[1] < self.eval_action_exec_chunks:
-            raise ValueError(
-                f"Policy produced only {chunk_actions.shape[1]} action steps, "
-                f"but env.eval.action_exec_chunks={self.eval_action_exec_chunks}."
-            )
-        chunk_actions = chunk_actions[:, : self.eval_action_exec_chunks]
-        self._validate_env_action_chunk(
-            chunk_actions,
-            mode="eval",
-            expected_chunks=self.eval_action_exec_chunks,
         )
         env_info = {}
 
@@ -718,7 +535,6 @@ class EnvWorker(Worker):
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
-            env_infos=infos if isinstance(infos, dict) else None,
         )
         return env_output, env_info
 
@@ -1176,7 +992,6 @@ class EnvWorker(Worker):
                             env_output.intervene_actions,
                             env_output.intervene_flags,
                         )
-                    self._mark_last_realworld_record_transition(stage_id, env_output)
 
                     reward_model_output = None
                     if reward_channel is not None and chunk_step_idx != 0:
@@ -1200,18 +1015,27 @@ class EnvWorker(Worker):
                         infer_batch_size_fn=self._infer_rollout_batch_size,
                         env_decoupled_mode=self.env_decoupled_mode,
                     )
-                    if self.model_env_handler is not None:
-                        for key, value in self.model_env_handler.extract_env_metrics(
-                            forward_inputs=rollout_result.forward_inputs,
-                        ).items():
-                            env_metrics[key].append(value)
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
-                    chunk_step_result = self._build_chunk_step_result(
-                        rollout_result,
-                        env_output,
-                        rewards,
+                    chunk_step_result = ChunkStepResult(
+                        actions=rollout_result.forward_inputs.get("action", None),
+                        prev_logprobs=(
+                            rollout_result.prev_logprobs
+                            if self.collect_prev_infos
+                            else None
+                        ),
+                        prev_values=(
+                            rollout_result.prev_values
+                            if self.collect_prev_infos
+                            else None
+                        ),
+                        forward_inputs=rollout_result.forward_inputs,
+                        versions=rollout_result.versions,
+                        dones=env_output.dones,
+                        truncations=env_output.truncations,
+                        terminations=env_output.terminations,
+                        rewards=rewards,
                     )
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
                     if (
@@ -1268,7 +1092,6 @@ class EnvWorker(Worker):
                         env_output.intervene_actions,
                         env_output.intervene_flags,
                     )
-                self._mark_last_realworld_record_transition(stage_id, env_output)
 
                 reward_model_output = None
                 if reward_channel is not None:
@@ -1296,11 +1119,14 @@ class EnvWorker(Worker):
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
                 )
-                chunk_step_result = self._build_chunk_step_result(
-                    rollout_result,
-                    env_output,
-                    rewards,
-                    include_action=False,
+                chunk_step_result = ChunkStepResult(
+                    prev_values=(
+                        rollout_result.prev_values if self.collect_prev_infos else None
+                    ),
+                    dones=env_output.dones,
+                    truncations=env_output.truncations,
+                    terminations=env_output.terminations,
+                    rewards=rewards,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
                 if (
@@ -1378,18 +1204,13 @@ class EnvWorker(Worker):
                             if "final_observation" in infos
                             else None
                         ),
-                        env_infos=infos if isinstance(infos, dict) else None,
                     )
-                    env_batch = env_output.to_dict()
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
                         data={
-                            "obs": env_batch["obs"],
-                            "final_obs": env_batch["final_obs"],
-                            "env_infos": self._select_rollout_env_infos(
-                                env_batch["env_infos"]
-                            ),
+                            "obs": env_output.obs,
+                            "final_obs": env_output.final_obs,
                         },
                         mode="eval",
                         tag="rollout_results",
@@ -1433,16 +1254,12 @@ class EnvWorker(Worker):
                     else:
                         if eval_step == self.n_eval_chunk_steps - 1:
                             continue
-                    env_batch = env_output.to_dict()
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
                         data={
-                            "obs": env_batch["obs"],
-                            "final_obs": env_batch["final_obs"],
-                            "env_infos": self._select_rollout_env_infos(
-                                env_batch["env_infos"]
-                            ),
+                            "obs": env_output.obs,
+                            "final_obs": env_output.final_obs,
                         },
                         mode="eval",
                         tag="rollout_results",

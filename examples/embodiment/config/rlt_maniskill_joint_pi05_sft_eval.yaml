@@ -108,7 +108,6 @@ env:
     wrap_obs_mode: rlt_openpi_joint
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
-    action_exec_chunks: 10
     group_size: 1
     video_cfg:
       save_video: True

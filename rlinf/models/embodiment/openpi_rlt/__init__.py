@@ -16,30 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
-
 from omegaconf import DictConfig
-
-from .rollout import extract_rlt_env_metrics
-
-
-@dataclass(frozen=True)
-class OpenPIRLTEnvWorkerHandler:
-    """Model-side EnvWorker extension for RLT Stage 2 metadata."""
-
-    model_cfg: DictConfig
-
-    def extract_env_metrics(
-        self,
-        *,
-        forward_inputs: dict[str, Any] | None = None,
-        env_infos: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return extract_rlt_env_metrics(
-            forward_inputs=forward_inputs,
-            env_infos=env_infos,
-        )
 
 
 def get_model(cfg: DictConfig, torch_dtype=None):
@@ -59,10 +36,4 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     )
 
 
-def get_env_worker_handler(model_cfg: DictConfig) -> OpenPIRLTEnvWorkerHandler | None:
-    if model_cfg is None or str(model_cfg.get("model_type", "")) != "rlt_stage2":
-        return None
-    return OpenPIRLTEnvWorkerHandler(model_cfg=model_cfg)
-
-
-__all__ = ["OpenPIRLTEnvWorkerHandler", "get_env_worker_handler", "get_model"]
+__all__ = ["get_model"]

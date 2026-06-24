@@ -33,7 +33,6 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker
-from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.nested_dict_process import split_dict
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.utils.utils import _split_channel_message
@@ -104,9 +103,16 @@ class MultiStepRolloutWorker(Worker):
 
         self.n_train_chunk_steps = (
             cfg.env.train.max_steps_per_rollout_epoch
-            // cfg.actor.model.num_action_chunks
+            // self.model_cfg.num_action_chunks
+            if self.enable_train
+            else 0
         )
         self.n_eval_chunk_steps = 0
+        if self.enable_eval:
+            self.n_eval_chunk_steps = (
+                cfg.env.eval.max_steps_per_rollout_epoch
+                // self.model_cfg.num_action_chunks
+            )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
@@ -147,27 +153,10 @@ class MultiStepRolloutWorker(Worker):
             self._expert_model_config = self._build_expert_model_config()
             if self._use_dagger_expert_sampling():
                 self._ensure_expert_model_loaded()
-        if self.cfg.rollout.get("expert_model", None):
-            expert_model_config = copy.deepcopy(self.model_cfg)
-            with open_dict(expert_model_config):
-                expert_model_config.precision = self.cfg.rollout.expert_model.precision
-                expert_model_config.model_path = (
-                    self.cfg.rollout.expert_model.model_path
-                )
-            self.expert_model = get_model(expert_model_config)
-
-            if self.cfg.runner.get("expert_ckpt_path", None):
-                expert_model_dict = torch.load(self.cfg.runner.expert_ckpt_path)
-                self.expert_model.load_state_dict(expert_model_dict)
 
         self.hf_model.eval()
         if self.expert_model is not None:
             self.expert_model.eval()
-        if self.enable_eval:
-            self.n_eval_chunk_steps = (
-                self.cfg.env.eval.max_steps_per_rollout_epoch
-                // self.get_action_exec_chunks("eval")
-            )
 
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
@@ -185,7 +174,7 @@ class MultiStepRolloutWorker(Worker):
             self.offload_model()
 
     def _build_expert_model_config(self):
-        expert_model_config = copy.deepcopy(self.cfg.actor.model)
+        expert_model_config = copy.deepcopy(self.model_cfg)
         expert_overrides = OmegaConf.to_container(
             self.cfg.rollout.expert_model,
             resolve=True,
@@ -547,40 +536,6 @@ class MultiStepRolloutWorker(Worker):
             return method()
         return self.hf_model.state_dict()
 
-    def _setup_dst_ranks(self, batch_size: int) -> list[tuple[int, int]]:
-        """Compute env peer ranks for this rollout worker.
-
-        This mapping supports both one-to-many and many-to-one env/rollout layouts.
-        The returned ranks are used as communication counterparts for receiving env
-        outputs and sending action chunks.
-
-        Args:
-            batch_size: Total env batch size per pipeline stage across all workers.
-
-        Returns:
-            Ordered ``(env_rank, batch_size)`` tuples this rollout worker should
-            send action chunks to.
-        """
-        env_world_size = self.placement.get_world_size("env")
-        rollout_world_size = self.placement.get_world_size("rollout")
-        return CommMapper.get_dst_ranks(
-            batch_size=batch_size,
-            src_world_size=rollout_world_size,
-            dst_world_size=env_world_size,
-            src_rank=self._rank,
-        )
-
-    def _setup_src_ranks(self, batch_size: int) -> list[tuple[int, int]]:
-        """Compute env source ranks and sizes for receiving env outputs."""
-        env_world_size = self.placement.get_world_size("env")
-        rollout_world_size = self.placement.get_world_size("rollout")
-        return CommMapper.get_src_ranks(
-            batch_size=batch_size,
-            src_world_size=env_world_size,
-            dst_world_size=rollout_world_size,
-            dst_rank=self._rank,
-        )
-
     @Worker.timer("predict")
     def predict(
         self,
@@ -724,28 +679,6 @@ class MultiStepRolloutWorker(Worker):
                 f"{policy_mode!r}"
             )
         return policy_mode
-
-    def get_action_exec_chunks(self, mode: Literal["train", "eval"]) -> int:
-        env_cfg = self.cfg.env.eval if mode == "eval" else self.cfg.env.train
-        default = int(self.cfg.actor.model.num_action_chunks)
-        method = getattr(self.hf_model, "get_rollout_action_exec_chunks", None)
-        action_exec_chunks = (
-            method(mode=mode, env_cfg=env_cfg, default=default)
-            if method is not None
-            else default
-        )
-        action_exec_chunks = int(action_exec_chunks)
-        if action_exec_chunks <= 0:
-            raise ValueError(
-                f"rollout action_exec_chunks must be positive, got {action_exec_chunks}."
-            )
-        max_steps = int(env_cfg.max_steps_per_rollout_epoch)
-        if max_steps % action_exec_chunks != 0:
-            raise ValueError(
-                "env max_steps_per_rollout_epoch must be divisible by rollout "
-                f"action_exec_chunks, got {max_steps} and {action_exec_chunks}."
-            )
-        return action_exec_chunks
 
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None

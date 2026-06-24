@@ -43,8 +43,6 @@ from rlinf.models.embodiment.openpi_rlt.trajectory_adapter import (
     RLTStage2TrajectoryReplayAdapter,
 )
 
-from rlinf.workers.env.env_worker import EnvWorker  # noqa: E402
-
 
 class AttrDict(dict):
     def __getattr__(self, item):
@@ -103,7 +101,7 @@ def _replay_cfg() -> AttrDict:
                 rlt_stage2=AttrDict(),
             ),
         ),
-        env=AttrDict(train=AttrDict(auto_reset=True)),
+        env=AttrDict(train=AttrDict(auto_reset=True, env_type="realworld")),
     )
 
 
@@ -216,7 +214,7 @@ def test_critical_phase_key_uses_edge_press_queue(monkeypatch):
     assert info["record_transition"] is True
 
 
-def test_realworld_boundary_chunk_enters_replay_without_faking_rl_source():
+def test_realworld_boundary_chunk_waits_until_next_rollout_to_enter_replay():
     rollout = EmbodiedRolloutResult(max_episode_length=1)
     base_action = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32)
     human_action = torch.tensor([[10.0, 20.0, 30.0, 40.0]], dtype=torch.float32)
@@ -263,23 +261,23 @@ def test_realworld_boundary_chunk_enters_replay_without_faking_rl_source():
     )
     assert replay_before_boundary == []
 
-    EnvWorker._mark_last_record_transition_if_env_recorded(
-        rollout,
-        {
-            "policy_info": {
-                "record_transition": torch.tensor(
-                    [[False, True]],
-                    dtype=torch.bool,
-                )
-            }
-        },
-    )
-
     expected_executed_action = torch.tensor(
         [[1.0, 2.0, 30.0, 40.0]],
         dtype=torch.float32,
     )
     torch.testing.assert_close(rollout.actions[-1], expected_executed_action)
+    torch.testing.assert_close(
+        rollout.forward_inputs[-1]["action"],
+        expected_executed_action,
+    )
+    torch.testing.assert_close(
+        rollout.forward_inputs[-1]["action_chunk"],
+        base_action,
+    )
+    torch.testing.assert_close(
+        rollout.forward_inputs[-1]["intervention_flags"],
+        torch.zeros((1, 2), dtype=torch.bool),
+    )
     torch.testing.assert_close(
         rollout.forward_inputs[-1]["source_chunk"],
         torch.tensor(
@@ -287,28 +285,14 @@ def test_realworld_boundary_chunk_enters_replay_without_faking_rl_source():
             dtype=torch.uint8,
         ),
     )
-    assert bool(rollout.forward_inputs[-1]["record_transition"].item()) is True
+    assert bool(rollout.forward_inputs[-1]["record_transition"].item()) is False
 
     replay_trajectories, completed_episodes = adapter.build_replay_trajectories(
         rollout.to_trajectory()
     )
 
-    assert completed_episodes == 1
-    assert len(replay_trajectories) == 1
-    replay_inputs = replay_trajectories[0].forward_inputs
-    torch.testing.assert_close(
-        replay_inputs["action_chunk"].reshape(-1),
-        expected_executed_action.reshape(-1),
-    )
-    torch.testing.assert_close(
-        replay_inputs["source_chunk"].reshape(-1),
-        torch.tensor(
-            [int(TransitionSource.BASE), int(TransitionSource.HUMAN)],
-            dtype=torch.uint8,
-        ),
-    )
-    assert replay_inputs["source"].item() == TransitionSource.MIXED
-    assert bool(replay_inputs["intervention_flag"].item()) is True
+    assert completed_episodes == 0
+    assert replay_trajectories == []
 
 
 def test_realworld_stage2_phase_gate_and_replay_sources():
@@ -328,17 +312,6 @@ def test_realworld_stage2_phase_gate_and_replay_sources():
         record_transition=False,
         source_base=10.0,
         human_step=1,
-    )
-    EnvWorker._mark_last_record_transition_if_env_recorded(
-        rollout,
-        {
-            "policy_info": {
-                "record_transition": torch.tensor(
-                    [[False, True]],
-                    dtype=torch.bool,
-                )
-            }
-        },
     )
     _append_routed_chunk(
         rollout,
@@ -377,7 +350,7 @@ def test_realworld_stage2_phase_gate_and_replay_sources():
     ]
     assert [bool(fi["record_transition"].item()) for fi in rollout.forward_inputs] == [
         False,
-        True,
+        False,
         True,
         False,
         True,
@@ -404,30 +377,28 @@ def test_realworld_stage2_phase_gate_and_replay_sources():
     )
 
     assert completed_episodes == 1
-    assert len(replay_trajectories) == 3
+    assert len(replay_trajectories) == 2
     replay_sources = [
         int(traj.forward_inputs["source"].item()) for traj in replay_trajectories
     ]
     assert replay_sources == [
-        int(TransitionSource.MIXED),
         int(TransitionSource.BASE),
-        int(TransitionSource.MIXED),
+        int(TransitionSource.HUMAN),
     ]
     replay_source_chunks = [
         traj.forward_inputs["source_chunk"].reshape(-1).tolist()
         for traj in replay_trajectories
     ]
     assert replay_source_chunks == [
-        [int(TransitionSource.BASE), int(TransitionSource.HUMAN)],
         [int(TransitionSource.BASE), int(TransitionSource.BASE)],
-        [int(TransitionSource.HUMAN), int(TransitionSource.RL)],
+        [int(TransitionSource.HUMAN), int(TransitionSource.HUMAN)],
     ]
     torch.testing.assert_close(
         replay_trajectories[0].forward_inputs["action_chunk"].reshape(-1),
-        torch.tensor([10.0, 11.0, 1012.0, 1013.0], dtype=torch.float32),
+        torch.tensor([20.0, 21.0, 22.0, 23.0], dtype=torch.float32),
     )
     torch.testing.assert_close(
-        replay_trajectories[2].forward_inputs["action_chunk"].reshape(-1),
+        replay_trajectories[1].forward_inputs["action_chunk"].reshape(-1),
         torch.tensor([1040.0, 1041.0, 142.0, 143.0], dtype=torch.float32),
     )
 
@@ -448,6 +419,7 @@ def test_realworld_missing_critical_metadata_defaults_to_base_control():
             chunk_length=2,
             action_dim=2,
             in_critical_phase_default=False,
+            record_transition_default=False,
         ),
     )
     torch.testing.assert_close(
@@ -459,6 +431,7 @@ def test_realworld_missing_critical_metadata_defaults_to_base_control():
         int(TransitionSource.BASE),
     ]
     assert bool(realworld_route.result["forward_inputs"]["student_control"].item()) is False
+    assert bool(realworld_route.result["forward_inputs"]["record_transition"].item()) is False
 
     default_route = route_rlt_stage2_rollout(
         env_obs={},
@@ -483,34 +456,3 @@ def test_realworld_missing_critical_metadata_defaults_to_base_control():
         int(TransitionSource.RL),
     ]
     assert bool(default_route.result["forward_inputs"]["student_control"].item()) is True
-
-
-def test_realworld_boundary_record_uses_final_info_after_auto_reset():
-    rollout = EmbodiedRolloutResult(max_episode_length=1)
-    rollout.append_step_result(
-        ChunkStepResult(
-            actions=torch.zeros((1, 4), dtype=torch.float32),
-            forward_inputs={
-                "record_transition": torch.zeros((1, 1), dtype=torch.bool),
-            },
-        )
-    )
-
-    EnvWorker._mark_last_record_transition_if_env_recorded(
-        rollout,
-        {
-            "policy_info": {
-                "record_transition": torch.tensor([[False, False]], dtype=torch.bool),
-            },
-            "final_info": {
-                "policy_info": {
-                    "record_transition": torch.tensor(
-                        [[False, True]],
-                        dtype=torch.bool,
-                    ),
-                },
-            },
-        },
-    )
-
-    assert bool(rollout.forward_inputs[-1]["record_transition"].item()) is True

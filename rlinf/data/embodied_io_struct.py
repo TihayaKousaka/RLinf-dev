@@ -23,7 +23,6 @@ if TYPE_CHECKING:
 
 from rlinf.utils.nested_dict_process import (
     cat_list_of_dict_tensor,
-    copy_dict_tensor,
     put_tensor_device,
     split_dict,
     split_dict_to_chunk,
@@ -635,8 +634,6 @@ class EmbodiedRolloutResult:
             assert intervene_flags.dim() == 2, (
                 f"Expected 2D tensor, got {intervene_flags.shape=}"
             )
-            intervene_flags = intervene_flags.to(torch.bool)
-
             bsz, num_action_chunks = intervene_flags.shape[:2]
             flags = intervene_flags.reshape(-1, num_action_chunks, 1)
 
@@ -655,20 +652,10 @@ class EmbodiedRolloutResult:
                     last_fi["action"] = (
                         last_full_action.reshape(bsz, -1).cpu().contiguous()
                     )
-                if "action_chunk" in last_fi:
-                    last_fi["action_chunk"] = (
-                        last_full_action.reshape(bsz, -1).cpu().contiguous()
-                    )
-                if "intervention_flags" in last_fi:
-                    last_fi["intervention_flags"] = (
-                        intervene_flags.cpu().contiguous()
-                    )
                 last_fi.pop("model_action", None)
 
     def append_transitions(self, curr_obs=None, next_obs=None):
         assert curr_obs is not None and next_obs is not None
-        curr_obs = copy_dict_tensor(curr_obs)
-        next_obs = copy_dict_tensor(next_obs)
         if "task_descriptions" in curr_obs:
             curr_obs.pop("task_descriptions")
         if "task_descriptions" in next_obs:
