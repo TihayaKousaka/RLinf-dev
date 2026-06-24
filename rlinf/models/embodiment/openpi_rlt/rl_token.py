@@ -109,14 +109,31 @@ class RLTokenModel(nn.Module):
         self.encoder = RLTokenEncoder(embedding_dim, encoder_layers, encoder_heads)
         self.decoder = RLTokenDecoder(embedding_dim, decoder_layers, decoder_heads)
 
-    def forward(self, z: Tensor, pad_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def loss_sum(
+        self,
+        z: Tensor,
+        pad_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         z = z.detach()
         z_rl = self.encoder(z, pad_mask)
         z_hat = self.decoder(z_rl, z, pad_mask)
         mse = (z_hat - z).pow(2).mean(dim=-1)
         masked_mse = mse * pad_mask.float()
+        loss_sum = masked_mse.sum()
         num_valid = pad_mask.float().sum()
-        loss = masked_mse.sum() / num_valid.clamp(min=1.0)
+        return loss_sum, num_valid, z_rl, z_hat
+
+    def forward(
+        self,
+        z: Tensor,
+        pad_mask: Tensor,
+        *,
+        normalize: bool = True,
+    ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
+        loss_sum, num_valid, z_rl, z_hat = self.loss_sum(z, pad_mask)
+        if not normalize:
+            return loss_sum, num_valid, z_rl, z_hat
+        loss = loss_sum / num_valid.clamp(min=1.0)
         return loss, z_rl, z_hat
 
     @torch.no_grad()

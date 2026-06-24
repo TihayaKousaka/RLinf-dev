@@ -18,6 +18,7 @@ rlt_stage1:
   norm_stats_path: null
   num_images_in_input: 2
   num_steps: 5
+  rl_token_micro_batch_size: 0
   embedding_dim: 2048
   encoder_layers: 2
   encoder_heads: 8

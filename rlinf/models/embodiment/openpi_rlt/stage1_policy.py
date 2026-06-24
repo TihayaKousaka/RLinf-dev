@@ -41,6 +41,9 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
 
         stage1_cfg = cfg.rlt_stage1
         self.alpha = float(stage1_cfg.get("alpha", 0.0))
+        self.rl_token_micro_batch_size = int(
+            stage1_cfg.get("rl_token_micro_batch_size", 0) or 0
+        )
         joint_finetune = self.alpha > 0.0
 
         vla = build_openpi_rlt_backbone(
@@ -104,11 +107,11 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
         observation = data["observation"]
 
         if self.alpha > 0.0:
-            z, pad_mask = self.vla.extract_rlt_prefix_embeddings(
-                observation,
-                detach=False,
-                dtype=torch.float32,
-            )
+            with torch.no_grad():
+                z, pad_mask = self.vla.extract_rlt_prefix_embeddings(
+                    observation,
+                    dtype=torch.float32,
+                )
             vla_loss = self.vla(
                 forward_type=ForwardType.SFT,
                 data={"observation": observation, "actions": data["actions"]},
@@ -121,9 +124,7 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
                 )
             vla_loss = None
 
-        l_ro, z_rl, z_hat = self.rl_token_model(
-            z.to(self.device), pad_mask.to(self.device)
-        )
+        l_ro, z_rl, z_hat = self.compute_rl_token_loss(z, pad_mask)
         loss = l_ro if vla_loss is None else l_ro + self.alpha * vla_loss
         metrics = {
             "loss": loss,
@@ -138,6 +139,34 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
             key: value for key, value in metrics.items() if key != "loss"
         }
         return metrics
+
+    def compute_rl_token_loss(
+        self,
+        z: torch.Tensor,
+        pad_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z = z.to(self.device)
+        pad_mask = pad_mask.to(self.device)
+        micro_batch_size = self.rl_token_micro_batch_size
+        if micro_batch_size <= 0 or micro_batch_size >= z.shape[0]:
+            return self.rl_token_model(z, pad_mask)
+
+        loss_sum = z.new_zeros(())
+        num_valid = z.new_zeros(())
+        z_rl_chunks = []
+        z_hat_chunks = []
+        for start in range(0, z.shape[0], micro_batch_size):
+            end = min(start + micro_batch_size, z.shape[0])
+            chunk_loss_sum, chunk_num_valid, chunk_z_rl, chunk_z_hat = (
+                self.rl_token_model.loss_sum(z[start:end], pad_mask[start:end])
+            )
+            loss_sum = loss_sum + chunk_loss_sum
+            num_valid = num_valid + chunk_num_valid.to(loss_sum.device)
+            z_rl_chunks.append(chunk_z_rl.detach())
+            z_hat_chunks.append(chunk_z_hat.detach())
+
+        loss = loss_sum / num_valid.clamp(min=1.0)
+        return loss, torch.cat(z_rl_chunks, dim=0), torch.cat(z_hat_chunks, dim=0)
 
     def default_forward(self, **kwargs):
         raise NotImplementedError("RLT Stage 1 does not use default_forward.")
