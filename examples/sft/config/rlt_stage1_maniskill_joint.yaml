@@ -50,7 +50,6 @@ actor:
     action_dim: 8
     rlt_stage1:
       config_name: "pi05_rlt_maniskill_joint"
-      norm_stats_path: ${actor.openpi_data.norm_stats_path}
       num_images_in_input: 2
       num_steps: 5
       embedding_dim: 2048
@@ -60,8 +59,7 @@ actor:
       decoder_heads: 8
 
   openpi_data:
-    repo_id: "/mnt/public2/xiekaizhi/rlt-openpi-sim/rlt_maniskill_joint"
-    norm_stats_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/rlt_maniskill_joint/norm_stats.json"
+    repo_id: "rlt_maniskill_joint"
     default_prompt: "insert the peg in the hole"
 
   optim:

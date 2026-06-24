@@ -49,7 +49,6 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
         vla = build_openpi_rlt_backbone(
             model_path=cfg.model_path,
             config_name=stage1_cfg.config_name,
-            norm_stats_path=stage1_cfg.get("norm_stats_path", None),
             num_images_in_input=int(stage1_cfg.get("num_images_in_input", 2)),
             num_action_chunks=int(cfg.num_action_chunks),
             action_dim=int(cfg.action_dim),

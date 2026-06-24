@@ -139,8 +139,7 @@ RLT Stage1/Stage2 开始前需要先准备一个 joint-control 的 OpenPI SFT ch
 这个阶段的关键配置包括：
 
 - ``actor.model.model_path``: OpenPI 基座权重
-- ``actor.openpi_data.repo_id``: ManiSkill joint LeRobot 数据路径
-- ``actor.openpi_data.norm_stats_path``: 与数据集匹配的归一化统计
+- ``actor.openpi_data.repo_id``: ManiSkill joint LeRobot 数据集的逻辑 repo id
 - ``actor.model.openpi.config_name``: ``pi05_rlt_joint``
 
 完成后会得到类似如下目录：
@@ -193,8 +192,7 @@ Stage1 的目标是训练 RL token encoder/decoder，不直接更新大 VLA 主�
 至少检查以下字段：
 
 - ``data.train_data_paths[0].dataset_path``: 指向你的 joint LeRobot 数据目录
-- ``actor.openpi_data.repo_id``: 指向同一份数据
-- ``actor.openpi_data.norm_stats_path``: 指向同一数据集的 ``norm_stats.json``
+- ``actor.openpi_data.repo_id``: 用于在 ``actor.model.model_path/<repo_id>/`` 下定位 ``norm_stats.json`` 的 repo id
 - ``actor.model.model_path``: 指向上一步的 OpenPI SFT 基座 checkpoint
 
 启动命令：
@@ -209,8 +207,7 @@ Stage1 的目标是训练 RL token encoder/decoder，不直接更新大 VLA 主�
 
    bash examples/sft/train_rlt_stage1.sh rlt_stage1_maniskill_joint \
      data.train_data_paths[0].dataset_path=/data/rlt_maniskill_joint \
-     actor.openpi_data.repo_id=/data/rlt_maniskill_joint \
-     actor.openpi_data.norm_stats_path=/data/rlt_maniskill_joint/norm_stats.json \
+     actor.openpi_data.repo_id=rlt_maniskill_joint \
      actor.model.model_path=/path/to/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_2000/actor \
      runner.logger.logger_backends='[tensorboard]'
 
@@ -264,7 +261,7 @@ Stage2 使用冻结 VLA + 冻结 RL token + 小 actor-critic 的在线 RL 流程
 - ``actor.model.model_path``: SFT 基座 checkpoint
 - ``rollout.expert_model.model_path``: expert/reference checkpoint
 - ``actor.model.rlt_stage2.rl_token_path``: Stage1 导出的 ``rl_token_model.pt``
-- ``actor.model.rlt_stage2.norm_stats_path``: 与 joint 数据集匹配的 ``norm_stats.json``
+- ``actor.openpi_data.repo_id`` 要与 checkpoint 根目录下保存 ``norm_stats.json`` 的子目录名一致
 
 推荐同时把日志后端切到 ``tensorboard``，并打开 eval 视频：
 
@@ -296,7 +293,7 @@ Stage2 使用冻结 VLA + 冻结 RL token + 小 actor-critic 的在线 RL 流程
      rollout.model.model_path=/path/to/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_1000/actor \
      rollout.expert_model.model_path=/path/to/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_8000/actor \
      actor.model.rlt_stage2.rl_token_path=/path/to/rlt_stage1_maniskill_joint/checkpoints/global_step_5000/actor/rl_token/rl_token_model.pt \
-     actor.model.rlt_stage2.norm_stats_path=/data/rlt_maniskill_joint/norm_stats.json \
+     actor.openpi_data.repo_id=rlt_maniskill_joint \
      runner.logger.logger_backends='[tensorboard]' \
      env.eval.video_cfg.save_video=True
 
@@ -428,7 +425,7 @@ RLT joint 的专属结果图。
 
 - ``actor.model.model_path`` 是否指向同一套 OpenPI joint SFT 基座
 - ``actor.model.rlt_stage2.rl_token_path`` 是否来自同语义的 Stage1
-- ``norm_stats_path`` 是否对应当前数据集
+- ``actor.openpi_data.repo_id`` 是否对应 checkpoint 根目录下保存 ``norm_stats.json`` 的子目录
 - ``num_action_chunks`` / ``action_dim`` 是否保持 ``10`` / ``8``
 - 数据集中的 prompt 是否统一为 ``insert the peg in the hole``
 - ``warmup_post_collect_updates`` 的单位是 learner 完成的 update 数，不是 runner step

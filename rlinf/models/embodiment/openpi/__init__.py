@@ -130,7 +130,6 @@ def build_openpi_rlt_backbone(
     *,
     model_path: str,
     config_name: str,
-    norm_stats_path: str | None = None,
     num_images_in_input: int = 2,
     num_action_chunks: int = 10,
     action_dim: int = 8,
@@ -155,8 +154,6 @@ def build_openpi_rlt_backbone(
             "add_value_head": False,
         },
     }
-    if norm_stats_path is not None:
-        cfg_dict["openpi_data"] = {"norm_stats_path": norm_stats_path}
 
     cfg = OmegaConf.create(cfg_dict)
     with open_dict(cfg):

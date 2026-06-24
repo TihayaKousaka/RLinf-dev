@@ -216,7 +216,6 @@ def test_openpi_rlt_backbone_reuses_existing_openpi_loader(monkeypatch):
     model = build_openpi_rlt_backbone(
         model_path="/tmp/openpi",
         config_name="pi05_rlt_maniskill_joint",
-        norm_stats_path="/tmp/norm_stats.json",
         num_images_in_input=2,
         num_action_chunks=10,
         action_dim=8,
@@ -233,7 +232,7 @@ def test_openpi_rlt_backbone_reuses_existing_openpi_loader(monkeypatch):
     assert cfg.openpi.config_name == "pi05_rlt_maniskill_joint"
     assert cfg.openpi.action_chunk == 10
     assert cfg.openpi.action_env_dim == 8
-    assert cfg.openpi_data.norm_stats_path == "/tmp/norm_stats.json"
+    assert "openpi_data" not in cfg
     assert model.training is False
     assert all(not param.requires_grad for param in model.parameters())
 

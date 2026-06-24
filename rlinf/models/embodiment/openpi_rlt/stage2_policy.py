@@ -109,7 +109,6 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             self.vla = build_openpi_rlt_backbone(
                 model_path=cfg.model_path,
                 config_name=stage2_cfg.config_name,
-                norm_stats_path=stage2_cfg.get("norm_stats_path", None),
                 num_images_in_input=int(stage2_cfg.get("num_images_in_input", 1)),
                 num_action_chunks=self.chunk_length,
                 action_dim=self.action_dim,

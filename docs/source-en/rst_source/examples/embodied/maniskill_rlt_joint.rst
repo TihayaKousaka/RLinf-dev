@@ -151,8 +151,7 @@ Launch it with:
 The key fields are:
 
 - ``actor.model.model_path``: OpenPI base weights
-- ``actor.openpi_data.repo_id``: ManiSkill joint LeRobot dataset path
-- ``actor.openpi_data.norm_stats_path``: normalization stats for that dataset
+- ``actor.openpi_data.repo_id``: logical repo id for the ManiSkill joint LeRobot dataset
 - ``actor.model.openpi.config_name``: ``pi05_rlt_joint``
 
 After training, you should get a checkpoint like:
@@ -207,8 +206,7 @@ The main files are:
 At minimum, check:
 
 - ``data.train_data_paths[0].dataset_path``: your joint LeRobot dataset
-- ``actor.openpi_data.repo_id``: the same dataset
-- ``actor.openpi_data.norm_stats_path``: that dataset's ``norm_stats.json``
+- ``actor.openpi_data.repo_id``: the dataset repo id used to place ``norm_stats.json`` under ``actor.model.model_path/<repo_id>/``
 - ``actor.model.model_path``: the OpenPI SFT base checkpoint from Step 0
 
 Launch command:
@@ -223,8 +221,7 @@ If you prefer Hydra overrides instead of editing yaml:
 
    bash examples/sft/train_rlt_stage1.sh rlt_stage1_maniskill_joint \
      data.train_data_paths[0].dataset_path=/data/rlt_maniskill_joint \
-     actor.openpi_data.repo_id=/data/rlt_maniskill_joint \
-     actor.openpi_data.norm_stats_path=/data/rlt_maniskill_joint/norm_stats.json \
+     actor.openpi_data.repo_id=rlt_maniskill_joint \
      actor.model.model_path=/path/to/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_2000/actor \
      runner.logger.logger_backends='[tensorboard]'
 
@@ -279,7 +276,7 @@ At minimum, check:
 - ``actor.model.model_path``: the SFT base checkpoint
 - ``rollout.expert_model.model_path``: expert/reference checkpoint
 - ``actor.model.rlt_stage2.rl_token_path``: the ``rl_token_model.pt`` from Stage1
-- ``actor.model.rlt_stage2.norm_stats_path``: the ``norm_stats.json`` for the joint dataset
+- ``actor.openpi_data.repo_id`` matches the subdirectory that stores ``norm_stats.json`` under each checkpoint root
 
 It is also recommended to switch the logger backend to ``tensorboard`` and enable eval video:
 
@@ -311,7 +308,7 @@ To override paths directly from the command line:
      rollout.model.model_path=/path/to/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_1000/actor \
      rollout.expert_model.model_path=/path/to/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_8000/actor \
      actor.model.rlt_stage2.rl_token_path=/path/to/rlt_stage1_maniskill_joint/checkpoints/global_step_5000/actor/rl_token/rl_token_model.pt \
-     actor.model.rlt_stage2.norm_stats_path=/data/rlt_maniskill_joint/norm_stats.json \
+     actor.openpi_data.repo_id=rlt_maniskill_joint \
      runner.logger.logger_backends='[tensorboard]' \
      env.eval.video_cfg.save_video=True
 
@@ -446,7 +443,7 @@ If the pipeline does not behave as expected, first check that these are aligned:
 
 - ``actor.model.model_path`` points to the intended OpenPI joint SFT base
 - ``actor.model.rlt_stage2.rl_token_path`` comes from the matching Stage1 run
-- ``norm_stats_path`` matches the current dataset
+- ``actor.openpi_data.repo_id`` matches the checkpoint subdirectory that stores ``norm_stats.json``
 - ``num_action_chunks`` / ``action_dim`` stay at ``10`` / ``8``
 - dataset prompts are normalized to ``insert the peg in the hole``
 - ``warmup_post_collect_updates`` is interpreted as completed learner updates,

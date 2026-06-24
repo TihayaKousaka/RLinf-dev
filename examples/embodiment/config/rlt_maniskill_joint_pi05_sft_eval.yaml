@@ -161,8 +161,7 @@ actor:
       action_chunk: ${actor.model.num_action_chunks}
       action_env_dim: ${actor.model.action_dim}
     openpi_data:
-      repo_id: "/mnt/public2/xiekaizhi/rlt-openpi-sim/rlt_maniskill_joint"
-      norm_stats_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/rlt_maniskill_joint/norm_stats.json"
+      repo_id: "rlt_maniskill_joint"
       default_prompt: "insert the peg in the hole"
 
   optim:

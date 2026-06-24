@@ -12,11 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
-import json
-import pathlib
 
 import openpi.models.model as _model
-import openpi.shared.normalize as _normalize
 import openpi.transforms as _transforms
 from openpi.training.config import DataConfig, DataConfigFactory, ModelTransformFactory
 from typing_extensions import override
@@ -36,29 +33,8 @@ class LeRobotRLTManiSkillJointDataConfig(DataConfigFactory):
     action_key: str = "actions"
     task_key: str | None = None
     prompt_key: str | None = None
-    norm_stats_path: str | None = None
     default_prompt: str | None = None
     output_action_dim: int = 8
-
-    def _load_explicit_norm_stats(self):
-        if not self.norm_stats_path:
-            return None
-
-        norm_stats_path = pathlib.Path(self.norm_stats_path).expanduser()
-        if not norm_stats_path.exists():
-            raise FileNotFoundError(
-                f"Explicit norm stats file not found: {norm_stats_path}"
-            )
-
-        if norm_stats_path.is_dir():
-            return _normalize.load(norm_stats_path)
-
-        raw_text = norm_stats_path.read_text()
-        if hasattr(_normalize, "deserialize_json"):
-            return _normalize.deserialize_json(raw_text)
-
-        raw_data = json.loads(raw_text)
-        return raw_data.get("norm_stats", raw_data)
 
     @override
     def create(
@@ -106,15 +82,8 @@ class LeRobotRLTManiSkillJointDataConfig(DataConfigFactory):
             )
 
         model_transforms = ModelTransformFactory()(model_config)
-        base_config = self.create_base_config(assets_dirs, model_config)
-        explicit_norm_stats = self._load_explicit_norm_stats()
-        if explicit_norm_stats is not None:
-            base_config = dataclasses.replace(
-                base_config, norm_stats=explicit_norm_stats
-            )
-
         return dataclasses.replace(
-            base_config,
+            self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
