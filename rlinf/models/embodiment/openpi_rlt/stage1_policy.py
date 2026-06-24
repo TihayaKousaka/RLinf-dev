@@ -40,6 +40,8 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
         self._latest_stage1_metrics: dict[str, torch.Tensor] = {}
 
         stage1_cfg = cfg.rlt_stage1
+        self.alpha = float(stage1_cfg.get("alpha", 0.0))
+        joint_finetune = self.alpha > 0.0
 
         vla = build_openpi_rlt_backbone(
             model_path=cfg.model_path,
@@ -50,12 +52,14 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
             action_dim=int(cfg.action_dim),
             num_steps=int(stage1_cfg.get("num_steps", 5)),
             device=self.device,
-            freeze=True,
+            freeze=not joint_finetune,
         )
-        # Keep the frozen VLA out of PyTorch's module tree so FSDP only flattens
-        # the trainable RL-token module. The backbone is already on-device and
-        # remains accessible through ``self.vla`` for feature extraction.
-        object.__setattr__(self, "vla", vla)
+        if joint_finetune:
+            self.vla = vla
+        else:
+            # Keep the frozen VLA out of PyTorch's module tree so FSDP only
+            # flattens the trainable RL-token module.
+            object.__setattr__(self, "vla", vla)
 
         self.rl_token_model = RLTokenModel(
             embedding_dim=int(stage1_cfg.get("embedding_dim", 2048)),
@@ -75,25 +79,44 @@ class RLTStage1Policy(torch.nn.Module, BasePolicy):
         )
 
     def trainable_parameters(self):
+        if self.alpha > 0.0:
+            return self.parameters()
         return self.rl_token_model.parameters()
 
     def sft_forward(self, data: dict[str, Any], **kwargs) -> dict[str, torch.Tensor]:
         observation = data["observation"]
 
-        with torch.no_grad():
+        if self.alpha > 0.0:
             z, pad_mask = self.vla.extract_rlt_prefix_embeddings(
                 observation,
+                detach=False,
                 dtype=torch.float32,
             )
+            vla_loss = self.vla(
+                forward_type=ForwardType.SFT,
+                data={"observation": observation, "actions": data["actions"]},
+            )
+        else:
+            with torch.no_grad():
+                z, pad_mask = self.vla.extract_rlt_prefix_embeddings(
+                    observation,
+                    dtype=torch.float32,
+                )
+            vla_loss = None
+
         l_ro, z_rl, z_hat = self.rl_token_model(
             z.to(self.device), pad_mask.to(self.device)
         )
+        loss = l_ro if vla_loss is None else l_ro + self.alpha * vla_loss
         metrics = {
-            "loss": l_ro,
+            "loss": loss,
             "l_ro": l_ro.detach(),
             "z_rl": z_rl.detach(),
             "z_hat": z_hat.detach(),
         }
+        if vla_loss is not None:
+            metrics["vla_loss"] = vla_loss.detach()
+            metrics["alpha"] = torch.as_tensor(self.alpha, device=l_ro.device)
         self._latest_stage1_metrics = {
             key: value for key, value in metrics.items() if key != "loss"
         }

@@ -139,6 +139,10 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         step_metrics = {"loss": loss.detach().item()}
         if "l_ro" in output:
             step_metrics["l_ro"] = output["l_ro"].detach().item()
+        if "vla_loss" in output:
+            step_metrics["vla_loss"] = output["vla_loss"].detach().item()
+        if "alpha" in output:
+            step_metrics["alpha"] = output["alpha"].detach().item()
         return loss, step_metrics
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
@@ -146,6 +150,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
 
         if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.RLT_STAGE1:
             self._save_rlt_stage1_rl_token_checkpoint(save_path, step)
+            self._save_rlt_stage1_vla_checkpoint(save_path)
 
         if isinstance(self.data_loader, StatefulDataLoader):
             state = self.data_loader.state_dict()
@@ -189,6 +194,31 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             {"model_state_dict": rl_token_state, "step": step},
             os.path.join(rl_token_dir, "rl_token_model.pt"),
         )
+
+    def _save_rlt_stage1_vla_checkpoint(self, save_path: str) -> None:
+        alpha = float(self.cfg.actor.model.rlt_stage1.get("alpha", 0.0))
+        if alpha <= 0.0 or self._rank != 0:
+            return
+
+        model_state = self._strategy.get_model_state_dict(
+            self.model,
+            cpu_offload=True,
+            full_state_dict=True,
+        )
+        vla_state = {
+            key.replace("vla.", "", 1): value
+            for key, value in model_state.items()
+            if key.startswith("vla.")
+        }
+        if not vla_state:
+            raise RuntimeError(
+                "RLT Stage 1 alpha > 0 expected VLA weights under the 'vla.' "
+                "prefix, but no matching parameters were found."
+            )
+
+        vla_state_dir = os.path.join(save_path, "vla", "model_state_dict")
+        os.makedirs(vla_state_dir, exist_ok=True)
+        torch.save(vla_state, os.path.join(vla_state_dir, "full_weights.pt"))
 
     def load_checkpoint(self, load_path: str) -> None:
         super().load_checkpoint(load_path)
