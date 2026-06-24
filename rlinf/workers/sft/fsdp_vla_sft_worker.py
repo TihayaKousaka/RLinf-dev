@@ -14,7 +14,6 @@
 import os
 from typing import Any
 
-import numpy as np
 import torch
 from omegaconf import DictConfig
 from torch.utils._pytree import tree_map
@@ -22,12 +21,9 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.config import SupportedModel
 from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
-from rlinf.data.utils import forward_set_epoch
 from rlinf.models.embodiment.base_policy import ForwardType
-from rlinf.utils.distributed import all_reduce_dict
-from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.pytree import register_pytree_dataclasses
-from rlinf.utils.utils import clear_memory, get_rng_state, set_rng_state
+from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
 
@@ -148,157 +144,6 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         if "alpha" in output:
             step_metrics["alpha"] = output["alpha"].detach().item()
         return loss, step_metrics
-
-    def run_training(self):
-        if not self._use_rlt_stage1_split_backward():
-            return super().run_training()
-
-        with self.worker_timer():
-            self.model.train()
-
-            metrics = {}
-
-            for idx in range(self.gradient_accumulation):
-                backward_ctx = self.before_micro_batch(
-                    self.model,
-                    is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
-                )
-                batch = self._next_train_batch()
-
-                loss, step_metrics = self._backward_rlt_stage1_split_loss(
-                    batch,
-                    backward_ctx,
-                )
-                append_to_dict(metrics, step_metrics)
-                append_to_dict(metrics, {"loss": loss.detach().item()})
-
-            grad_norm, lr_list = self.optimizer_step()
-            self.optimizer.zero_grad(set_to_none=True)
-
-            self.lr_scheduler.step()
-            lr_value = self.optimizer.param_groups[0]["lr"]
-            grad_norm_value = (
-                float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm
-            )
-            append_to_dict(
-                metrics,
-                {
-                    "learning_rate": lr_value,
-                    "grad_norm": grad_norm_value,
-                },
-            )
-
-            if self.global_step > 0 and self.global_step % 1000 == 0:
-                clear_memory()
-
-            train_metrics = {key: np.mean(value) for key, value in metrics.items()}
-            train_metrics = all_reduce_dict(
-                train_metrics, op=torch.distributed.ReduceOp.AVG
-            )
-            return train_metrics
-
-    def _use_rlt_stage1_split_backward(self) -> bool:
-        if SupportedModel(self.cfg.actor.model.model_type) != SupportedModel.RLT_STAGE1:
-            return False
-        return float(self.cfg.actor.model.rlt_stage1.get("alpha", 0.0)) > 0.0
-
-    def _next_train_batch(self) -> Any:
-        try:
-            batch = next(self.data_iter)
-            self._data_iter_offset += 1
-        except StopIteration:
-            self._data_epoch += 1
-            self.log_info(
-                "[INFO] data_iter exhausted, reset iterator "
-                f"self._data_epoch {self._data_epoch}"
-            )
-            forward_set_epoch(self.data_loader, self._data_epoch)
-            self.data_iter = iter(self.data_loader)
-            batch = next(self.data_iter)
-            self._data_iter_offset = 1
-        return batch
-
-    def _backward_rlt_stage1_split_loss(
-        self,
-        batch: Any,
-        backward_ctx,
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        observation, actions = self._prepare_rlt_stage1_batch(batch)
-
-        with backward_ctx:
-            with torch.no_grad():
-                z, pad_mask = self.model.vla.extract_rlt_prefix_embeddings(
-                    observation,
-                    dtype=torch.float32,
-                )
-            l_ro = self._backward_rlt_stage1_rl_token_loss(z, pad_mask)
-            del z, pad_mask
-
-            with self.amp_context:
-                vla_loss = self.model.vla(
-                    forward_type=ForwardType.SFT,
-                    data={"observation": observation, "actions": actions},
-                )
-            alpha = float(self.cfg.actor.model.rlt_stage1.get("alpha", 0.0))
-            scaled_vla_loss = (alpha * vla_loss) / self.gradient_accumulation
-            self.grad_scaler.scale(scaled_vla_loss).backward()
-
-        total_loss = l_ro.detach() + alpha * vla_loss.detach()
-        return total_loss, {
-            "l_ro": l_ro.detach().item(),
-            "vla_loss": vla_loss.detach().item(),
-            "alpha": alpha,
-        }
-
-    def _backward_rlt_stage1_rl_token_loss(
-        self,
-        z: torch.Tensor,
-        pad_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        z = z.to(self.device)
-        pad_mask = pad_mask.to(self.device)
-        micro_batch_size = int(
-            self.cfg.actor.model.rlt_stage1.get("rl_token_micro_batch_size", 0) or 0
-        )
-        if micro_batch_size <= 0 or micro_batch_size >= z.shape[0]:
-            with self.amp_context:
-                l_ro, _, _ = self.model.rl_token_model(z, pad_mask)
-            self.grad_scaler.scale(l_ro / self.gradient_accumulation).backward()
-            return l_ro.detach()
-
-        with torch.no_grad():
-            total_valid = pad_mask.float().sum().clamp(min=1.0)
-
-        total_loss = z.new_zeros(())
-        for start in range(0, z.shape[0], micro_batch_size):
-            end = min(start + micro_batch_size, z.shape[0])
-            with self.amp_context:
-                chunk_loss_sum, _, _, _ = self.model.rl_token_model(
-                    z[start:end],
-                    pad_mask[start:end],
-                    normalize=False,
-                )
-                chunk_loss = chunk_loss_sum / total_valid
-            self.grad_scaler.scale(chunk_loss / self.gradient_accumulation).backward()
-            total_loss = total_loss + chunk_loss.detach()
-        return total_loss
-
-    def _prepare_rlt_stage1_batch(
-        self,
-        batch: Any,
-    ) -> tuple[Any, torch.Tensor]:
-        observation, actions = batch
-        register_pytree_dataclasses(observation)
-        observation = tree_map(
-            lambda x: (
-                torch.as_tensor(x, device=self.device).contiguous().clone()
-                if x is not None
-                else x
-            ),
-            observation,
-        )
-        actions = actions.to(torch.float32).to(self.device)
-        return observation, actions
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         super().save_checkpoint(save_path, step)

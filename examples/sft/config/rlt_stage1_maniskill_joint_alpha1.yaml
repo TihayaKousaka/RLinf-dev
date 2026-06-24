@@ -54,7 +54,6 @@ actor:
       norm_stats_path: ${actor.openpi_data.norm_stats_path}
       num_images_in_input: 2
       num_steps: 5
-      rl_token_micro_batch_size: 2
       embedding_dim: 2048
       encoder_layers: 2
       encoder_heads: 8
