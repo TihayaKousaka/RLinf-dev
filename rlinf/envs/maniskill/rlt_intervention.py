@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 import torch
 from omegaconf import DictConfig
+from omegaconf.omegaconf import OmegaConf
 
 
 def apply_rlt_intervention_policy_info(
@@ -43,6 +44,41 @@ def apply_rlt_intervention_policy_info(
         if isinstance(value, torch.Tensor):
             infos_last[key] = value
     infos_list[-1] = infos_last
+
+
+def build_maniskill_rlt_intervention_controller(
+    *,
+    intervention_cfg: DictConfig | None,
+    is_peg_insertion_side: bool,
+    env,
+    batch_size: int,
+    mode: Literal["train", "eval"] = "train",
+) -> "ManiSkillLocalCorrectionController | None":
+    if intervention_cfg is None:
+        return None
+    if not bool(intervention_cfg.get("enable", False)):
+        return None
+    if str(intervention_cfg.get("mode", "local_correction")) != "local_correction":
+        return None
+    if not is_peg_insertion_side:
+        raise ValueError(
+            "ManiSkill RLT local correction is only supported for peg-insertion tasks."
+        )
+    return ManiSkillLocalCorrectionController(
+        cfg=OmegaConf.create(
+            {
+                "algorithm": {
+                    "intervention": OmegaConf.to_container(
+                        intervention_cfg,
+                        resolve=True,
+                    )
+                }
+            }
+        ),
+        batch_size=batch_size,
+        mode=mode,
+        hole_radii=getattr(env, "box_hole_radii", None),
+    )
 
 
 class ManiSkillLocalCorrectionController:

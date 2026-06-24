@@ -92,6 +92,51 @@ def default_peg_instruction(*, num_envs: int) -> list[str]:
     return [_RLT_DEFAULT_PROMPT for _ in range(num_envs)]
 
 
+def resolve_maniskill_task_descriptions(
+    env,
+    *,
+    num_envs: int,
+    is_peg_insertion_side: bool,
+):
+    if hasattr(env, "get_language_instruction"):
+        instruction = env.get_language_instruction()
+        if instruction is not None:
+            return _format_task_descriptions(
+                instruction,
+                num_envs=num_envs,
+                is_peg_insertion_side=is_peg_insertion_side,
+            )
+
+    for attr in ("task_descriptions", "task_description", "task_prompt", "instruction"):
+        if not hasattr(env, attr):
+            continue
+        instruction = getattr(env, attr)
+        if instruction is None:
+            continue
+        return _format_task_descriptions(
+            instruction,
+            num_envs=num_envs,
+            is_peg_insertion_side=is_peg_insertion_side,
+        )
+
+    if is_peg_insertion_side:
+        return default_peg_instruction(num_envs=num_envs)
+    return ["" for _ in range(num_envs)]
+
+
+def _format_task_descriptions(
+    instruction,
+    *,
+    num_envs: int,
+    is_peg_insertion_side: bool,
+):
+    if isinstance(instruction, str):
+        instruction = [instruction for _ in range(num_envs)]
+    if is_peg_insertion_side:
+        return normalize_peg_instructions(instruction, num_envs=num_envs)
+    return instruction
+
+
 def wrap_rlt_openpi_joint_obs(
     raw_obs: dict[str, Any],
     *,
@@ -282,6 +327,24 @@ def augment_peg_insertion_info(
         }
     )
     return infos
+
+
+def maybe_augment_peg_insertion_info(
+    *,
+    env,
+    infos: dict[str, Any],
+    event_state: dict[str, torch.Tensor] | None,
+    device,
+    is_peg_insertion_side: bool,
+) -> dict[str, Any]:
+    if not is_peg_insertion_side or event_state is None:
+        return infos
+    return augment_peg_insertion_info(
+        env=env,
+        infos=infos,
+        event_state=event_state,
+        device=device,
+    )
 
 
 def _to_numpy(x):

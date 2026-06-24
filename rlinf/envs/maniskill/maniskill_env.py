@@ -26,20 +26,19 @@ from omegaconf import open_dict
 from omegaconf.omegaconf import OmegaConf
 from rlinf.envs.maniskill.peg_insertion_side_variants import (
     RLT_OPENPI_JOINT_WRAP_MODE,
-    augment_peg_insertion_info,
-    default_peg_instruction,
     init_peg_insertion_event_state,
     is_peg_insertion_side_env_id,
-    normalize_peg_instruction,
+    maybe_augment_peg_insertion_info,
     patch_rlt_openpi_joint_env_args,
     reset_peg_insertion_event_state,
+    resolve_maniskill_task_descriptions,
     restore_peg_insertion_event_state,
     snapshot_peg_insertion_event_state,
     wrap_rlt_openpi_joint_obs,
 )
 from rlinf.envs.maniskill.rlt_intervention import (
-    ManiSkillLocalCorrectionController,
     apply_rlt_intervention_policy_info,
+    build_maniskill_rlt_intervention_controller,
 )
 
 __all__ = ["ManiskillEnv"]
@@ -126,27 +125,10 @@ class ManiskillEnv(gym.Env):
         self._is_start = True
         self._init_reset_state_ids()
         if self._is_peg_insertion_side:
-            self.info_logging_keys = [
-                "is_grasped_current",
-                "consecutive_grasp_once",
-                "prealign_once",
-                "partial_insert_once",
-                "success",
-                "tcp_peg_dist",
-                "peg_head_hole_x",
-                "peg_head_goal_yz_dist",
-                "peg_body_goal_yz_dist",
-            ]
             self.peg_event_state = init_peg_insertion_event_state(
                 num_envs=self.num_envs,
                 device=self.device,
             )
-        else:
-            self.info_logging_keys = [
-                "is_src_obj_grasped",
-                "consecutive_grasp",
-                "success",
-            ]
         self._show_goal_site_visual()
         if self.record_metrics:
             self._init_metrics()
@@ -183,48 +165,11 @@ class ManiskillEnv(gym.Env):
 
     @property
     def instruction(self):
-        env = self.env.unwrapped
-        if hasattr(env, "get_language_instruction"):
-            instruction = env.get_language_instruction()
-            if instruction is not None:
-                if isinstance(instruction, str):
-                    return [
-                        normalize_peg_instruction(instruction)
-                        for _ in range(self.num_envs)
-                    ]
-                if self._is_peg_insertion_side:
-                    return [
-                        normalize_peg_instruction(item)
-                        for item in instruction
-                    ]
-                return instruction
-
-        for attr in (
-            "task_descriptions",
-            "task_description",
-            "task_prompt",
-            "instruction",
-        ):
-            if not hasattr(env, attr):
-                continue
-            instruction = getattr(env, attr)
-            if instruction is None:
-                continue
-            if isinstance(instruction, str):
-                return [
-                    normalize_peg_instruction(instruction)
-                    for _ in range(self.num_envs)
-                ]
-            if self._is_peg_insertion_side:
-                return [
-                    normalize_peg_instruction(item)
-                    for item in instruction
-                ]
-            return instruction
-
-        if self._is_peg_insertion_side:
-            return default_peg_instruction(num_envs=self.num_envs)
-        return ["" for _ in range(self.num_envs)]
+        return resolve_maniskill_task_descriptions(
+            self.env.unwrapped,
+            num_envs=self.num_envs,
+            is_peg_insertion_side=self._is_peg_insertion_side,
+        )
 
     def _init_reset_state_ids(self):
         self._generator = torch.Generator()
@@ -331,37 +276,12 @@ class ManiskillEnv(gym.Env):
         return state_obs
 
     def _init_rlt_intervention_controller(self):
-        if self.rlt_intervention_cfg is None:
-            self.rlt_intervention_controller = None
-            return
-        if not bool(self.rlt_intervention_cfg.get("enable", False)):
-            self.rlt_intervention_controller = None
-            return
-        if (
-            str(self.rlt_intervention_cfg.get("mode", "local_correction"))
-            != "local_correction"
-        ):
-            self.rlt_intervention_controller = None
-            return
-        if not self._is_peg_insertion_side:
-            raise ValueError(
-                "ManiSkill RLT local correction is only supported for peg-insertion tasks."
-            )
-        env = self.env.unwrapped
-        self.rlt_intervention_controller = ManiSkillLocalCorrectionController(
-            cfg=OmegaConf.create(
-                {
-                    "algorithm": {
-                        "intervention": OmegaConf.to_container(
-                            self.rlt_intervention_cfg,
-                            resolve=True,
-                        )
-                    }
-                }
-            ),
+        self.rlt_intervention_controller = build_maniskill_rlt_intervention_controller(
+            intervention_cfg=self.rlt_intervention_cfg,
+            is_peg_insertion_side=self._is_peg_insertion_side,
+            env=self.env.unwrapped,
             batch_size=self.num_envs,
             mode="train",
-            hole_radii=getattr(env, "box_hole_radii", None),
         )
 
     def _reset_rlt_intervention_controller(self):
@@ -373,14 +293,6 @@ class ManiskillEnv(gym.Env):
             pass
         elif getattr(self.cfg, "reward_mode", "default") == "only_success":
             reward = info["success"] * 1.0
-        elif getattr(self.cfg, "reward_mode", "default") == "rlt_events":
-            reward = torch.zeros(self.num_envs, dtype=torch.float32).to(
-                self.env.unwrapped.device
-            )
-            reward += info["consecutive_grasp_event"].float() * 0.1
-            reward += info["prealign_event"].float() * 0.2
-            reward += info["partial_insert_event"].float() * 0.3
-            reward += info["success_event"].float() * 1.0
         else:
             reward = torch.zeros(self.num_envs, dtype=torch.float32).to(
                 self.env.unwrapped.device
@@ -519,13 +431,13 @@ class ManiskillEnv(gym.Env):
         self, actions: Union[Array, dict] = None, auto_reset=True
     ) -> tuple[Array, Array, Array, Array, dict]:
         raw_obs, _reward, terminations, truncations, infos = self.env.step(actions)
-        if self._is_peg_insertion_side:
-            infos = augment_peg_insertion_info(
-                env=self.env.unwrapped,
-                infos=infos,
-                event_state=self.peg_event_state,
-                device=self.device,
-            )
+        infos = maybe_augment_peg_insertion_info(
+            env=self.env.unwrapped,
+            infos=infos,
+            event_state=getattr(self, "peg_event_state", None),
+            device=self.device,
+            is_peg_insertion_side=self._is_peg_insertion_side,
+        )
         terminations = extract_termination_from_info(
             infos,
             num_envs=self.num_envs,
