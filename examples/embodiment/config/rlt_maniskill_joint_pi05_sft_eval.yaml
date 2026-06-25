@@ -16,7 +16,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0-0
+    actor,env,rollout: all
 
 runner:
   task_type: embodied
@@ -101,8 +101,8 @@ env:
         height: 384
 
   eval:
-    total_num_envs: 8
-    auto_reset: True
+    total_num_envs: 256
+    auto_reset: False
     ignore_terminations: False
     use_fixed_reset_state_ids: True
     wrap_obs_mode: rlt_openpi_joint
@@ -110,7 +110,7 @@ env:
     max_steps_per_rollout_epoch: 500
     group_size: 1
     video_cfg:
-      save_video: True
+      save_video: False
       fps: 10
       record_every: 1
       video_base_dir: ${runner.logger.log_path}/video/eval
@@ -128,22 +128,20 @@ rollout:
   pipeline_stage_num: 1
   collect_transitions: False
   collect_prev_infos: True
-  model:
-    model_path: ${actor.model.model_path}
-    precision: ${actor.model.precision}
+  model: ${actor.model}
   enable_torch_compile: False
   enable_cuda_graph: False
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 8
-  global_batch_size: 8
+  micro_batch_size: 16
+  global_batch_size: 256
   seed: 0
   enable_offload: False
 
   model:
-    model_path: "/path/to/sft/checkpoints/global_step_xxx/actor"
+    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tmp/RLinf-dev/logs/20260624-19:47:44/rlt_stage1_maniskill_joint_alpha1/checkpoints/global_step_5000/actor/vla"
     precision: null
     model_type: "openpi"
     num_action_chunks: 10
