@@ -105,6 +105,7 @@ class ManiskillEnv(gym.Env):
         self.video_cfg = cfg.video_cfg
 
         self.cfg = cfg
+        self._has_seeded_reset = False
         self.task_id = getattr(cfg.init_params, "id", None)
         self._is_peg_insertion_side = is_peg_insertion_side_env_id(self.task_id)
         self.rlt_intervention_cfg = getattr(cfg, "rlt_intervention", None)
@@ -402,12 +403,16 @@ class ManiskillEnv(gym.Env):
         options: Optional[dict] = None,
     ):
         if options is None:
-            seed = self.seed
             options = (
                 {"episode_id": self.reset_state_ids}
                 if self.use_fixed_reset_state_ids
                 else {}
             )
+            if seed is None:
+                if self.use_fixed_reset_state_ids or not self._has_seeded_reset:
+                    seed = self.seed
+        if seed is not None:
+            self._has_seeded_reset = True
         raw_obs, infos = self.env.reset(seed=seed, options=options)
         self._show_goal_site_visual()
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
