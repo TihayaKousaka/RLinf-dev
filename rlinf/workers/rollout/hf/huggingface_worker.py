@@ -30,8 +30,9 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.utils import _split_channel_message as split_channel_message
 
 
 class MultiStepRolloutWorker(Worker):
@@ -294,15 +295,15 @@ class MultiStepRolloutWorker(Worker):
             A merged payload and its split sizes. If only one shard is received, the
             current implementation returns that shard directly.
         """
-        from rlinf.scheduler import (
-            decoupled_build_recv_plan,
+        from rlinf.scheduler.worker.routing import (
+            env_decoupled_build_recv_plan,
             get_batch_size,
             get_group_world_size,
             merge_batches,
         )
 
         world_size = get_group_world_size(self._manager_proxy, group_name)
-        plan = decoupled_build_recv_plan(
+        plan = env_decoupled_build_recv_plan(
             src_group_name=group_name,
             dst_group_name=self.worker_address.root_group_name,
             recv_rank=None,
@@ -413,8 +414,8 @@ class MultiStepRolloutWorker(Worker):
 
             AsyncRouteWork wrapping the async channel put operations.
         """
-        from rlinf.scheduler import build_send_key, split_batch
         from rlinf.scheduler.collective import AsyncRouteWork
+        from rlinf.scheduler.worker.routing import build_send_key, split_batch
 
         assert tag in self.batch_router, (
             f"{tag=} need to be already in the batch_router"

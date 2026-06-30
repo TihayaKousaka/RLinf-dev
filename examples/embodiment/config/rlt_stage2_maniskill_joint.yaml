@@ -35,6 +35,7 @@ rlt:
   rlt_num_layers: 2
   rlt_num_heads: 8
   rlt_mlp_ratio: 4.0
+  rlt_encoder_type: "append_self_attention"
 
 cluster:
   num_nodes: 1
@@ -231,6 +232,7 @@ rollout:
       rlt_num_layers: ${rlt.rlt_num_layers}
       rlt_num_heads: ${rlt.rlt_num_heads}
       rlt_mlp_ratio: ${rlt.rlt_mlp_ratio}
+      rlt_encoder_type: ${rlt.rlt_encoder_type}
       rlt_image_only: False
       rlt_use_mask: True
 

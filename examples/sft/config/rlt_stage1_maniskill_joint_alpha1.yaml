@@ -69,6 +69,7 @@ actor:
       rlt_num_layers: 2
       rlt_num_heads: 8
       rlt_mlp_ratio: 4.0
+      rlt_encoder_type: "append_self_attention"
       rlt_image_only: False
       rlt_use_mask: True
 

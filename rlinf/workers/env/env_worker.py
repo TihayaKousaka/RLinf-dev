@@ -33,7 +33,8 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
-from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
+from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
@@ -732,14 +733,14 @@ class EnvWorker(Worker):
             data=reward_input,
             tag="train_reward_obs",
             async_op=True,
-            decoupled_mode=self.env_decoupled_mode,
+            env_decoupled_mode=self.env_decoupled_mode,
         )
         reward_output = self.recv_from(
             group_name=self.cfg.reward.group_name,
             channel=recv_channel,
             tag="train_reward_obs",
             batch_size=self.train_batch_size,
-            decoupled_mode=self.env_decoupled_mode,
+            env_decoupled_mode=self.env_decoupled_mode,
         )
         if self.reward_mode != "terminal" or reward_output is None:
             return reward_output
@@ -878,7 +879,7 @@ class EnvWorker(Worker):
                 },
                 mode="train",
                 tag="rollout_results",
-                decoupled_mode=self.env_decoupled_mode,
+                env_decoupled_mode=self.env_decoupled_mode,
             )
 
     def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
@@ -1029,7 +1030,7 @@ class EnvWorker(Worker):
                         batch_size=self.train_batch_size,
                         merge_fn=RolloutResult.merge_rollout_results,
                         infer_batch_size_fn=self._infer_rollout_batch_size,
-                        decoupled_mode=self.env_decoupled_mode,
+                        env_decoupled_mode=self.env_decoupled_mode,
                     )
                     if use_rlt_stage2 and self.collect_transitions:
                         self._update_rlt_stage2_transitions(
@@ -1088,7 +1089,7 @@ class EnvWorker(Worker):
                         },
                         mode="train",
                         tag="rollout_results",
-                        decoupled_mode=self.env_decoupled_mode,
+                        env_decoupled_mode=self.env_decoupled_mode,
                     )
                     if self.collect_transitions and not use_rlt_stage2:
                         next_obs = (
@@ -1137,7 +1138,7 @@ class EnvWorker(Worker):
                     batch_size=self.train_batch_size,
                     merge_fn=RolloutResult.merge_rollout_results,
                     infer_batch_size_fn=self._infer_rollout_batch_size,
-                    decoupled_mode=self.env_decoupled_mode,
+                    env_decoupled_mode=self.env_decoupled_mode,
                 )
                 if use_rlt_stage2 and self.collect_transitions:
                     self._update_rlt_stage2_transitions(
@@ -1245,7 +1246,7 @@ class EnvWorker(Worker):
                         },
                         mode="eval",
                         tag="rollout_results",
-                        decoupled_mode=self.env_decoupled_mode,
+                        env_decoupled_mode=self.env_decoupled_mode,
                     )
 
             for eval_step in range(self.n_eval_chunk_steps):
@@ -1258,7 +1259,7 @@ class EnvWorker(Worker):
                         infer_batch_size_fn=self._infer_rollout_batch_size
                         if self.env_decoupled_mode
                         else None,
-                        decoupled_mode=self.env_decoupled_mode,
+                        env_decoupled_mode=self.env_decoupled_mode,
                     )
                     raw_chunk_actions = (
                         rollout_results.actions
@@ -1295,7 +1296,7 @@ class EnvWorker(Worker):
                         },
                         mode="eval",
                         tag="rollout_results",
-                        decoupled_mode=self.env_decoupled_mode,
+                        env_decoupled_mode=self.env_decoupled_mode,
                     )
 
             self.finish_rollout(mode="eval")

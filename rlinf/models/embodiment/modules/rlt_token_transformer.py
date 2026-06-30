@@ -42,7 +42,7 @@ class GeGLU(nn.Module):
 
 
 class RLTCrossAttentionLayer(nn.Module):
-    """Cross-attention transformer block used by the RLT token encoder/decoder."""
+    """Cross-attention transformer block used by RLT token modules."""
 
     def __init__(
         self,
@@ -111,6 +111,60 @@ class RLTCrossAttentionLayer(nn.Module):
         return x + self.mlp(self.mlp_norm(x))
 
 
+class RLTSelfAttentionLayer(nn.Module):
+    """Self-attention transformer block for the RLT prefix-token encoder."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout_rate: float = 0.0,
+    ):
+        super().__init__()
+        mlp_dim = int(embed_dim * mlp_ratio)
+        self.self_norm = nn.LayerNorm(embed_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim,
+            num_heads,
+            dropout=dropout_rate,
+            batch_first=True,
+        )
+        self.mlp_norm = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_dim),
+            nn.Dropout(dropout_rate),
+            GeGLU(mlp_dim),
+            nn.Linear(mlp_dim, embed_dim),
+        )
+
+    @staticmethod
+    def _key_padding_mask(mask: torch.Tensor | None) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        return ~mask.to(dtype=torch.bool)
+
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        key_padding_mask = self._key_padding_mask(mask)
+        if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask.to(device=x.device)
+
+        residual = x
+        x_norm = self.self_norm(x)
+        x = self.self_attn(
+            x_norm,
+            x_norm,
+            x_norm,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )[0]
+        x = residual + x
+
+        return x + self.mlp(self.mlp_norm(x))
+
+
 class RLTTokenEncoder(nn.Module):
     """Compress VLA prefix embeddings into a small set of RL tokens."""
 
@@ -125,27 +179,47 @@ class RLTTokenEncoder(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout_rate: float = 0.0,
+        encoder_type: str = "append_self_attention",
     ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.embed_dim = int(embed_dim)
         self.num_rl_tokens = int(num_rl_tokens)
         self.prefix_seq_len = int(prefix_seq_len)
+        self.encoder_type = encoder_type
 
         self.input_proj = (
             nn.Linear(self.input_dim, self.embed_dim)
             if self.input_dim != self.embed_dim
             else nn.Identity()
         )
-        self.q_embed = nn.Parameter(
-            sinusoidal_pe_init(self.num_rl_tokens, self.embed_dim)
-        )
-        self.y_pos_enc = nn.Parameter(
-            sinusoidal_pe_init(self.prefix_seq_len, self.embed_dim)
-        )
+        if self.encoder_type == "append_self_attention":
+            self.rl_token_embed = nn.Parameter(
+                sinusoidal_pe_init(self.num_rl_tokens, self.embed_dim)
+            )
+            self.prefix_pos_enc = nn.Parameter(
+                sinusoidal_pe_init(self.prefix_seq_len, self.embed_dim)
+            )
+            self.rl_token_pos_enc = nn.Parameter(
+                sinusoidal_pe_init(self.num_rl_tokens, self.embed_dim)
+            )
+            layer_cls = RLTSelfAttentionLayer
+        elif self.encoder_type == "cross_attention":
+            self.q_embed = nn.Parameter(
+                sinusoidal_pe_init(self.num_rl_tokens, self.embed_dim)
+            )
+            self.y_pos_enc = nn.Parameter(
+                sinusoidal_pe_init(self.prefix_seq_len, self.embed_dim)
+            )
+            layer_cls = RLTCrossAttentionLayer
+        else:
+            raise ValueError(
+                f"Unsupported RLT encoder_type={self.encoder_type!r}. "
+                "Use 'append_self_attention' or 'cross_attention'."
+            )
         self.layers = nn.ModuleList(
             [
-                RLTCrossAttentionLayer(
+                layer_cls(
                     self.embed_dim,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
@@ -167,12 +241,44 @@ class RLTTokenEncoder(nn.Module):
             )
 
         batch_size = prefix_embs.shape[0]
-        x = self.q_embed.unsqueeze(0).expand(batch_size, -1, -1)
-        y = prefix_embs + self.y_pos_enc[:seq_len].to(dtype=prefix_embs.dtype)
+        if self.encoder_type == "cross_attention":
+            x = self.q_embed.to(
+                device=prefix_embs.device, dtype=prefix_embs.dtype
+            ).unsqueeze(0).expand(batch_size, -1, -1)
+            y_pos = self.y_pos_enc[:seq_len].to(
+                device=prefix_embs.device, dtype=prefix_embs.dtype
+            )
+            y = prefix_embs + y_pos
+            for layer in self.layers:
+                x = layer(x, y, cross_mask=mask)
+            return x
+
+        prefix_pos = self.prefix_pos_enc[:seq_len].to(
+            device=prefix_embs.device, dtype=prefix_embs.dtype
+        )
+        prefix_tokens = prefix_embs + prefix_pos
+        rl_tokens = self.rl_token_embed.to(
+            device=prefix_embs.device, dtype=prefix_embs.dtype
+        ).unsqueeze(0).expand(batch_size, -1, -1)
+        rl_pos = self.rl_token_pos_enc.to(
+            device=prefix_embs.device, dtype=prefix_embs.dtype
+        )
+        rl_tokens = rl_tokens.to(dtype=prefix_embs.dtype) + rl_pos
+        x = torch.cat([prefix_tokens, rl_tokens], dim=1)
+
+        if mask is not None:
+            mask = mask.to(device=prefix_embs.device, dtype=torch.bool)
+            rl_mask = torch.ones(
+                batch_size,
+                self.num_rl_tokens,
+                device=prefix_embs.device,
+                dtype=torch.bool,
+            )
+            mask = torch.cat([mask, rl_mask], dim=1)
 
         for layer in self.layers:
-            x = layer(x, y, cross_mask=mask)
-        return x
+            x = layer(x, mask=mask)
+        return x[:, -self.num_rl_tokens :]
 
 
 class RLTTokenDecoder(nn.Module):
@@ -250,12 +356,14 @@ class RLTTokenTransformer(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout_rate: float = 0.0,
+        encoder_type: str = "append_self_attention",
     ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.embed_dim = int(embed_dim)
         self.num_rl_tokens = int(num_rl_tokens)
         self.prefix_seq_len = int(prefix_seq_len)
+        self.encoder_type = encoder_type
 
         common_kwargs = {
             "input_dim": self.input_dim,
@@ -267,7 +375,7 @@ class RLTTokenTransformer(nn.Module):
             "mlp_ratio": mlp_ratio,
             "dropout_rate": dropout_rate,
         }
-        self.encoder = RLTTokenEncoder(**common_kwargs)
+        self.encoder = RLTTokenEncoder(**common_kwargs, encoder_type=encoder_type)
         self.decoder = RLTTokenDecoder(**common_kwargs)
 
     @property
