@@ -117,7 +117,6 @@ def _stage2_cfg(*, proprio_dim: int | None = 5):
                 "decoder_heads": 2,
                 "mlp_hidden_dim": 4,
                 "mlp_num_hidden_layers": 0,
-                "actor_noise_sigma": 0.0,
                 "ref_action_dropout": 0.0,
                 "load_feature_backbones": False,
                 "load_rl_token_model": False,

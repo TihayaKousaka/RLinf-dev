@@ -64,6 +64,7 @@ class EnvWorker(Worker):
         self.eval_env_list = []
 
         self.last_obs_list = []
+        self.last_env_infos_list = []
         self.last_intervened_info_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
@@ -374,8 +375,11 @@ class EnvWorker(Worker):
         for i in range(self.stage_num):
             if self.enable_train:
                 if self.cfg.env.train.auto_reset:
-                    extracted_obs, _ = self.env_list[i].reset()
+                    extracted_obs, infos = self.env_list[i].reset()
                     self.last_obs_list.append(extracted_obs)
+                    self.last_env_infos_list.append(
+                        infos if isinstance(infos, dict) else None
+                    )
                     self.last_intervened_info_list.append((None, None))
                 if self.train_enable_offload and self.cfg.env.train.get(
                     "enable_init_offload", True
@@ -751,6 +755,16 @@ class EnvWorker(Worker):
             reward_env_infos[key] = clone_nested_to_cpu(env_infos[key])
         return reward_env_infos
 
+    def _select_rollout_env_infos(
+        self, env_infos: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if not isinstance(env_infos, dict):
+            return None
+        policy_info = env_infos.get("policy_info")
+        if not isinstance(policy_info, dict):
+            return None
+        return {"policy_info": clone_nested_to_cpu(policy_info)}
+
     def _scatter_terminal_reward_output(
         self,
         env_output: EnvOutput,
@@ -821,6 +835,7 @@ class EnvWorker(Worker):
                         if "final_observation" in infos
                         else None
                     ),
+                    env_infos=infos if isinstance(infos, dict) else None,
                     intervene_actions=None,
                     intervene_flags=None,
                 )
@@ -837,6 +852,7 @@ class EnvWorker(Worker):
                     dones=dones,
                     terminations=terminations,
                     truncations=truncations,
+                    env_infos=self.last_env_infos_list[stage_id],
                     intervene_actions=self.last_intervened_info_list[stage_id][0],
                     intervene_flags=self.last_intervened_info_list[stage_id][1],
                 )
@@ -856,6 +872,9 @@ class EnvWorker(Worker):
                 data={
                     "obs": env_batch["obs"],
                     "final_obs": env_batch["final_obs"],
+                    "env_infos": self._select_rollout_env_infos(
+                        env_batch["env_infos"]
+                    ),
                 },
                 mode="train",
                 tag="rollout_results",
@@ -888,6 +907,9 @@ class EnvWorker(Worker):
 
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
+        self.last_env_infos_list = [
+            env_output.env_infos for env_output in env_output_list
+        ]
         self.last_intervened_info_list = [
             (env_output.intervene_actions, env_output.intervene_flags)
             for env_output in env_output_list
@@ -961,10 +983,7 @@ class EnvWorker(Worker):
             )
             for _ in range(self.stage_num)
         ]
-        use_rlt_stage2 = self.cfg.algorithm.get("loss_type", "") in {
-            "rlt_sac",
-            "rlt_td3",
-        }
+        use_rlt_stage2 = self.cfg.algorithm.get("loss_type", "") == "rlt_sac"
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
         env_metrics = defaultdict(list)
 
@@ -1063,6 +1082,9 @@ class EnvWorker(Worker):
                         data={
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            "env_infos": self._select_rollout_env_infos(
+                                env_batch["env_infos"]
+                            ),
                         },
                         mode="train",
                         tag="rollout_results",

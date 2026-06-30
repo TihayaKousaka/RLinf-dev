@@ -41,17 +41,30 @@ class RLTSACLossMixin:
         action_dim = int(self.cfg.actor.model.action_dim)
         return chunk_len, action_dim
 
-    def _algorithm_mode(self) -> str:
-        loss_type = str(self.cfg.algorithm.get("loss_type", "rlt_sac")).lower()
-        if loss_type == "rlt_td3":
-            return "td3"
-        if loss_type == "rlt_sac":
-            return "sac"
-        raise NotImplementedError(f"{loss_type=} is not supported by RLT worker.")
+    def _rlt_schedule_cfg(self):
+        return self.cfg.algorithm.get("rlt_schedule", {})
+
+    def _rlt_schedule_value(self, key: str, default):
+        schedule_cfg = self._rlt_schedule_cfg()
+        if schedule_cfg is not None and key in schedule_cfg:
+            return schedule_cfg.get(key, default)
+        return self.cfg.algorithm.get(key, default)
+
+    def _use_rlt_schedule(self) -> bool:
+        schedule_cfg = self._rlt_schedule_cfg()
+        if schedule_cfg is not None and "enable" in schedule_cfg:
+            return bool(schedule_cfg.get("enable", False))
+        schedule_keys = {
+            "warmup_post_collect_updates",
+            "train_every_transitions",
+            "train_every_episodes",
+            "max_updates_per_train_step",
+        }
+        return any(key in self.cfg.algorithm for key in schedule_keys)
 
     def get_rollout_sync_version(self) -> int:
-        """Expose learner update count so TD3 rollout warmup tracks updates."""
-        if self._algorithm_mode() != "td3":
+        """Expose learner update count when RLT warmup gates actor rollout."""
+        if not self._use_rlt_schedule():
             return super().get_rollout_sync_version()
         return int(self.update_step)
 
@@ -141,49 +154,24 @@ class RLTSACLossMixin:
         target_delta = target_chunk[:, 1:, :] - target_chunk[:, :-1, :]
         return F.mse_loss(pred_delta, target_delta)
 
-    def _not_done(self, terminations: torch.Tensor) -> torch.Tensor:
-        return ~terminations.reshape(terminations.shape[0], -1).bool().any(
-            dim=-1,
-            keepdim=True,
-        )
-
-    def _bootstrap_target(
-        self,
-        rewards: torch.Tensor,
-        terminations: torch.Tensor,
-        q_next: torch.Tensor,
-    ) -> torch.Tensor:
-        reward_target = self._discounted_chunk_rewards(rewards)
-        reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
-        bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
-        bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
-        if bootstrap_type == "always":
-            return reward_target + bootstrap_discount * q_next
-        if bootstrap_type == "standard":
-            return (
-                reward_target
-                + self._not_done(terminations) * bootstrap_discount * q_next
-            )
-        raise NotImplementedError(f"{bootstrap_type=} is not supported!")
-
     def _actor_loss_weights(self) -> tuple[float, float, float, dict[str, float]]:
-        """Resolve TD3 BC/Q/delta weights with local warmup and ramp support."""
-        td3_bc_cfg = self.cfg.algorithm.get("td3_bc", {})
+        """Resolve RLT BC/Q/delta weights with local warmup and ramp support."""
+        rlt_loss_cfg = self.cfg.algorithm.get("rlt_actor_loss", {})
         loss_warmup_updates = int(
-            td3_bc_cfg.get(
+            rlt_loss_cfg.get(
                 "actor_loss_warmup_updates",
                 self.cfg.algorithm.get("actor_loss_warmup_updates", 0),
             )
         )
         ramp_updates = int(
-            td3_bc_cfg.get(
+            rlt_loss_cfg.get(
                 "actor_loss_ramp_updates",
                 self.cfg.algorithm.get("actor_loss_ramp_updates", 0),
             )
         )
         in_warmup = int(self.update_step) < loss_warmup_updates
         warmup_bc_weight = float(
-            td3_bc_cfg.get(
+            rlt_loss_cfg.get(
                 "warmup_bc_weight",
                 self.cfg.algorithm.get(
                     "warmup_bc_weight",
@@ -192,7 +180,7 @@ class RLTSACLossMixin:
             )
         )
         warmup_q_weight = float(
-            td3_bc_cfg.get(
+            rlt_loss_cfg.get(
                 "warmup_q_weight",
                 self.cfg.algorithm.get(
                     "warmup_q_weight",
@@ -201,7 +189,7 @@ class RLTSACLossMixin:
             )
         )
         online_bc_weight = float(
-            td3_bc_cfg.get(
+            rlt_loss_cfg.get(
                 "online_bc_weight",
                 self.cfg.algorithm.get(
                     "online_bc_weight",
@@ -210,7 +198,7 @@ class RLTSACLossMixin:
             )
         )
         online_q_weight = float(
-            td3_bc_cfg.get(
+            rlt_loss_cfg.get(
                 "online_q_weight",
                 self.cfg.algorithm.get(
                     "online_q_weight",
@@ -243,7 +231,7 @@ class RLTSACLossMixin:
             ramp_progress = 1.0
 
         delta_weight = float(
-            td3_bc_cfg.get(
+            rlt_loss_cfg.get(
                 "delta_weight",
                 self.cfg.algorithm.get("delta_weight", 0.0),
             )
@@ -259,43 +247,11 @@ class RLTSACLossMixin:
 
     def _ready_for_online(self) -> bool:
         return int(self.update_step) >= int(
-            self.cfg.algorithm.get("warmup_post_collect_updates", 0)
+            self._rlt_schedule_value("warmup_post_collect_updates", 0)
         )
-
-    def _td3_target_actions(self, next_obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        with torch.no_grad():
-            next_actions, _, _ = self.target_model(
-                forward_type=ForwardType.SAC,
-                obs=next_obs,
-                deterministic=True,
-                apply_action_noise=False,
-            )
-            target_noise_sigma = float(
-                self.cfg.algorithm.get("target_noise_sigma", 0.0)
-            )
-            if target_noise_sigma > 0:
-                target_noise_clip = float(
-                    self.cfg.algorithm.get("target_noise_clip", 0.5)
-                )
-                noise = torch.randn_like(next_actions) * target_noise_sigma
-                noise = noise.clamp(-target_noise_clip, target_noise_clip)
-                next_actions = (next_actions + noise).clamp(-1.0, 1.0)
-            return next_actions
-
-    def _set_q_head_requires_grad(self, requires_grad: bool) -> None:
-        module = self.model.module if hasattr(self.model, "module") else self.model
-        if hasattr(module, "set_q_head_requires_grad"):
-            module.set_q_head_requires_grad(requires_grad)
-            return
-        for name, param in self.model.named_parameters():
-            if "q_head" in name:
-                param.requires_grad_(requires_grad)
 
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
-        if self._algorithm_mode() == "td3":
-            return self.forward_td3_critic(batch)
-
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
         agg_q = self.cfg.algorithm.get("agg_q", "min")
@@ -372,13 +328,16 @@ class RLTSACLossMixin:
         critic_loss = F.mse_loss(
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
-        return critic_loss, {"q_data": all_data_q_values.mean().item()}
+        metrics = {
+            "q_data": all_data_q_values.mean().item(),
+            "q_target": target_q_values.mean().item(),
+        }
+        if self._use_rlt_schedule():
+            metrics["ready_for_online"] = float(self._ready_for_online())
+        return critic_loss, metrics
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
-        if self._algorithm_mode() == "td3":
-            return self.forward_td3_actor(batch)
-
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
         agg_q = self.cfg.algorithm.get(
             "actor_agg_q", self.cfg.algorithm.get("agg_q", "min")
@@ -432,14 +391,21 @@ class RLTSACLossMixin:
         metrics.update(rlt_metrics)
 
         entropy = -log_pi.mean()
-        q_weight = float(self.cfg.algorithm.get("q_weight", 1.0))
-        bc_weight = float(self.cfg.algorithm.get("bc_weight", 1.0))
-        actor_loss = -q_weight * qf_pi.mean() + bc_weight * bc_loss
+        delta_loss = self._chunk_delta_loss(pi, ref_chunk)
+        bc_weight, q_weight, delta_weight, weight_metrics = self._actor_loss_weights()
+        actor_loss = (
+            -q_weight * qf_pi.mean()
+            + bc_weight * bc_loss
+            + delta_weight * delta_loss
+        )
+        metrics.update(weight_metrics)
+        metrics["delta_loss"] = delta_loss.detach().item()
         metrics["weighted_q"] = (q_weight * qf_pi.mean()).detach().item()
         metrics["weighted_bc"] = (bc_weight * bc_loss).detach().item()
-        metrics["q_weight"] = q_weight
-        metrics["bc_weight"] = bc_weight
+        metrics["weighted_delta"] = (delta_weight * delta_loss).detach().item()
         metrics["reference_dropout_prob"] = reference_dropout_prob
+        if self._use_rlt_schedule():
+            metrics["ready_for_online"] = float(self._ready_for_online())
 
         return actor_loss, entropy, metrics
 
@@ -448,116 +414,9 @@ class RLTSACLossMixin:
         del batch
         return self.entropy_temp.compute_alpha() * 0.0
 
-    def forward_td3_critic(self, batch):
-        agg_q = self.cfg.algorithm.get("agg_q", "min")
-        curr_obs = batch["curr_obs"]
-        next_obs = batch["next_obs"]
-        actions = batch["actions"]
-        rewards = batch["rewards"]
-        terminations = batch["terminations"].to(self.torch_dtype)
-
-        with torch.no_grad():
-            next_actions = self._td3_target_actions(next_obs)
-            all_qf_next_target = self.target_model(
-                forward_type=ForwardType.SAC_Q,
-                obs=next_obs,
-                actions=next_actions,
-            )
-            if self.critic_subsample_size > 0:
-                sample_idx = torch.randint(
-                    0,
-                    all_qf_next_target.shape[-1],
-                    (self.critic_subsample_size,),
-                    generator=self.critic_sample_generator,
-                    device=self.device,
-                )
-                all_qf_next_target = all_qf_next_target.index_select(
-                    dim=-1,
-                    index=sample_idx,
-                )
-            q_next = self._aggregate_q(all_qf_next_target, agg_q)
-            target_q_values = self._bootstrap_target(rewards, terminations, q_next)
-
-        all_data_q_values = self.model(
-            forward_type=ForwardType.SAC_Q,
-            obs=curr_obs,
-            actions=actions,
-        )
-        target_q_values = target_q_values.to(dtype=all_data_q_values.dtype)
-        critic_loss = F.mse_loss(
-            all_data_q_values,
-            target_q_values.expand_as(all_data_q_values),
-        )
-        metrics = {
-            "q_data": all_data_q_values.mean().item(),
-            "q_target": target_q_values.mean().item(),
-            "ready_for_online": float(self._ready_for_online()),
-        }
-        return critic_loss, metrics
-
-    def forward_td3_actor(self, batch):
-        agg_q = self.cfg.algorithm.get(
-            "actor_agg_q",
-            self.cfg.algorithm.get("agg_q", "min"),
-        )
-        curr_obs = batch["curr_obs"]
-        reference_dropout_prob = float(
-            self.cfg.algorithm.get("reference_dropout_prob", 0.0)
-        )
-        self._set_q_head_requires_grad(False)
-        try:
-            pi, log_pi, _ = self.model(
-                forward_type=ForwardType.SAC,
-                obs=curr_obs,
-                deterministic=False,
-                apply_action_noise=True,
-                apply_reference_dropout=True,
-                reference_dropout_prob=reference_dropout_prob,
-            )
-            all_qf_pi = self.model(
-                forward_type=ForwardType.SAC_Q,
-                obs=curr_obs,
-                actions=pi,
-                detach_encoder=True,
-            )
-        finally:
-            self._set_q_head_requires_grad(True)
-        qf_pi = self._aggregate_q(all_qf_pi, agg_q)
-
-        ref_chunk = self._ref_chunk(curr_obs)
-        bc_loss, metrics = self._bc_metrics(
-            pi=pi,
-            actions=batch["actions"],
-            ref_chunk=ref_chunk,
-            intervene_flags=batch.get("intervene_flags", None),
-        )
-        delta_loss = self._chunk_delta_loss(pi, ref_chunk)
-        bc_weight, q_weight, delta_weight, weight_metrics = self._actor_loss_weights()
-        actor_loss = (
-            -q_weight * qf_pi.mean()
-            + bc_weight * bc_loss
-            + delta_weight * delta_loss
-        )
-        metrics.update(
-            {
-                f"q_value_{q_id}": all_qf_pi[..., q_id].mean().item()
-                for q_id in range(self.cfg.actor.model.get("num_q_heads", 2))
-            }
-        )
-        metrics.update(weight_metrics)
-        metrics["q_pi"] = qf_pi.mean().item()
-        metrics["delta_loss"] = delta_loss.detach().item()
-        metrics["weighted_q"] = (q_weight * qf_pi.mean()).detach().item()
-        metrics["weighted_bc"] = (bc_weight * bc_loss).detach().item()
-        metrics["weighted_delta"] = (delta_weight * delta_loss).detach().item()
-        metrics["reference_dropout_prob"] = reference_dropout_prob
-        metrics["ready_for_online"] = float(self._ready_for_online())
-        entropy = -log_pi.mean()
-        return actor_loss, entropy, metrics
-
 
 class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
-    """Synchronous RLT worker with optional TD3 warmup scheduling."""
+    """Synchronous RLT worker with optional warmup/update scheduling."""
 
     def __init__(self, cfg):
         super().__init__(cfg)
@@ -568,13 +427,10 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
         self._warmup_ready_total_transitions: int | None = None
         self._warmup_ready_total_episodes: int | None = None
 
-    def _is_td3_mode(self) -> bool:
-        return self.cfg.algorithm.get("loss_type", "") == "rlt_td3"
-
     def setup_sac_components(self):
-        """Initialize replay components and let TD3 warmup own sample readiness."""
+        """Initialize replay components and let RLT schedule own readiness."""
         super().setup_sac_components()
-        if self._is_td3_mode():
+        if self._use_rlt_schedule():
             self.buffer_dataset.min_replay_buffer_size = 1
 
     @staticmethod
@@ -615,7 +471,7 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
             if len(intervene_traj_list) > 0:
                 self.demo_buffer.add_trajectories(intervene_traj_list)
 
-        if self._is_td3_mode():
+        if self._use_rlt_schedule():
             added = sum(self._trajectory_transition_count(traj) for traj in recv_list)
             completed = sum(
                 self._trajectory_completed_episodes(traj) for traj in recv_list
@@ -625,7 +481,7 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
             self.total_transitions_added += added
             self.total_episodes_added += completed
 
-    def _global_td3_counters(self) -> dict[str, float]:
+    def _global_rlt_counters(self) -> dict[str, float]:
         summed = all_reduce_dict(
             {
                 "transitions_since_train": float(self.transitions_since_train),
@@ -647,18 +503,18 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
         summed.update(minimums)
         return summed
 
-    def _td3_updates_to_run(self) -> tuple[int, dict[str, float]]:
+    def _rlt_updates_to_run(self) -> tuple[int, dict[str, float]]:
         replay_cfg = self.cfg.algorithm.replay_buffer
         min_buffer_size = int(
             replay_cfg.get(
                 "min_buffer_size",
-                self.cfg.algorithm.get("warmup_min_size", 1),
+                self._rlt_schedule_value("warmup_min_size", 1),
             )
         )
-        counters = self._global_td3_counters()
+        counters = self._global_rlt_counters()
         buffer_ready = counters["min_replay_size"] >= min_buffer_size
         warmup_required_updates = int(
-            self.cfg.algorithm.get("warmup_post_collect_updates", 0)
+            self._rlt_schedule_value("warmup_post_collect_updates", 0)
         )
         if buffer_ready and self._warmup_ready_total_transitions is None:
             self._warmup_ready_total_transitions = int(
@@ -673,10 +529,12 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
             skip_reason = 1
         else:
             train_every_transitions = int(
-                self.cfg.algorithm.get("train_every_transitions", 0)
+                self._rlt_schedule_value("train_every_transitions", 0)
             )
-            train_every_episodes = int(self.cfg.algorithm.get("train_every_episodes", 0))
-            update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
+            train_every_episodes = int(
+                self._rlt_schedule_value("train_every_episodes", 0)
+            )
+            update_epoch = int(self._rlt_schedule_value("update_epoch", 1))
             online_transitions = max(
                 int(counters["total_transitions_added"])
                 - int(self._warmup_ready_total_transitions or 0),
@@ -706,7 +564,9 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
             )
             pending_updates = max(desired_total_updates - int(self.update_step), 0)
             updates_to_run = pending_updates
-            max_updates = int(self.cfg.algorithm.get("max_updates_per_train_step", 0))
+            max_updates = int(
+                self._rlt_schedule_value("max_updates_per_train_step", 0)
+            )
             if max_updates > 0:
                 updates_to_run = min(updates_to_run, max_updates)
             if updates_to_run <= 0:
@@ -733,14 +593,14 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
         return updates_to_run, metrics
 
     def run_training(self):
-        if not self._is_td3_mode():
+        if not self._use_rlt_schedule():
             return super().run_training()
 
         if self.cfg.actor.get("enable_offload", False):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)
 
-        updates_to_run, schedule_metrics = self._td3_updates_to_run()
+        updates_to_run, schedule_metrics = self._rlt_updates_to_run()
         if updates_to_run <= 0:
             mean_metric_dict = self.process_train_metrics(schedule_metrics)
             torch.cuda.synchronize()

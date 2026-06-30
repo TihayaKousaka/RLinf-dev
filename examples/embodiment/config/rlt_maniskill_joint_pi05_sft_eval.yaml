@@ -141,7 +141,9 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tmp/RLinf-dev/logs/20260624-19:47:44/rlt_stage1_maniskill_joint_alpha1/checkpoints/global_step_5000/actor/vla"
+    # Unified Stage1 checkpoint directory. The OpenPI loader reads
+    # model_state_dict/full_weights.pt from this actor directory.
+    model_path: "/logs/20260630-12:57:56/rlt_stage1_maniskill_joint_alpha1/checkpoints/global_step_1000/actor"
     precision: null
     model_type: "openpi"
     num_action_chunks: 10
@@ -158,8 +160,20 @@ actor:
       action_horizon: 10
       action_chunk: ${actor.model.num_action_chunks}
       action_env_dim: ${actor.model.action_dim}
+      num_steps: ${actor.model.num_steps}
+      use_rlt: True
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      rlt_num_rl_tokens: 1
+      rlt_prefix_seq_len: 1024
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_image_only: False
+      rlt_use_mask: True
     openpi_data:
-      repo_id: "rlt_maniskill_joint"
+      repo_id: "maniskill_peginsertionside_joint"
       default_prompt: "insert the peg in the hole"
 
   optim:

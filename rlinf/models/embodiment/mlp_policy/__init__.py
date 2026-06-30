@@ -35,8 +35,6 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             q_head_type=cfg.get("q_head_type", "default"),
             hidden_dim=cfg.get("hidden_dim", 256),
             num_q_heads=cfg.get("num_q_heads", 2),
-            algorithm_mode=cfg.get("algorithm_mode", "sac"),
-            actor_noise_sigma=cfg.get("actor_noise_sigma", 0.1),
         )
     elif iql_config is not None:
         model = IQLMLPPolicy(

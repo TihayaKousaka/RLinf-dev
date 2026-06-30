@@ -72,6 +72,7 @@ class MultiStepRolloutWorker(Worker):
         self.eval_rollout_epoch = eval_env_cfg.rollout_epoch if self.enable_eval else 1
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.expert_model = None
+        self._rlt_expert_model_config = None
         self.rlt_feature_model = None
 
         self.total_num_train_envs = (
@@ -151,17 +152,22 @@ class MultiStepRolloutWorker(Worker):
             self.rlt_feature_model.requires_grad_(False)
 
         if self.cfg.rollout.get("expert_model", None):
-            expert_model_config = copy.deepcopy(self.model_cfg)
-            with open_dict(expert_model_config):
-                expert_model_config.precision = self.cfg.rollout.expert_model.precision
-                expert_model_config.model_path = (
-                    self.cfg.rollout.expert_model.model_path
-                )
-            self.expert_model = get_model(expert_model_config)
+            if self._use_rlt_maniskill_route():
+                self._rlt_expert_model_config = self._build_rlt_expert_model_config()
+            else:
+                expert_model_config = copy.deepcopy(self.model_cfg)
+                with open_dict(expert_model_config):
+                    expert_model_config.precision = (
+                        self.cfg.rollout.expert_model.precision
+                    )
+                    expert_model_config.model_path = (
+                        self.cfg.rollout.expert_model.model_path
+                    )
+                self.expert_model = get_model(expert_model_config)
 
-            if self.cfg.runner.get("expert_ckpt_path", None):
-                expert_model_dict = torch.load(self.cfg.runner.expert_ckpt_path)
-                self.expert_model.load_state_dict(expert_model_dict)
+                if self.cfg.runner.get("expert_ckpt_path", None):
+                    expert_model_dict = torch.load(self.cfg.runner.expert_ckpt_path)
+                    self.expert_model.load_state_dict(expert_model_dict)
 
         self.hf_model.eval()
         if self.expert_model is not None:
@@ -481,7 +487,7 @@ class MultiStepRolloutWorker(Worker):
         ).async_wait()
 
     def update_dagger_beta(self):
-        if self.expert_model is None:
+        if self.expert_model is None or not hasattr(self, "_dagger_sampling_params"):
             return
 
         if self._dagger_sampling_params["beta_schedule"] == "exponential":
@@ -533,7 +539,11 @@ class MultiStepRolloutWorker(Worker):
             "only_save_expert", True
         )
 
-        if mode == "train" and self.expert_model is not None:
+        if (
+            mode == "train"
+            and self.expert_model is not None
+            and hasattr(self, "_dagger_sampling_params")
+        ):
             # training with expert model. Beta-probability acting.
             use_expert = torch.rand(1).item() < self._dagger_sampling_params["beta"]
         else:
@@ -584,16 +594,309 @@ class MultiStepRolloutWorker(Worker):
         env_obs: dict[str, Any],
         mode: Literal["train", "eval"] = "train",
         final_obs: dict[str, Any] | None = None,
+        env_infos: dict[str, Any] | None = None,
+        allow_expert: bool = True,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
-            return self._predict_with_rlt_features(env_obs, final_obs, mode)
+            return self._predict_with_rlt_features(
+                env_obs,
+                final_obs,
+                mode,
+                env_infos=env_infos,
+                allow_expert=allow_expert,
+            )
         return self.predict(env_obs, mode=mode)
+
+    def _rlt_schedule_cfg(self):
+        return self.cfg.algorithm.get("rlt_schedule", {})
+
+    def _rlt_schedule_value(self, key: str, default):
+        schedule_cfg = self._rlt_schedule_cfg()
+        if schedule_cfg is not None and key in schedule_cfg:
+            return schedule_cfg.get(key, default)
+        return self.cfg.algorithm.get(key, default)
+
+    def _use_rlt_schedule(self) -> bool:
+        if str(self.cfg.algorithm.get("loss_type", "")) != "rlt_sac":
+            return False
+        schedule_cfg = self._rlt_schedule_cfg()
+        if schedule_cfg is not None and "enable" in schedule_cfg:
+            return bool(schedule_cfg.get("enable", False))
+        schedule_keys = {
+            "warmup_post_collect_updates",
+            "train_every_transitions",
+            "train_every_episodes",
+            "max_updates_per_train_step",
+        }
+        return any(key in self.cfg.algorithm for key in schedule_keys)
+
+    def _use_rlt_maniskill_route(self) -> bool:
+        train_env_cfg = self.cfg.env.get("train", None)
+        return (
+            str(self.cfg.algorithm.get("loss_type", "")) == "rlt_sac"
+            and train_env_cfg is not None
+            and str(train_env_cfg.get("env_type", "")) == "maniskill"
+        )
+
+    def _build_rlt_expert_model_config(self):
+        rlt_feature_model_config = OmegaConf.select(
+            self.cfg, "rollout.rlt_feature_model", default=None
+        )
+        if rlt_feature_model_config is None:
+            raise ValueError(
+                "ManiSkill RLT expert requires rollout.rlt_feature_model so the "
+                "expert can reuse the same OpenPI/RL-token config."
+            )
+        expert_model_config = copy.deepcopy(rlt_feature_model_config)
+        expert_overrides = OmegaConf.to_container(
+            self.cfg.rollout.expert_model,
+            resolve=True,
+        )
+        expert_overrides = {} if expert_overrides is None else dict(expert_overrides)
+        expert_model_config = OmegaConf.merge(expert_model_config, expert_overrides)
+        return expert_model_config
+
+    def _ensure_rlt_expert_model_loaded(self):
+        if self.expert_model is not None:
+            return self.expert_model
+        if self._rlt_expert_model_config is None:
+            raise RuntimeError(
+                "ManiSkill RLT expert takeover requested, but "
+                "rollout.expert_model is not configured."
+            )
+        self.expert_model = get_model(copy.deepcopy(self._rlt_expert_model_config))
+        self.expert_model.eval()
+        self.expert_model.requires_grad_(False)
+        return self.expert_model
+
+    @staticmethod
+    def _flatten_action_chunk(actions: torch.Tensor) -> torch.Tensor:
+        if actions.dim() <= 2:
+            return actions
+        return actions.reshape(actions.shape[0], -1)
+
+    @staticmethod
+    def _policy_info_bool(
+        policy_info: dict[str, Any] | None,
+        key: str,
+        *,
+        batch_size: int,
+        device: torch.device,
+        default: bool,
+    ) -> torch.Tensor:
+        if policy_info is None or key not in policy_info:
+            return torch.full(
+                (batch_size,), bool(default), dtype=torch.bool, device=device
+            )
+        value = torch.as_tensor(policy_info[key], device=device)
+        if value.numel() == 1:
+            return torch.full(
+                (batch_size,),
+                bool(value.reshape(-1)[0].item()),
+                dtype=torch.bool,
+                device=device,
+            )
+        return value.reshape(batch_size, -1).to(torch.bool).any(dim=1)
+
+    @staticmethod
+    def _policy_info_float(
+        policy_info: dict[str, Any] | None,
+        key: str,
+        *,
+        batch_size: int,
+        device: torch.device,
+        default: float,
+    ) -> torch.Tensor:
+        if policy_info is None or key not in policy_info:
+            return torch.full(
+                (batch_size,), float(default), dtype=torch.float32, device=device
+            )
+        value = torch.as_tensor(policy_info[key], device=device)
+        if value.numel() == 1:
+            return torch.full(
+                (batch_size,),
+                float(value.reshape(-1)[0].item()),
+                dtype=torch.float32,
+                device=device,
+            )
+        return value.reshape(batch_size, -1)[:, -1].to(torch.float32)
+
+    def _rlt_ready_for_online(self) -> bool:
+        if not self._use_rlt_schedule():
+            return True
+        return int(self.version) >= int(
+            self._rlt_schedule_value("warmup_post_collect_updates", 0)
+        )
+
+    def _rlt_base_actions(
+        self,
+        ref_chunk: torch.Tensor,
+        *,
+        chunk_len: int,
+        action_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if ref_chunk.dim() == 2:
+            ref_chunk = ref_chunk.reshape(ref_chunk.shape[0], -1, action_dim)
+        return ref_chunk[:, :chunk_len, :action_dim].to(device=device, dtype=dtype)
+
+    def _rlt_expert_actions(
+        self,
+        env_obs: dict[str, Any],
+        *,
+        chunk_len: int,
+        action_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        expert_model = self._ensure_rlt_expert_model_loaded()
+        with torch.no_grad():
+            expert_actions, _ = expert_model.predict_action_batch(
+                env_obs=env_obs,
+                mode="eval",
+                compute_values=False,
+            )
+        if isinstance(expert_actions, np.ndarray):
+            expert_actions = torch.from_numpy(expert_actions)
+        if expert_actions.dim() == 2:
+            expert_actions = expert_actions.reshape(
+                expert_actions.shape[0], -1, action_dim
+            )
+        return expert_actions[:, :chunk_len, :action_dim].to(
+            device=device,
+            dtype=dtype,
+        )
+
+    def _route_rlt_maniskill_actions(
+        self,
+        *,
+        env_obs: dict[str, Any],
+        rlt_obs: dict[str, torch.Tensor],
+        student_actions: torch.Tensor,
+        result: dict[str, Any],
+        mode: Literal["train", "eval"],
+        env_infos: dict[str, Any] | None,
+        allow_expert: bool,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if not self._use_rlt_maniskill_route():
+            return student_actions, result
+
+        actions = student_actions
+        batch_size, chunk_len, action_dim = actions.shape
+        policy_info = None
+        if isinstance(env_infos, dict) and isinstance(
+            env_infos.get("policy_info"), dict
+        ):
+            policy_info = env_infos["policy_info"]
+
+        ready_for_online = self._rlt_ready_for_online()
+        in_critical_phase = self._policy_info_bool(
+            policy_info,
+            "in_critical_phase",
+            batch_size=batch_size,
+            device=actions.device,
+            default=True,
+        )
+        requested_expert_takeover = self._policy_info_bool(
+            policy_info,
+            "expert_takeover",
+            batch_size=batch_size,
+            device=actions.device,
+            default=False,
+        )
+        expert_takeover = (
+            requested_expert_takeover
+            & ready_for_online
+            & bool(allow_expert)
+            & (mode == "train")
+        )
+        use_actor = env_obs.get("rlt_use_actor", None)
+        if use_actor is None:
+            actor_control = (
+                torch.full(
+                    (batch_size,),
+                    bool(ready_for_online),
+                    dtype=torch.bool,
+                    device=actions.device,
+                )
+                & in_critical_phase
+            )
+        else:
+            actor_control = torch.as_tensor(
+                use_actor, device=actions.device
+            ).bool().reshape(batch_size, -1).any(dim=1)
+
+        base_actions = self._rlt_base_actions(
+            rlt_obs["ref_chunk"],
+            chunk_len=chunk_len,
+            action_dim=action_dim,
+            device=actions.device,
+            dtype=actions.dtype,
+        )
+        routed_actions = torch.where(
+            actor_control[:, None, None],
+            actions,
+            base_actions,
+        ).contiguous()
+
+        intervention_flags = torch.zeros(
+            (batch_size, chunk_len),
+            dtype=torch.bool,
+            device=actions.device,
+        )
+        if expert_takeover.any():
+            expert_actions = self._rlt_expert_actions(
+                env_obs,
+                chunk_len=chunk_len,
+                action_dim=action_dim,
+                device=actions.device,
+                dtype=actions.dtype,
+            )
+            routed_actions = torch.where(
+                expert_takeover[:, None, None],
+                expert_actions,
+                routed_actions,
+            ).contiguous()
+            intervention_flags[expert_takeover] = True
+
+        forward_inputs = result["forward_inputs"]
+        forward_inputs["action"] = self._flatten_action_chunk(routed_actions).detach()
+        forward_inputs["intervention_flags"] = intervention_flags
+        forward_inputs["student_control"] = actor_control[:, None]
+        forward_inputs["intervention_requested"] = requested_expert_takeover[:, None]
+        forward_inputs["in_critical_phase"] = in_critical_phase[:, None]
+        forward_inputs["record_transition"] = self._policy_info_bool(
+            policy_info,
+            "record_transition",
+            batch_size=batch_size,
+            device=actions.device,
+            default=True,
+        )[:, None]
+        forward_inputs["intervention_phase"] = self._policy_info_float(
+            policy_info,
+            "intervention_phase",
+            batch_size=batch_size,
+            device=actions.device,
+            default=0.0,
+        )[:, None]
+        forward_inputs["ready_for_online"] = torch.full(
+            (batch_size, 1),
+            bool(ready_for_online),
+            dtype=torch.bool,
+            device=actions.device,
+        )
+        result["expert_label_flag"] = bool(expert_takeover.any().item())
+        return routed_actions, result
 
     def _predict_with_rlt_features(
         self,
         env_obs: dict[str, Any],
         final_obs: dict[str, Any] | None,
         mode: Literal["train", "eval"],
+        *,
+        env_infos: dict[str, Any] | None = None,
+        allow_expert: bool = True,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         with torch.no_grad():
             rlt_obs = self.rlt_feature_model.extract_rlt_stage2_obs(
@@ -607,36 +910,42 @@ class MultiStepRolloutWorker(Worker):
             if isinstance(actions, np.ndarray):
                 actions = torch.from_numpy(actions)
 
-            use_actor = env_obs.get("rlt_use_actor", None)
-            if use_actor is None and str(
-                self.cfg.algorithm.get("loss_type", "")
-            ) == "rlt_td3":
-                ready_for_online = int(self.version) >= int(
-                    self.cfg.algorithm.get("warmup_post_collect_updates", 0)
+            if self._use_rlt_maniskill_route():
+                actions, result = self._route_rlt_maniskill_actions(
+                    env_obs=env_obs,
+                    rlt_obs=rlt_obs,
+                    student_actions=actions,
+                    result=result,
+                    mode=mode,
+                    env_infos=env_infos,
+                    allow_expert=allow_expert,
                 )
-                use_actor = torch.full(
-                    (actions.shape[0],),
-                    ready_for_online,
-                    dtype=torch.bool,
-                    device=actions.device,
-                )
-            if use_actor is not None:
-                use_actor = (
-                    torch.as_tensor(use_actor, device=actions.device)
-                    .bool()
-                    .reshape(actions.shape[0], 1, 1)
-                )
-                ref_actions = result["forward_inputs"]["ref_chunk"].to(
-                    device=actions.device, dtype=actions.dtype
-                )
-                actions = torch.where(
-                    use_actor,
-                    actions,
-                    ref_actions[:, : actions.shape[1], : actions.shape[2]],
-                ).contiguous()
-                result["forward_inputs"]["action"] = actions.reshape(
-                    actions.shape[0], -1
-                ).contiguous()
+            else:
+                use_actor = env_obs.get("rlt_use_actor", None)
+                if use_actor is None and self._use_rlt_schedule():
+                    use_actor = torch.full(
+                        (actions.shape[0],),
+                        self._rlt_ready_for_online(),
+                        dtype=torch.bool,
+                        device=actions.device,
+                    )
+                if use_actor is not None:
+                    use_actor = (
+                        torch.as_tensor(use_actor, device=actions.device)
+                        .bool()
+                        .reshape(actions.shape[0], 1, 1)
+                    )
+                    ref_actions = result["forward_inputs"]["ref_chunk"].to(
+                        device=actions.device, dtype=actions.dtype
+                    )
+                    actions = torch.where(
+                        use_actor,
+                        actions,
+                        ref_actions[:, : actions.shape[1], : actions.shape[2]],
+                    ).contiguous()
+                    result["forward_inputs"]["action"] = actions.reshape(
+                        actions.shape[0], -1
+                    ).contiguous()
 
             transition_obs = rlt_obs
             if final_obs is not None:
@@ -646,7 +955,7 @@ class MultiStepRolloutWorker(Worker):
             for key in ("z_rl", "proprio", "ref_chunk"):
                 result["forward_inputs"][f"rlt_transition_{key}"] = transition_obs[key]
 
-        result["expert_label_flag"] = False
+        result["expert_label_flag"] = bool(result.get("expert_label_flag", False))
         return actions, result
 
     def get_bootstrap_values(
@@ -659,7 +968,10 @@ class MultiStepRolloutWorker(Worker):
         ):
             return None
         with torch.no_grad():
-            actions, result = self._predict_rollout_actions(final_obs)
+            actions, result = self._predict_rollout_actions(
+                final_obs,
+                allow_expert=False,
+            )
             if "prev_values" in result and result["prev_values"] is not None:
                 final_values = result["prev_values"]
             else:
@@ -724,11 +1036,15 @@ class MultiStepRolloutWorker(Worker):
                     batch_size=self.train_batch_size,
                 )
                 actions, result = self._predict_rollout_actions(
-                    env_output["obs"], final_obs=env_output.get("final_obs", None)
+                    env_output["obs"],
+                    final_obs=env_output.get("final_obs", None),
+                    env_infos=env_output.get("env_infos", None),
                 )
 
-                save_flags = None
-                if result.get("expert_label_flag", False):
+                save_flags = result.get("forward_inputs", {}).get(
+                    "intervention_flags", None
+                )
+                if save_flags is None and result.get("expert_label_flag", False):
                     save_flags = torch.full(
                         (actions.shape[0], self.model_cfg.num_action_chunks),
                         True,
@@ -768,7 +1084,10 @@ class MultiStepRolloutWorker(Worker):
                 batch_size=self.train_batch_size,
             )
             actions, result = self._predict_rollout_actions(
-                env_output["obs"], final_obs=env_output.get("final_obs", None)
+                env_output["obs"],
+                final_obs=env_output.get("final_obs", None),
+                env_infos=env_output.get("env_infos", None),
+                allow_expert=False,
             )
 
             rollout_result = RolloutResult(
@@ -829,7 +1148,10 @@ class MultiStepRolloutWorker(Worker):
                     recv_queue_size=self.rollout_queue_size,
                 )
                 actions, _ = self._predict_rollout_actions(
-                    env_output["obs"], mode="eval"
+                    env_output["obs"],
+                    mode="eval",
+                    env_infos=env_output.get("env_infos", None),
+                    allow_expert=False,
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
@@ -854,7 +1176,10 @@ class MultiStepRolloutWorker(Worker):
                             batch_size=self.eval_batch_size,
                         )
                         actions, _ = self._predict_rollout_actions(
-                            env_output["obs"], mode="eval"
+                            env_output["obs"],
+                            mode="eval",
+                            env_infos=env_output.get("env_infos", None),
+                            allow_expert=False,
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
@@ -874,12 +1199,16 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model.to("cpu")
         if self.rlt_feature_model is not None:
             self.rlt_feature_model.to("cpu")
+        if self.expert_model is not None:
+            self.expert_model.to("cpu")
         self.torch_platform.empty_cache()
 
     def reload_model(self):
         self.hf_model.to(self.device)
         if self.rlt_feature_model is not None:
             self.rlt_feature_model.to(self.device)
+        if self.expert_model is not None:
+            self.expert_model.to(self.device)
         if self.enable_cuda_graph:
             self.hf_model.capture_cuda_graph(
                 train_batch_size=self.per_node_train_batch_size,
@@ -906,6 +1235,7 @@ class MultiStepRolloutWorker(Worker):
             for obs_batch in obs_batches
         ]
         final_obs_list = [obs_batch.get("final_obs", None) for obs_batch in obs_batches]
+        env_infos_list = [obs_batch.get("env_infos", None) for obs_batch in obs_batches]
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged: dict[str, Any] = {}
@@ -933,7 +1263,27 @@ class MultiStepRolloutWorker(Worker):
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
 
-        return {"obs": merged_obs, "final_obs": merged_final_obs}
+        merged_env_infos = None
+        if any(env_infos is not None for env_infos in env_infos_list):
+            merged_env_infos = {}
+            keys = set()
+            for env_infos in env_infos_list:
+                if isinstance(env_infos, dict):
+                    keys.update(env_infos.keys())
+            for key in keys:
+                values = [
+                    env_infos[key]
+                    for env_infos in env_infos_list
+                    if isinstance(env_infos, dict) and key in env_infos
+                ]
+                if values:
+                    merged_env_infos[key] = _merge_obs_dicts(values)
+
+        return {
+            "obs": merged_obs,
+            "final_obs": merged_final_obs,
+            "env_infos": merged_env_infos,
+        }
 
     def _split_rollout_result(
         self, rollout_result: RolloutResult, sizes: list[int]

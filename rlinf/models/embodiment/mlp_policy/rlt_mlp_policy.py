@@ -24,9 +24,8 @@ class RLTMLPPolicy(MLPPolicy):
 
     Actor input follows RLT: reference action chunk, RL token feature, and
     proprioceptive state. Critic input follows RLT: action chunk, RL token
-    feature, and proprioceptive state. ``algorithm_mode`` keeps the feature/rlt
-    SAC behavior as the default and enables a deterministic TD3 actor path for
-    ManiSkill RLT without adding another policy class.
+    feature, and proprioceptive state. The actor is a Gaussian policy over
+    action chunks, matching the RLT Stage2 objective.
     """
 
     def __init__(
@@ -40,17 +39,9 @@ class RLTMLPPolicy(MLPPolicy):
         q_head_type: str = "default",
         hidden_dim: int = 256,
         num_q_heads: int = 2,
-        algorithm_mode: str = "sac",
-        actor_noise_sigma: float = 0.1,
     ):
         if not add_q_head:
             raise ValueError("RLTMLPPolicy requires add_q_head=True for RL training.")
-        algorithm_mode = str(algorithm_mode).lower()
-        if algorithm_mode not in {"sac", "td3"}:
-            raise ValueError(
-                "RLTMLPPolicy algorithm_mode must be 'sac' or 'td3', "
-                f"got {algorithm_mode!r}."
-            )
         z_dim = int(z_dim)
         proprio_dim = int(proprio_dim)
         step_action_dim = int(action_dim)
@@ -76,8 +67,6 @@ class RLTMLPPolicy(MLPPolicy):
         self.step_action_dim = step_action_dim
         self.chunk_len = chunk_len
         self.flat_action_dim = flat_action_dim
-        self.algorithm_mode = algorithm_mode
-        self.actor_noise_sigma = float(actor_noise_sigma)
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -146,9 +135,9 @@ class RLTMLPPolicy(MLPPolicy):
         apply_reference_dropout: bool = False,
         reference_dropout_prob: float = 0.0,
         deterministic: bool = False,
-        apply_action_noise: bool | None = None,
         **kwargs,
     ):
+        del kwargs
         actor_state = self._actor_state(
             obs,
             apply_reference_dropout=apply_reference_dropout,
@@ -156,24 +145,6 @@ class RLTMLPPolicy(MLPPolicy):
         )
         feat = self.backbone(actor_state)
         action_mean = self.actor_mean(feat)
-        if self.algorithm_mode == "td3":
-            if apply_action_noise is None:
-                apply_action_noise = not deterministic
-            raw_action = action_mean
-            if apply_action_noise and self.actor_noise_sigma > 0.0:
-                raw_action = (
-                    raw_action
-                    + torch.randn_like(raw_action) * self.actor_noise_sigma
-                )
-            action = torch.tanh(raw_action)
-            logprobs = torch.zeros(
-                action.shape[0],
-                1,
-                device=action.device,
-                dtype=action.dtype,
-            )
-            return action, logprobs, None
-
         action_logstd = self.actor_logstd(feat)
         action_logstd = torch.tanh(action_logstd)
         action_logstd = self.logstd_range[0] + 0.5 * (
