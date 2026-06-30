@@ -87,6 +87,7 @@ SupportedModel.OPENVLA_OFT = SupportedModel.register("openvla_oft", force=True)
 SupportedModel.OPENPI = SupportedModel.register("openpi", force=True)
 SupportedModel.STARVLA = SupportedModel.register("starvla", force=True)
 SupportedModel.MLP_POLICY = SupportedModel.register("mlp_policy", force=True)
+SupportedModel.RLT_MLP_POLICY = SupportedModel.register("rlt_mlp_policy", force=True)
 SupportedModel.GR00T = SupportedModel.register("gr00t", force=True)
 SupportedModel.DEXBOTIC_PI = SupportedModel.register("dexbotic_pi", force=True)
 SupportedModel.DEXBOTIC_DM0 = SupportedModel.register("dexbotic_dm0", force=True)
@@ -99,8 +100,6 @@ SupportedModel.ABOT_M0 = SupportedModel.register("abot_m0", force=True)
 SupportedModel.RESNET_REWARD = SupportedModel.register("resnet", force=True)
 SupportedModel.CFG_MODEL = SupportedModel.register("cfg_model", force=True)
 SupportedModel.VALUE_MODEL = SupportedModel.register("value_model", force=True)
-SupportedModel.RLT_STAGE2 = SupportedModel.register("rlt_stage2", force=True)
-SupportedModel.RLT_STAGE1 = SupportedModel.register("rlt_stage1", force=True)
 
 SupportedModel.QWEN2_5_VL_SFT = SupportedModel.register("qwen2.5_vl", force=True)
 SupportedModel.QWEN3_VL_SFT = SupportedModel.register("qwen3_vl", force=True)
@@ -115,6 +114,7 @@ EMBODIED_MODEL = set(
         SupportedModel.OPENPI,
         SupportedModel.STARVLA,
         SupportedModel.MLP_POLICY,
+        SupportedModel.RLT_MLP_POLICY,
         SupportedModel.GR00T,
         SupportedModel.DEXBOTIC_PI,
         SupportedModel.DEXBOTIC_DM0,
@@ -129,7 +129,6 @@ EMBODIED_MODEL = set(
         SupportedModel.GR00T_N1D7,
         SupportedModel.CFG_MODEL,
         SupportedModel.VALUE_MODEL,
-        SupportedModel.RLT_STAGE2,
     }
 )
 

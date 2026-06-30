@@ -53,6 +53,9 @@ from rlinf.models.embodiment.openpi.dataconfig.libero_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.maniskill_dataconfig import (
     LeRobotManiSkillDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.rlt_maniskill_joint_dataconfig import (
+    LeRobotRLTManiSkillJointDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.metaworld_dataconfig import (
     LeRobotMetaworldDataConfig,
 )
@@ -61,9 +64,6 @@ from rlinf.models.embodiment.openpi.dataconfig.polaris_dataconfig import (
 )
 from rlinf.models.embodiment.openpi.dataconfig.realworld_dataconfig import (
     LeRobotRealworldDataConfig,
-)
-from rlinf.models.embodiment.openpi.dataconfig.rlt_maniskill_joint_dataconfig import (
-    LeRobotRLTManiSkillJointDataConfig,
 )
 from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
     LeRobotRobocasaDataConfig,
@@ -156,41 +156,19 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_rlt_maniskill_joint",
         model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=True
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=True,
         ),
         data=LeRobotRLTManiSkillJointDataConfig(
-            repo_id="rlt_maniskill_joint",
+            repo_id="physical-intelligence/maniskill",
             base_config=DataConfig(prompt_from_task=False),
             assets=AssetsConfig(
                 assets_dir="checkpoints/torch/pi05_rlt_maniskill_joint/assets"
             ),
             extra_delta_transform=False,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "checkpoints/jax/pi05_base"
-        ),
-        pytorch_weight_path="checkpoints/torch/pi05_base",
-        seed=0,
-        batch_size=256,
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        num_workers=8,
-        num_train_steps=5_000,
-        log_interval=5,
-        save_interval=250,
-    ),
-    TrainConfig(
-        name="pi05_rlt_realworld_ee",
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=True
-        ),
-        data=LeRobotRealworldDataConfig(
-            repo_id="rlt_realworld_ee",
-            base_config=DataConfig(prompt_from_task=False),
-            assets=AssetsConfig(
-                assets_dir="checkpoints/torch/pi05_rlt_realworld_ee/assets"
-            ),
-            extra_delta_transform=False,
+            default_prompt="insert the peg in the hole",
+            output_action_dim=8,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "checkpoints/jax/pi05_base"
@@ -217,6 +195,33 @@ _CONFIGS = [
                 assets_dir="checkpoints/torch/pi05_franka_pretrained/assets"
             ),
             output_action_dim=6,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        seed=0,
+        batch_size=16,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=8,
+        num_train_steps=5_000,
+        log_interval=5,
+        save_interval=250,
+    ),
+    TrainConfig(
+        name="pi05_franka_state7d",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=20, discrete_state_input=True
+        ),
+        data=LeRobotFrankaEEDataConfig(
+            repo_id="physical-intelligence/real_rl",  # Not important
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi05_franka_pretrained/assets"
+            ),
+            output_action_dim=7,
+            pad_state=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "checkpoints/jax/pi05_base"

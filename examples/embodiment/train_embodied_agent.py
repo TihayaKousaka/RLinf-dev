@@ -75,16 +75,15 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
         actor_worker_cls = EmbodiedSACFSDPPolicy
-    elif cfg.algorithm.loss_type == "rlt_td3":
+    elif cfg.algorithm.loss_type in {"rlt_sac", "rlt_td3"}:
         if use_training_pipeline:
             raise ValueError(
-                "runner.use_training_pipeline=True is not supported for rlt_td3."
+                "runner.use_training_pipeline=True is not supported for "
+                f"{cfg.algorithm.loss_type}."
             )
-        from rlinf.workers.actor.fsdp_rlt_stage2_policy_worker import (
-            RLTStage2FSDPPolicyWorker,
-        )
+        from rlinf.workers.actor.rlt_sac_policy_worker import RLTSACFSDPPolicy
 
-        actor_worker_cls = RLTStage2FSDPPolicyWorker
+        actor_worker_cls = RLTSACFSDPPolicy
     elif cfg.algorithm.loss_type == "embodied_dagger":
         if use_training_pipeline:
             raise ValueError(

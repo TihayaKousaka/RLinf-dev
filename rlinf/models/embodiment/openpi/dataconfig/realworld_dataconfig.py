@@ -49,7 +49,7 @@ class LeRobotRealworldDataConfig(DataConfigFactory):
                 _transforms.RepackTransform(
                     {
                         "observation/image": "image",
-                        "observation/wrist_image": "extra_view_image",
+                        "observation/extra_view_image": "extra_view_image",
                         "observation/state": "state",
                         "actions": "actions",
                         "prompt": "prompt",
@@ -71,6 +71,7 @@ class LeRobotRealworldDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(
             model_config
         )
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,

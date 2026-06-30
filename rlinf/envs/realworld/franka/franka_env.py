@@ -47,7 +47,6 @@ class FrankaRobotConfig:
     robot_ip: Optional[str] = None
     camera_serials: Optional[list[str]] = None
     camera_names: Optional[dict[str, str]] = None
-    camera_infos: Optional[list[dict[str, Any]]] = None
     camera_type: Optional[str] = None
     gripper_type: Optional[str] = None
     gripper_connection: Optional[str] = None
@@ -125,8 +124,6 @@ class FrankaRobotConfig:
                 str(serial): str(camera_name)
                 for serial, camera_name in self.camera_names.items()
             }
-        if self.camera_infos is not None:
-            self.camera_infos = [dict(camera_info) for camera_info in self.camera_infos]
         if self.camera_crop_regions is not None:
             self.camera_crop_regions = {
                 str(serial): crop_region
@@ -236,10 +233,6 @@ class FrankaEnv(gym.Env):
         )
         if self.config.robot_ip is None:
             self.config.robot_ip = self.hardware_info.config.robot_ip
-        if self.config.camera_infos is None:
-            self.config.camera_infos = getattr(
-                self.hardware_info.config, "camera_infos", None
-            )
         if self.config.camera_serials is None:
             self.config.camera_serials = self.hardware_info.config.camera_serials
         if self.config.camera_type is None:
@@ -471,7 +464,9 @@ class FrankaEnv(gym.Env):
             )
 
         image_batch = np.expand_dims(frames[image_key], axis=0)
-        reward_output = self._reward_worker.compute_image_rewards(image_batch).wait()[0]
+        reward_output = self._reward_worker.compute_image_rewards(
+            {"main_images": image_batch}
+        ).wait()[0]
         if hasattr(reward_output, "detach"):
             reward_output = reward_output.detach().cpu().numpy()
         reward_array = np.asarray(reward_output).reshape(-1)
@@ -661,12 +656,6 @@ class FrankaEnv(gym.Env):
         return normalized_crop_region
 
     def _build_camera_infos(self) -> list[CameraInfo]:
-        if self.config.camera_infos is not None:
-            camera_infos: list[CameraInfo] = []
-            for camera_info in self.config.camera_infos:
-                camera_infos.append(self._build_camera_info_from_cfg(camera_info))
-            return camera_infos
-
         if self.config.camera_serials is None:
             return []
 
@@ -698,35 +687,6 @@ class FrankaEnv(gym.Env):
             )
 
         return camera_infos
-
-    def _build_camera_info_from_cfg(self, camera_info_cfg: dict[str, Any]) -> CameraInfo:
-        cfg = dict(camera_info_cfg)
-        name = cfg.pop("name", None)
-        serial = cfg.pop("serial_number", cfg.pop("serial", None))
-        if name is None or serial is None:
-            raise ValueError(
-                "Each camera_infos item must define 'name' and "
-                "'serial_number' (or 'serial')."
-            )
-        camera_type = cfg.pop("camera_type", self.config.camera_type or "realsense")
-        crop_region = cfg.pop("crop_region", None)
-        if crop_region is not None:
-            crop_region = self._normalize_crop_region(
-                crop_region,
-                camera_name=str(name),
-                serial=str(serial),
-            )
-        if cfg:
-            raise ValueError(
-                "Unsupported camera_infos fields for camera "
-                f"{name!r}: {sorted(cfg)}."
-            )
-        return CameraInfo(
-            name=str(name),
-            serial_number=str(serial),
-            camera_type=str(camera_type),
-            crop_region=crop_region,
-        )
 
     def _open_cameras(self):
         self._cameras: list[BaseCamera] = []

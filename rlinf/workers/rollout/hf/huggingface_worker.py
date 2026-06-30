@@ -15,7 +15,6 @@
 import asyncio
 import copy
 import gc
-import os
 import time
 from typing import Any, Callable, Literal, Optional
 
@@ -26,16 +25,13 @@ from tqdm import tqdm
 
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
-    EnvOutput,
     RolloutResult,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.scheduler import Channel, Cluster, Worker
-from rlinf.utils.nested_dict_process import split_dict
+from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.utils import _split_channel_message
 
 
 class MultiStepRolloutWorker(Worker):
@@ -76,10 +72,7 @@ class MultiStepRolloutWorker(Worker):
         self.eval_rollout_epoch = eval_env_cfg.rollout_epoch if self.enable_eval else 1
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.expert_model = None
-        self._expert_model_config = None
-        self._has_expert_model_config = (
-            self.cfg.rollout.get("expert_model", None) is not None
-        )
+        self.rlt_feature_model = None
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -149,14 +142,32 @@ class MultiStepRolloutWorker(Worker):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             self.hf_model.load_state_dict(model_dict)
 
-        if self._has_expert_model_config:
-            self._expert_model_config = self._build_expert_model_config()
-            if self._use_dagger_expert_sampling():
-                self._ensure_expert_model_loaded()
+        rlt_feature_model_config = OmegaConf.select(
+            self.cfg, "rollout.rlt_feature_model", default=None
+        )
+        if rlt_feature_model_config is not None:
+            self.rlt_feature_model = get_model(copy.deepcopy(rlt_feature_model_config))
+            self.rlt_feature_model.eval()
+            self.rlt_feature_model.requires_grad_(False)
+
+        if self.cfg.rollout.get("expert_model", None):
+            expert_model_config = copy.deepcopy(self.model_cfg)
+            with open_dict(expert_model_config):
+                expert_model_config.precision = self.cfg.rollout.expert_model.precision
+                expert_model_config.model_path = (
+                    self.cfg.rollout.expert_model.model_path
+                )
+            self.expert_model = get_model(expert_model_config)
+
+            if self.cfg.runner.get("expert_ckpt_path", None):
+                expert_model_dict = torch.load(self.cfg.runner.expert_ckpt_path)
+                self.expert_model.load_state_dict(expert_model_dict)
 
         self.hf_model.eval()
         if self.expert_model is not None:
             self.expert_model.eval()
+        if self.rlt_feature_model is not None:
+            self.rlt_feature_model.eval()
 
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
@@ -172,47 +183,6 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
-
-    def _build_expert_model_config(self):
-        expert_model_config = copy.deepcopy(self.model_cfg)
-        expert_overrides = OmegaConf.to_container(
-            self.cfg.rollout.expert_model,
-            resolve=True,
-        )
-        expert_overrides = {} if expert_overrides is None else dict(expert_overrides)
-        expert_ckpt_path = self.cfg.runner.get("expert_ckpt_path", None)
-        expert_model_path = (
-            expert_ckpt_path
-            if expert_ckpt_path and os.path.isdir(str(expert_ckpt_path))
-            else self.cfg.rollout.expert_model.model_path
-        )
-        expert_overrides.pop("model_path", None)
-        expert_overrides.pop("precision", None)
-        if expert_overrides:
-            expert_model_config = OmegaConf.merge(
-                expert_model_config,
-                expert_overrides,
-            )
-        with open_dict(expert_model_config):
-            expert_model_config.precision = self.cfg.rollout.expert_model.precision
-            expert_model_config.model_path = expert_model_path
-        return expert_model_config
-
-    def _ensure_expert_model_loaded(self):
-        if self.expert_model is not None:
-            return self.expert_model
-        if self._expert_model_config is None:
-            raise RuntimeError(
-                "Expert intervention was requested, but rollout.expert_model is not configured."
-            )
-
-        self.expert_model = get_model(self._expert_model_config)
-        expert_ckpt_path = self.cfg.runner.get("expert_ckpt_path", None)
-        if expert_ckpt_path and not os.path.isdir(str(expert_ckpt_path)):
-            expert_model_dict = torch.load(expert_ckpt_path)
-            self.expert_model.load_state_dict(expert_model_dict)
-        self.expert_model.eval()
-        return self.expert_model
 
     def setup_sample_params(self):
         # sampling parameters for rollout
@@ -241,7 +211,7 @@ class MultiStepRolloutWorker(Worker):
             self._train_sampling_params = {}
             self._eval_sampling_params = {}
 
-        if self._has_expert_model_config and self._use_dagger_expert_sampling():
+        if self.expert_model is not None:
             self._dagger_sampling_params = {
                 "beta": self.algorithm_cfg.get("dagger", {}).get("init_beta", 0.5),
                 "beta_schedule": self.algorithm_cfg.get("dagger", {}).get(
@@ -318,15 +288,15 @@ class MultiStepRolloutWorker(Worker):
             A merged payload and its split sizes. If only one shard is received, the
             current implementation returns that shard directly.
         """
-        from rlinf.scheduler.worker.routing import (
-            env_decoupled_build_recv_plan,
+        from rlinf.scheduler import (
+            decoupled_build_recv_plan,
             get_batch_size,
             get_group_world_size,
             merge_batches,
         )
 
         world_size = get_group_world_size(self._manager_proxy, group_name)
-        plan = env_decoupled_build_recv_plan(
+        plan = decoupled_build_recv_plan(
             src_group_name=group_name,
             dst_group_name=self.worker_address.root_group_name,
             recv_rank=None,
@@ -343,7 +313,7 @@ class MultiStepRolloutWorker(Worker):
                 assert False, "received_items is empty"
 
             # get the tag from the received_items
-            _, _, _, tag = _split_channel_message(received_items[0]["batch_index"])
+            _, _, _, tag = split_channel_message(received_items[0]["batch_index"])
 
             assert tag in self.batch_router, (
                 f"{tag=} need to be already in the batch_router"
@@ -437,8 +407,8 @@ class MultiStepRolloutWorker(Worker):
 
             AsyncRouteWork wrapping the async channel put operations.
         """
+        from rlinf.scheduler import build_send_key, split_batch
         from rlinf.scheduler.collective import AsyncRouteWork
-        from rlinf.scheduler.worker.routing import build_send_key, split_batch
 
         assert tag in self.batch_router, (
             f"{tag=} need to be already in the batch_router"
@@ -458,7 +428,7 @@ class MultiStepRolloutWorker(Worker):
         works = []
         for i, payload in enumerate(payloads):
             batch_index = self.batch_router[tag][i]
-            send_rank, _, mode, _ = _split_channel_message(batch_index)
+            send_rank, _, mode, _ = split_channel_message(batch_index)
             # After enabling env_decoupled_mode, the data sending format is as follows:
             # {
             #     "batch_index": batch_index,
@@ -511,9 +481,7 @@ class MultiStepRolloutWorker(Worker):
         ).async_wait()
 
     def update_dagger_beta(self):
-        if not self._has_expert_model_config:
-            return
-        if not self._use_dagger_expert_sampling():
+        if self.expert_model is None:
             return
 
         if self._dagger_sampling_params["beta_schedule"] == "exponential":
@@ -527,23 +495,9 @@ class MultiStepRolloutWorker(Worker):
                 f"Beta schedule {self._dagger_sampling_params['beta_schedule']} is not implemented"
             )
 
-    def _use_dagger_expert_sampling(self) -> bool:
-        return self.cfg.algorithm.get("loss_type", None) == "embodied_dagger"
-
-    def _rollout_state_dict(self) -> dict[str, torch.Tensor]:
-        method = getattr(self.hf_model, "rollout_state_dict", None)
-        if method is not None:
-            return method()
-        return self.hf_model.state_dict()
-
     @Worker.timer("predict")
     def predict(
-        self,
-        env_obs: dict[str, Any],
-        mode: Literal["train", "eval"] = "train",
-        *,
-        allow_expert: bool = True,
-        env_infos: dict[str, Any] | None = None,
+        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = (
             self._train_sampling_params
@@ -579,55 +533,37 @@ class MultiStepRolloutWorker(Worker):
             "only_save_expert", True
         )
 
-        if (
-            mode == "train"
-            and allow_expert
-            and self._use_dagger_expert_sampling()
-            and self.expert_model is not None
-        ):
+        if mode == "train" and self.expert_model is not None:
+            # training with expert model. Beta-probability acting.
             use_expert = torch.rand(1).item() < self._dagger_sampling_params["beta"]
         else:
             use_expert = False
 
         with torch.no_grad():
             expert_label_flag = False
-            context_kwargs = self._predict_context_kwargs(
-                mode=mode,
-                allow_expert=allow_expert,
-                env_infos=env_infos,
-            )
-            context_kwargs = {
-                key: value
-                for key, value in context_kwargs.items()
-                if key not in kwargs
-            }
+            # Decide which model to act via use_expert
             if use_expert:
                 actions, result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
-                    **context_kwargs,
                 )
                 expert_label_flag = True
             else:
                 actions, result = self.hf_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
-                    **context_kwargs,
                 )
-                expert_label_flag = bool(result.get("expert_label_flag", False))
 
             # Decide re-label or not
             if (
                 not only_save_expert  # only re-label in classic dagger mode
                 and not use_expert  # only re-label if not using expert
-                and self._use_dagger_expert_sampling()
                 and self.expert_model is not None  # only re-label if expert exists
                 and mode == "train"  # only re-label in train mode
             ):
                 _, expert_result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
-                    **context_kwargs,
                 )
                 expert_forward_inputs = expert_result["forward_inputs"]
                 expert_target = expert_forward_inputs.get(
@@ -643,42 +579,75 @@ class MultiStepRolloutWorker(Worker):
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
 
-    def _predict_context_kwargs(
+    def _predict_rollout_actions(
         self,
-        *,
+        env_obs: dict[str, Any],
         mode: Literal["train", "eval"] = "train",
-        allow_expert: bool = True,
-        env_infos: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        if not getattr(self.hf_model, "accepts_rollout_context", False):
-            return {}
-        env_cfg = self.cfg.env.eval if mode == "eval" else self.cfg.env.train
-        return {
-            "mode": mode,
-            "env_cfg": env_cfg,
-            "env_infos": env_infos,
-            "allow_expert": allow_expert,
-            "expert_model_getter": (
-                self._ensure_expert_model_loaded
-                if self._has_expert_model_config
-                else None
-            ),
-        }
+        final_obs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if self.rlt_feature_model is not None:
+            return self._predict_with_rlt_features(env_obs, final_obs, mode)
+        return self.predict(env_obs, mode=mode)
 
-    def get_policy_mode(
-        self, mode: Literal["train", "eval"]
-    ) -> Literal["train", "eval"]:
-        env_cfg = self.cfg.env.eval if mode == "eval" else self.cfg.env.train
-        method = getattr(self.hf_model, "get_rollout_policy_mode", None)
-        policy_mode = (
-            method(mode=mode, env_cfg=env_cfg) if method is not None else mode
-        )
-        if policy_mode not in {"train", "eval"}:
-            raise ValueError(
-                "rollout policy mode must be either 'train' or 'eval', got "
-                f"{policy_mode!r}"
+    def _predict_with_rlt_features(
+        self,
+        env_obs: dict[str, Any],
+        final_obs: dict[str, Any] | None,
+        mode: Literal["train", "eval"],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        with torch.no_grad():
+            rlt_obs = self.rlt_feature_model.extract_rlt_stage2_obs(
+                env_obs,
             )
-        return policy_mode
+            actions, result = self.hf_model.predict_action_batch(
+                env_obs=rlt_obs,
+                mode=mode,
+                return_obs=True,
+            )
+            if isinstance(actions, np.ndarray):
+                actions = torch.from_numpy(actions)
+
+            use_actor = env_obs.get("rlt_use_actor", None)
+            if use_actor is None and str(
+                self.cfg.algorithm.get("loss_type", "")
+            ) == "rlt_td3":
+                ready_for_online = int(self.version) >= int(
+                    self.cfg.algorithm.get("warmup_post_collect_updates", 0)
+                )
+                use_actor = torch.full(
+                    (actions.shape[0],),
+                    ready_for_online,
+                    dtype=torch.bool,
+                    device=actions.device,
+                )
+            if use_actor is not None:
+                use_actor = (
+                    torch.as_tensor(use_actor, device=actions.device)
+                    .bool()
+                    .reshape(actions.shape[0], 1, 1)
+                )
+                ref_actions = result["forward_inputs"]["ref_chunk"].to(
+                    device=actions.device, dtype=actions.dtype
+                )
+                actions = torch.where(
+                    use_actor,
+                    actions,
+                    ref_actions[:, : actions.shape[1], : actions.shape[2]],
+                ).contiguous()
+                result["forward_inputs"]["action"] = actions.reshape(
+                    actions.shape[0], -1
+                ).contiguous()
+
+            transition_obs = rlt_obs
+            if final_obs is not None:
+                transition_obs = self.rlt_feature_model.extract_rlt_stage2_obs(
+                    final_obs,
+                )
+            for key in ("z_rl", "proprio", "ref_chunk"):
+                result["forward_inputs"][f"rlt_transition_{key}"] = transition_obs[key]
+
+        result["expert_label_flag"] = False
+        return actions, result
 
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
@@ -690,7 +659,7 @@ class MultiStepRolloutWorker(Worker):
         ):
             return None
         with torch.no_grad():
-            actions, result = self.predict(final_obs)
+            actions, result = self._predict_rollout_actions(final_obs)
             if "prev_values" in result and result["prev_values"] is not None:
                 final_values = result["prev_values"]
             else:
@@ -726,9 +695,8 @@ class MultiStepRolloutWorker(Worker):
                 ).async_wait()
 
         if not self.weight_syncer.receiver_initialized():
-            receiver_state_dict = self._rollout_state_dict()
             await self.weight_syncer.init_receiver(
-                state_dict=receiver_state_dict,
+                state_dict=self.hf_model.state_dict(),
                 recv=recv_func,
                 send=send_func,
             )
@@ -755,15 +723,12 @@ class MultiStepRolloutWorker(Worker):
                     tag="train_rollout_results",
                     batch_size=self.train_batch_size,
                 )
-                actions, result = self.predict(
-                    env_output["obs"],
-                    env_infos=env_output.get("env_infos", None),
+                actions, result = self._predict_rollout_actions(
+                    env_output["obs"], final_obs=env_output.get("final_obs", None)
                 )
 
-                save_flags = result.get("forward_inputs", {}).get(
-                    "intervention_flags", None
-                )
-                if save_flags is None and result.get("expert_label_flag", False):
+                save_flags = None
+                if result.get("expert_label_flag", False):
                     save_flags = torch.full(
                         (actions.shape[0], self.model_cfg.num_action_chunks),
                         True,
@@ -802,10 +767,8 @@ class MultiStepRolloutWorker(Worker):
                 tag="train_rollout_results",
                 batch_size=self.train_batch_size,
             )
-            actions, result = self.predict(
-                env_output["obs"],
-                allow_expert=False,
-                env_infos=env_output.get("env_infos", None),
+            actions, result = self._predict_rollout_actions(
+                env_output["obs"], final_obs=env_output.get("final_obs", None)
             )
 
             rollout_result = RolloutResult(
@@ -814,7 +777,11 @@ class MultiStepRolloutWorker(Worker):
                 bootstrap_values=self.get_bootstrap_values(
                     env_output.get("final_obs", None)
                 ),
-                forward_inputs=result.get("forward_inputs", {}),
+                forward_inputs=(
+                    result["forward_inputs"]
+                    if self.rlt_feature_model is not None
+                    else {}
+                ),
             )
             self.send_rollout_result(
                 output_channel=output_channel,
@@ -846,7 +813,6 @@ class MultiStepRolloutWorker(Worker):
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
-        eval_policy_mode = self.get_policy_mode("eval")
         if self.env_decoupled_mode:
             while True:
                 (
@@ -862,11 +828,8 @@ class MultiStepRolloutWorker(Worker):
                     timeout_time=0.02,
                     recv_queue_size=self.rollout_queue_size,
                 )
-                actions, _ = self.predict(
-                    env_output["obs"],
-                    mode=eval_policy_mode,
-                    allow_expert=False,
-                    env_infos=env_output.get("env_infos", None),
+                actions, _ = self._predict_rollout_actions(
+                    env_output["obs"], mode="eval"
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
@@ -890,11 +853,8 @@ class MultiStepRolloutWorker(Worker):
                             tag="eval_rollout_results",
                             batch_size=self.eval_batch_size,
                         )
-                        actions, _ = self.predict(
-                            env_output["obs"],
-                            mode=eval_policy_mode,
-                            allow_expert=False,
-                            env_infos=env_output.get("env_infos", None),
+                        actions, _ = self._predict_rollout_actions(
+                            env_output["obs"], mode="eval"
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
@@ -912,14 +872,14 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_cuda_graph:
             self.hf_model.release_cuda_graph()
         self.hf_model.to("cpu")
-        if self.expert_model is not None:
-            self.expert_model.to("cpu")
+        if self.rlt_feature_model is not None:
+            self.rlt_feature_model.to("cpu")
         self.torch_platform.empty_cache()
 
     def reload_model(self):
         self.hf_model.to(self.device)
-        if self.expert_model is not None:
-            self.expert_model.to(self.device)
+        if self.rlt_feature_model is not None:
+            self.rlt_feature_model.to(self.device)
         if self.enable_cuda_graph:
             self.hf_model.capture_cuda_graph(
                 train_batch_size=self.per_node_train_batch_size,
@@ -941,11 +901,39 @@ class MultiStepRolloutWorker(Worker):
     def _merge_obs_batches(obs_batches: list[dict[str, Any]]) -> dict[str, Any]:
         if not obs_batches:
             return {}
-        normalized_batches = [
-            obs_batch if "obs" in obs_batch else {"obs": obs_batch}
+        obs_dicts = [
+            obs_batch["obs"] if "obs" in obs_batch else obs_batch
             for obs_batch in obs_batches
         ]
-        return EnvOutput.merge_env_outputs(normalized_batches)
+        final_obs_list = [obs_batch.get("final_obs", None) for obs_batch in obs_batches]
+
+        def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
+            merged: dict[str, Any] = {}
+            for key in dicts[0].keys():
+                values = [obs_dict[key] for obs_dict in dicts]
+                first_non_none = next(
+                    (value for value in values if value is not None), None
+                )
+                if first_non_none is None:
+                    merged[key] = None
+                elif isinstance(first_non_none, torch.Tensor):
+                    merged[key] = torch.cat(values, dim=0)
+                elif isinstance(first_non_none, list):
+                    merged[key] = [item for sublist in values for item in sublist]
+                else:
+                    merged[key] = values
+            return merged
+
+        merged_obs = _merge_obs_dicts(obs_dicts)
+        merged_final_obs = None
+        if any(final_obs is not None for final_obs in final_obs_list):
+            final_obs_or_obs = [
+                final_obs if final_obs is not None else obs_dict
+                for obs_dict, final_obs in zip(obs_dicts, final_obs_list)
+            ]
+            merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
+
+        return {"obs": merged_obs, "final_obs": merged_final_obs}
 
     def _split_rollout_result(
         self, rollout_result: RolloutResult, sizes: list[int]
@@ -966,7 +954,13 @@ class MultiStepRolloutWorker(Worker):
         split_forward_inputs = (
             [{} for _ in sizes]
             if not rollout_result.forward_inputs
-            else split_dict(rollout_result.forward_inputs, sizes)
+            else [
+                {
+                    key: torch.split(value, sizes, dim=0)[idx]
+                    for key, value in rollout_result.forward_inputs.items()
+                }
+                for idx in range(len(sizes))
+            ]
         )
 
         return [

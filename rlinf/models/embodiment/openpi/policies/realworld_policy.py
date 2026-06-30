@@ -24,7 +24,7 @@ def make_realworld_example() -> dict:
     """Creates a random input example for the realworld policy."""
     return {
         "observation/image": np.random.randint(256, size=(128, 128, 3), dtype=np.uint8),
-        "observation/wrist_image": np.random.randint(
+        "observation/extra_view_image": np.random.randint(
             256, size=(128, 128, 3), dtype=np.uint8
         ),
         "observation/state": np.random.rand(19),
@@ -69,18 +69,15 @@ class RealworldInputs(transforms.DataTransformFn):
 
         state = transforms.pad_to_dim(data["observation/state"], self.action_dim)
         base_image = _parse_image(data["observation/image"])
-        wrist_image = _parse_image(
-            data.get(
-                "observation/wrist_image",
-                data.get("observation/extra_view_image", np.zeros_like(base_image)),
-            )
+        extra_view_image = _parse_image(
+            data.get("observation/extra_view_image", np.zeros_like(base_image))
         )
 
         if self.model_type in (_model.ModelType.PI0, _model.ModelType.PI05):
             names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
             images = (
                 base_image,
-                wrist_image,
+                extra_view_image,
                 np.zeros_like(base_image),
             )
             image_masks = (np.True_, np.True_, np.False_)
@@ -88,7 +85,7 @@ class RealworldInputs(transforms.DataTransformFn):
             names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
             images = (
                 base_image,
-                wrist_image,
+                extra_view_image,
                 np.zeros_like(base_image),
             )
             image_masks = (np.True_, np.True_, np.True_)

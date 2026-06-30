@@ -1,5 +1,5 @@
 defaults:
-  - model/rlt_stage1@actor.model
+  - model/pi0_5@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
 
@@ -46,18 +46,31 @@ actor:
   model:
     precision: null
     model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/pi05_base"
+    model_type: "openpi"
     num_action_chunks: 10
     action_dim: 7
-    rlt_stage1:
-      alpha: 1.0
+    add_value_head: False
+    num_steps: 5
+    openpi:
       config_name: "pi05_libero"
       num_images_in_input: 2
-      num_steps: 5
-      embedding_dim: 2048
-      encoder_layers: 2
-      encoder_heads: 8
-      decoder_layers: 2
-      decoder_heads: 8
+      train_expert_only: False
+      detach_critic_input: True
+      action_horizon: 10
+      action_chunk: ${actor.model.num_action_chunks}
+      action_env_dim: ${actor.model.action_dim}
+      num_steps: ${actor.model.num_steps}
+      use_rlt: True
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      rlt_num_rl_tokens: 1
+      rlt_prefix_seq_len: 1024
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_image_only: False
+      rlt_use_mask: True
 
   openpi_data:
     repo_id: "data/libero_10_task_6"

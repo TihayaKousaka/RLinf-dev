@@ -16,13 +16,11 @@ from typing import Any
 
 import torch
 from omegaconf import DictConfig
-from torch.utils._pytree import tree_map
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.config import SupportedModel
 from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
 from rlinf.models.embodiment.base_policy import ForwardType
-from rlinf.utils.pytree import register_pytree_dataclasses
 from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
@@ -32,26 +30,20 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         super().__init__(cfg)
 
     def build_dataloader(self, data_paths: Any, eval_dataset: bool = False):
-        model_type = SupportedModel(self.cfg.actor.model.model_type)
-        if model_type in [SupportedModel.OPENPI, SupportedModel.RLT_STAGE1]:
+        if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
             repo_id = resolve_lerobot_repo_id(data_paths)
             if repo_id is None:
                 raise ValueError(
-                    "OpenPI/RLT Stage 1 SFT requires data.train_data_paths to be set "
-                    "to a local dataset path or LeRobot repo id."
+                    "OpenPI SFT requires data.train_data_paths to be set to a local "
+                    "dataset path or LeRobot repo id."
                 )
 
             import openpi.training.data_loader as openpi_data_loader
 
             from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
 
-            if model_type == SupportedModel.RLT_STAGE1:
-                config_name = self.cfg.actor.model.rlt_stage1.config_name
-            else:
-                config_name = self.cfg.actor.model.openpi.config_name
-
             config = get_openpi_config(
-                config_name,
+                self.cfg.actor.model.openpi.config_name,
                 model_path=self.cfg.actor.model.model_path,
                 batch_size=self.cfg.actor.micro_batch_size * self._world_size,
                 repo_id=repo_id,
@@ -83,8 +75,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             )
         else:
             raise KeyError(
-                "not support such model type "
-                f"{self.cfg.actor.model.model_type} for SFT right now."
+                f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
             )
 
     def get_eval_model_output(self, batch: dict[str, Any]):
@@ -92,9 +83,6 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         raise NotImplementedError("eval is not supported for embodied sft right now.")
 
     def get_train_model_output(self, batch: Any) -> tuple[torch.Tensor, dict[str, Any]]:
-        if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.RLT_STAGE1:
-            return self._get_rlt_stage1_train_model_output(batch)
-
         with self.amp_context:
             output = self.model(forward_type=ForwardType.SFT, data=batch)
 
@@ -104,53 +92,19 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             loss = output["loss"]
 
         step_metrics = {"loss": loss.detach().item()}
-        if isinstance(output, dict) and output.get("dynamics_loss", None) is not None:
-            step_metrics.update(
-                {
-                    "dynamics_loss": output["dynamics_loss"].detach().item(),
-                    "action_loss": output["action_loss"].detach().item(),
-                }
-            )
-        return loss, step_metrics
-
-    def _get_rlt_stage1_train_model_output(
-        self,
-        batch: Any,
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        observation, actions = batch
-        register_pytree_dataclasses(observation)
-        observation = tree_map(
-            lambda x: (
-                torch.as_tensor(x, device=self.device).contiguous().clone()
-                if x is not None
-                else x
-            ),
-            observation,
-        )
-        actions = actions.to(torch.float32).to(self.device)
-
-        with self.amp_context:
-            output = self.model(
-                forward_type=ForwardType.SFT,
-                data={"observation": observation, "actions": actions},
-            )
-
-        loss = output["loss"]
-        step_metrics = {"loss": loss.detach().item()}
-        if "l_ro" in output:
-            step_metrics["l_ro"] = output["l_ro"].detach().item()
-        if "vla_loss" in output:
-            step_metrics["vla_loss"] = output["vla_loss"].detach().item()
-        if "alpha" in output:
-            step_metrics["alpha"] = output["alpha"].detach().item()
+        if isinstance(output, dict):
+            for key, value in output.items():
+                if key == "loss":
+                    continue
+                if torch.is_tensor(value):
+                    if value.numel() == 1:
+                        step_metrics[key] = value.detach().item()
+                elif isinstance(value, (float, int)):
+                    step_metrics[key] = value
         return loss, step_metrics
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         super().save_checkpoint(save_path, step)
-
-        if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.RLT_STAGE1:
-            self._save_rlt_stage1_rl_token_checkpoint(save_path, step)
-            self._save_rlt_stage1_vla_checkpoint(save_path)
 
         if isinstance(self.data_loader, StatefulDataLoader):
             state = self.data_loader.state_dict()
@@ -170,55 +124,6 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 torch.save(all_rng_states, os.path.join(save_path, "rng.pt"))
 
             torch.distributed.barrier()
-
-    def _save_rlt_stage1_rl_token_checkpoint(
-        self,
-        save_path: str,
-        step: int,
-    ) -> None:
-        if self._rank != 0:
-            return
-        rl_token_dir = os.path.join(save_path, "rl_token")
-        os.makedirs(rl_token_dir, exist_ok=True)
-        model_state = self._strategy.get_model_state_dict(
-            self.model,
-            cpu_offload=True,
-            full_state_dict=True,
-        )
-        rl_token_state = {
-            key.replace("rl_token_model.", "", 1): value
-            for key, value in model_state.items()
-            if key.startswith("rl_token_model.")
-        }
-        torch.save(
-            {"model_state_dict": rl_token_state, "step": step},
-            os.path.join(rl_token_dir, "rl_token_model.pt"),
-        )
-
-    def _save_rlt_stage1_vla_checkpoint(self, save_path: str) -> None:
-        alpha = float(self.cfg.actor.model.rlt_stage1.get("alpha", 0.0))
-        if alpha <= 0.0 or self._rank != 0:
-            return
-
-        model_state = self._strategy.get_model_state_dict(
-            self.model,
-            cpu_offload=True,
-            full_state_dict=True,
-        )
-        vla_state = {
-            key.replace("vla.", "", 1): value
-            for key, value in model_state.items()
-            if key.startswith("vla.")
-        }
-        if not vla_state:
-            raise RuntimeError(
-                "RLT Stage 1 alpha > 0 expected VLA weights under the 'vla.' "
-                "prefix, but no matching parameters were found."
-            )
-
-        vla_state_dir = os.path.join(save_path, "vla", "model_state_dict")
-        os.makedirs(vla_state_dir, exist_ok=True)
-        torch.save(vla_state, os.path.join(vla_state_dir, "full_weights.pt"))
 
     def load_checkpoint(self, load_path: str) -> None:
         super().load_checkpoint(load_path)
@@ -241,10 +146,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
     def get_max_steps_per_epoch(self):
         if self.data_loader is None:
             return 0
-        if SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.OPENPI,
-            SupportedModel.RLT_STAGE1,
-        ]:
+        if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.OPENPI:
             num_batches = len(self._openpi_pytorch_dataloader(self.data_loader))
             return max(1, num_batches // self.gradient_accumulation)
         return super().get_max_steps_per_epoch()

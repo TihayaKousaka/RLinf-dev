@@ -76,6 +76,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_rlt_mlp_policy(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.mlp_policy import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_gr00t(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.gr00t import get_model
 
@@ -131,16 +136,6 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
-    def _build_rlt_stage2(cfg: DictConfig, torch_dtype):
-        from rlinf.models.embodiment.openpi_rlt import get_model
-
-        return get_model(cfg, torch_dtype)
-
-    def _build_rlt_stage1(cfg: DictConfig, torch_dtype):
-        from rlinf.models.embodiment.openpi_rlt import get_model
-
-        return get_model(cfg, torch_dtype)
-
     register_model(
         SupportedModel.OPENVLA.value,
         _build_openvla,
@@ -174,6 +169,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.MLP_POLICY.value,
         _build_mlp_policy,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        SupportedModel.RLT_MLP_POLICY.value,
+        _build_rlt_mlp_policy,
         category="embodied",
         force=True,
     )
@@ -238,18 +239,6 @@ def _register_builtin_models():
         force=True,
     )
     register_model(
-        SupportedModel.RLT_STAGE1.value,
-        _build_rlt_stage1,
-        category="embodied",
-        force=True,
-    )
-    register_model(
-        SupportedModel.RLT_STAGE2.value,
-        _build_rlt_stage2,
-        category="embodied",
-        force=True,
-    )
-    register_model(    
         SupportedModel.GR00T_N1D7.value,
         _build_gr00t_n1d7,
         category="embodied",

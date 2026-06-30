@@ -20,7 +20,6 @@ from typing import Any, Mapping, Optional
 
 import gymnasium as gym
 
-from rlinf.envs.realworld.common.wrappers.critical_phase import CriticalPhaseWrapper
 from rlinf.envs.realworld.common.wrappers.dual_gello_joint_intervention import (
     DualGelloJointIntervention,
 )
@@ -31,6 +30,9 @@ from rlinf.envs.realworld.common.wrappers.gello_intervention import (
 from rlinf.envs.realworld.common.wrappers.gripper_close import GripperCloseEnv
 from rlinf.envs.realworld.common.wrappers.keyboard_eval_control_wrapper import (
     KeyboardEvalControlWrapper,
+)
+from rlinf.envs.realworld.common.wrappers.keyboard_rlt_policy_switch_wrapper import (
+    KeyboardRLTPolicySwitchWrapper,
 )
 from rlinf.envs.realworld.common.wrappers.keyboard_start_end_wrapper import (
     KeyboardStartEndWrapper,
@@ -89,21 +91,9 @@ def _apply_keyboard_wrapper(env: gym.Env, mode: Optional[str]) -> gym.Env:
         return KeyboardStartEndWrapper(env)
     if mode == "eval_control":
         return KeyboardEvalControlWrapper(env)
+    if mode == "rlt_policy_switch":
+        return KeyboardRLTPolicySwitchWrapper(env)
     return env
-
-
-def _apply_rlt_critical_phase(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
-    task_mode = cfg.get("task_mode", None)
-    if not task_mode:
-        return env
-    return CriticalPhaseWrapper(
-        env,
-        task_mode=str(task_mode),
-        critical_phase_key=str(cfg.get("critical_phase_key", "v")),
-        record_prefix_before_critical_phase=bool(
-            cfg.get("record_prefix_before_critical_phase", False)
-        ),
-    )
 
 
 def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
@@ -156,7 +146,6 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
         env = PicoIntervention(env, gripper_enabled=gripper_enabled, **pico_cfg)
 
     env = _apply_keyboard_wrapper(env, cfg.get("keyboard_reward_wrapper", None))
-    env = _apply_rlt_critical_phase(env, cfg)
 
     if cfg.get("use_relative_frame", True):
         env = RelativeFrame(env)

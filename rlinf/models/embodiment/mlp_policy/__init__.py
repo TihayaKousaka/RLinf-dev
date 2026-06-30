@@ -19,9 +19,26 @@ from omegaconf import DictConfig
 def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     from rlinf.models.embodiment.mlp_policy.iql_mlp_policy import IQLMLPPolicy
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
+    from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
 
     iql_config = cfg.get("iql_config", None)
-    if iql_config is not None:
+    if cfg.model_type == "rlt_mlp_policy":
+        model = RLTMLPPolicy(
+            z_dim=cfg.z_dim,
+            proprio_dim=cfg.proprio_dim,
+            action_dim=cfg.action_dim,
+            num_action_chunks=cfg.num_action_chunks,
+            ref_num_action_chunks=cfg.get(
+                "ref_num_action_chunks", cfg.num_action_chunks
+            ),
+            add_q_head=cfg.get("add_q_head", True),
+            q_head_type=cfg.get("q_head_type", "default"),
+            hidden_dim=cfg.get("hidden_dim", 256),
+            num_q_heads=cfg.get("num_q_heads", 2),
+            algorithm_mode=cfg.get("algorithm_mode", "sac"),
+            actor_noise_sigma=cfg.get("actor_noise_sigma", 0.1),
+        )
+    elif iql_config is not None:
         model = IQLMLPPolicy(
             cfg.obs_dim,
             cfg.action_dim,
@@ -39,6 +56,8 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_value_head=cfg.add_value_head,
             add_q_head=cfg.get("add_q_head", False),
             q_head_type=cfg.get("q_head_type", "default"),
+            hidden_dim=cfg.get("hidden_dim", 256),
+            num_q_heads=cfg.get("num_q_heads", 2),
         )
 
     return model
