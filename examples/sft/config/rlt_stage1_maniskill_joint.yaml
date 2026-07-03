@@ -30,7 +30,7 @@ runner:
 
 data:
   train_data_paths:
-    - dataset_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/rlt_maniskill_joint"
+    - dataset_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/maniskill_peginsertionside_joint"
       weight: 1.0
 
 algorithm:
@@ -73,7 +73,7 @@ actor:
       rlt_use_mask: True
 
   openpi_data:
-    repo_id: "rlt_maniskill_joint"
+    repo_id: "maniskill_peginsertionside_joint"
     default_prompt: "insert the peg in the hole"
 
   optim:

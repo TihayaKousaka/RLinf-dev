@@ -36,9 +36,10 @@ from rlinf.envs.maniskill.peg_insertion_side_variants import (
     snapshot_peg_insertion_event_state,
     wrap_rlt_openpi_joint_obs,
 )
-from rlinf.envs.maniskill.rlt_intervention import (
-    apply_rlt_intervention_policy_info,
-    build_maniskill_rlt_intervention_controller,
+from rlinf.envs.maniskill.rlt_policy_switch import (
+    apply_rlt_policy_switch_info,
+    attach_rlt_policy_switch_obs,
+    build_maniskill_rlt_policy_switch_controller,
 )
 
 __all__ = ["ManiskillEnv"]
@@ -108,8 +109,8 @@ class ManiskillEnv(gym.Env):
         self._has_seeded_reset = False
         self.task_id = getattr(cfg.init_params, "id", None)
         self._is_peg_insertion_side = is_peg_insertion_side_env_id(self.task_id)
-        self.rlt_intervention_cfg = getattr(cfg, "rlt_intervention", None)
-        self.rlt_intervention_controller = None
+        self.rlt_policy_switch_cfg = getattr(cfg, "rlt_policy_switch", None)
+        self.rlt_policy_switch_controller = None
 
         with open_dict(cfg):
             cfg.init_params.num_envs = num_envs
@@ -134,7 +135,7 @@ class ManiskillEnv(gym.Env):
         if self.record_metrics:
             self._init_metrics()
         self._init_persistent_done_state()
-        self._init_rlt_intervention_controller()
+        self._init_rlt_policy_switch_controller()
 
     @property
     def total_num_group_envs(self):
@@ -238,13 +239,18 @@ class ManiskillEnv(gym.Env):
                 raise ValueError(
                     "wrap_obs_mode='rlt_openpi_joint' requires ManiSkill obs_mode='rgb'."
                 )
-            return wrap_rlt_openpi_joint_obs(
+            obs = wrap_rlt_openpi_joint_obs(
                 raw_obs,
                 infos=infos,
                 task_descriptions=self.instruction,
                 num_envs=self.num_envs,
                 device=self.device,
                 is_peg_insertion_side=self._is_peg_insertion_side,
+            )
+            return attach_rlt_policy_switch_obs(
+                controller=self.rlt_policy_switch_controller,
+                obs=obs,
+                device=self.device,
             )
 
         # Default
@@ -276,18 +282,19 @@ class ManiskillEnv(gym.Env):
             )
         return state_obs
 
-    def _init_rlt_intervention_controller(self):
-        self.rlt_intervention_controller = build_maniskill_rlt_intervention_controller(
-            intervention_cfg=self.rlt_intervention_cfg,
-            is_peg_insertion_side=self._is_peg_insertion_side,
-            env=self.env.unwrapped,
-            batch_size=self.num_envs,
-            mode="train",
+    def _init_rlt_policy_switch_controller(self):
+        self.rlt_policy_switch_controller = (
+            build_maniskill_rlt_policy_switch_controller(
+                switch_cfg=self.rlt_policy_switch_cfg,
+                is_peg_insertion_side=self._is_peg_insertion_side,
+                env=self.env.unwrapped,
+                batch_size=self.num_envs,
+            )
         )
 
-    def _reset_rlt_intervention_controller(self):
-        if self.rlt_intervention_controller is not None:
-            self._init_rlt_intervention_controller()
+    def _reset_rlt_policy_switch_controller(self, env_idx=None):
+        if self.rlt_policy_switch_controller is not None:
+            self.rlt_policy_switch_controller.reset(env_idx=env_idx)
 
     def _calc_step_reward(self, reward, info):
         if getattr(self.cfg, "reward_mode", "default") == "raw":
@@ -390,6 +397,16 @@ class ManiskillEnv(gym.Env):
         if "fail" in infos:
             self.fail_once = self.fail_once | infos["fail"]
             episode_info["fail_once"] = self.fail_once.clone()
+        for key in (
+            "rlt_use_actor",
+            "entered_actor_phase_once",
+            "actor_switch_step",
+            "actor_switch_step_nonzero",
+        ):
+            if key in infos:
+                value = infos[key]
+                if isinstance(value, torch.Tensor):
+                    episode_info[key] = value.reshape(self.num_envs, -1)[:, -1].clone()
         episode_info["return"] = self.returns.clone()
         episode_info["episode_len"] = self.elapsed_steps.clone()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
@@ -414,8 +431,6 @@ class ManiskillEnv(gym.Env):
         if seed is not None:
             self._has_seeded_reset = True
         raw_obs, infos = self.env.reset(seed=seed, options=options)
-        self._show_goal_site_visual()
-        extracted_obs = self._wrap_obs(raw_obs, infos=infos)
         if "env_idx" in options:
             env_idx = options["env_idx"]
             if self._is_peg_insertion_side:
@@ -429,7 +444,9 @@ class ManiskillEnv(gym.Env):
                 reset_peg_insertion_event_state(self.peg_event_state)
             self._reset_metrics()
         self._reset_persistent_done_state(options.get("env_idx"))
-        self._reset_rlt_intervention_controller()
+        self._reset_rlt_policy_switch_controller(options.get("env_idx"))
+        self._show_goal_site_visual()
+        extracted_obs = self._wrap_obs(raw_obs, infos=infos)
         return extracted_obs, infos
 
     def step(
@@ -443,6 +460,7 @@ class ManiskillEnv(gym.Env):
             device=self.device,
             is_peg_insertion_side=self._is_peg_insertion_side,
         )
+        infos["elapsed_steps"] = self.elapsed_steps.clone()
         terminations = extract_termination_from_info(
             infos,
             num_envs=self.num_envs,
@@ -454,6 +472,7 @@ class ManiskillEnv(gym.Env):
 
         if self.record_metrics:
             infos = self._record_metrics(step_reward, infos)
+        self._attach_rlt_policy_switch_info(infos)
         if isinstance(truncations, bool):
             truncations = torch.tensor([truncations], device=self.device)
             truncations = truncations.repeat(self.num_envs)
@@ -471,6 +490,14 @@ class ManiskillEnv(gym.Env):
         if dones.any() and _auto_reset:
             extracted_obs, infos = self._handle_auto_reset(dones, extracted_obs, infos)
         return extracted_obs, step_reward, terminations, truncations, infos
+
+    def _attach_rlt_policy_switch_info(self, infos):
+        if self.rlt_policy_switch_controller is None:
+            return
+        policy_info = self.rlt_policy_switch_controller.export_info(device=self.device)
+        infos["policy_info"] = policy_info
+        for key, value in policy_info.items():
+            infos[key] = value
 
     def _snapshot_episode_state(self):
         state = {
@@ -663,14 +690,19 @@ class ManiskillEnv(gym.Env):
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
-        apply_rlt_intervention_policy_info(
-            controller=self.rlt_intervention_controller,
+        apply_rlt_policy_switch_info(
+            controller=self.rlt_policy_switch_controller,
             infos_list=infos_list,
             chunk_dones=torch.logical_or(
                 raw_chunk_terminations,
                 raw_chunk_truncations,
             ),
-            intervention_enabled=True,
+        )
+        self._sync_rlt_policy_switch_episode_info(infos_list[-1])
+        obs_list[-1] = attach_rlt_policy_switch_obs(
+            controller=self.rlt_policy_switch_controller,
+            obs=obs_list[-1],
+            device=self.device,
         )
 
         if past_dones.any() and self.auto_reset:
@@ -686,6 +718,20 @@ class ManiskillEnv(gym.Env):
             raw_chunk_truncations,
             infos_list,
         )
+
+    def _sync_rlt_policy_switch_episode_info(self, infos):
+        if not isinstance(infos, dict) or "episode" not in infos:
+            return
+        for key in (
+            "rlt_use_actor",
+            "entered_actor_phase_once",
+            "actor_switch_step",
+            "actor_switch_step_nonzero",
+        ):
+            if key in infos:
+                infos["episode"][key] = infos[key].reshape(self.num_envs, -1)[
+                    :, -1
+                ].clone()
 
     def _handle_auto_reset(self, dones, extracted_obs, infos):
         final_obs = torch_clone_dict(extracted_obs)

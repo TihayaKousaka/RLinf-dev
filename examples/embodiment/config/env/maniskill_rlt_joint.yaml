@@ -14,6 +14,18 @@ use_fixed_reset_state_ids: False
 max_steps_per_rollout_epoch: 500
 max_episode_steps: 500
 
+rlt_policy_switch:
+  enable: True
+  task_mode: full_task
+  trigger_mode: auto
+  latch_until_done: True
+  auto_gate:
+    require_grasp: True
+    require_not_success: True
+    near_hole_x_min: -0.16
+    near_hole_yz_margin: 1.5
+    fallback_hole_radius: 0.03
+
 video_cfg:
   save_video: False
   info_on_video: True
@@ -24,7 +36,7 @@ video_cfg:
 enable_offload: False
 
 init_params:
-  id: "PegInsertionSideHardClearance-v1"
+  id: "PegInsertionSideWideClearance-v1"
   num_envs: null
   obs_mode: "rgb"
   control_mode: "pd_joint_delta_pos"

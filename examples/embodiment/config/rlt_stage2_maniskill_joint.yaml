@@ -120,20 +120,6 @@ algorithm:
       lr_scheduler: torch_constant
       clip_grad: 10.0
 
-  intervention:
-    enable: True
-    mode: local_correction
-    deviation_patience: 3
-    takeover_chunks: 3
-    takeover_max_chunks: 6
-    safe_yz_margin: 2.0
-    progress_eps: 0.01
-    yz_error_eps: 0.01
-    near_hole_x_min: -0.03
-    near_hole_yz_margin: 1.5
-    exit_hole_x_min: -0.10
-    fallback_hole_radius: 0.03
-
   replay_buffer:
     enable_cache: True
     cache_size: 10000
@@ -152,14 +138,24 @@ env:
     use_fixed_reset_state_ids: False
     wrap_obs_mode: rlt_openpi_joint
     reward_mode: only_success
-    rlt_intervention: ${algorithm.intervention}
+    rlt_policy_switch:
+      enable: True
+      task_mode: full_task
+      trigger_mode: auto
+      latch_until_done: True
+      auto_gate:
+        require_grasp: True
+        require_not_success: True
+        near_hole_x_min: -0.16
+        near_hole_yz_margin: 1.5
+        fallback_hole_radius: 0.03
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
     action_dim: ${rlt.action_dim}
     num_action_chunks: ${rlt.num_action_chunks}
     ref_num_action_chunks: ${rlt.ref_num_action_chunks}
     init_params:
-      id: "PegInsertionSideHardClearance-v1"
+      id: "PegInsertionSideWideClearance-v1"
       obs_mode: "rgb"
       control_mode: "pd_joint_delta_pos"
       reward_mode: "sparse"
@@ -177,8 +173,17 @@ env:
     use_fixed_reset_state_ids: True
     wrap_obs_mode: rlt_openpi_joint
     reward_mode: only_success
-    rlt_intervention:
-      enable: False
+    rlt_policy_switch:
+      enable: True
+      task_mode: full_task
+      trigger_mode: auto
+      latch_until_done: True
+      auto_gate:
+        require_grasp: True
+        require_not_success: True
+        near_hole_x_min: -0.16
+        near_hole_yz_margin: 1.5
+        fallback_hole_radius: 0.03
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
     policy_mode: eval
@@ -192,7 +197,7 @@ env:
       record_every: 1
       video_base_dir: ${runner.logger.log_path}/video/eval
     init_params:
-      id: "PegInsertionSideHardClearance-v1"
+      id: "PegInsertionSideWideClearance-v1"
       obs_mode: "rgb"
       control_mode: "pd_joint_delta_pos"
       reward_mode: "sparse"
