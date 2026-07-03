@@ -271,7 +271,14 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
     if hasattr(module, "q_head"):
         from rlinf.models.embodiment.modules.q_head import MultiCrossQHead, MultiQHead
 
-        if isinstance(module.q_head, MultiCrossQHead):
+        if SupportedModel(model_type) == SupportedModel.RLT_MLP_POLICY:
+            # Keep the ManiSkill RLT direct Q-head visible as a separate FSDP
+            # unit when use_orig_params=False, so optimizer filters can match
+            # "q_head".
+            q_head_policy = functools.partial(
+                _module_wrap_policy, module_classes={type(module.q_head)}
+            )
+        elif isinstance(module.q_head, MultiCrossQHead):
             q_head_policy = functools.partial(
                 _module_wrap_policy, module_classes={MultiCrossQHead}
             )

@@ -13,10 +13,63 @@
 # limitations under the License.
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
+from rlinf.models.embodiment.modules.utils import make_mlp
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
+
+
+def _make_relu_mlp(
+    input_dim: int,
+    output_dim: int,
+    hidden_dim: int,
+    num_hidden_layers: int,
+) -> nn.Sequential:
+    return nn.Sequential(
+        *make_mlp(
+            in_channels=input_dim,
+            mlp_channels=[
+                *[hidden_dim for _ in range(num_hidden_layers)],
+                output_dim,
+            ],
+            act_builder=nn.ReLU,
+            last_act=False,
+        )
+    )
+
+
+class DirectRLTQHead(nn.Module):
+    """Ablation-compatible twin-Q MLP head for RLT Stage2."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        num_hidden_layers: int,
+        num_q_heads: int,
+    ):
+        super().__init__()
+        if int(num_q_heads) <= 0:
+            raise ValueError(f"num_q_heads must be positive, got {num_q_heads}.")
+        self.qs = nn.ModuleList(
+            [
+                _make_relu_mlp(
+                    input_dim=state_dim + action_dim,
+                    output_dim=1,
+                    hidden_dim=hidden_dim,
+                    num_hidden_layers=num_hidden_layers,
+                )
+                for _ in range(int(num_q_heads))
+            ]
+        )
+
+    def forward(self, state_features, action_features, **kwargs):
+        del kwargs
+        q_input = torch.cat([state_features, action_features], dim=-1)
+        return torch.cat([q(q_input) for q in self.qs], dim=-1)
 
 
 class RLTMLPPolicy(MLPPolicy):
@@ -38,10 +91,19 @@ class RLTMLPPolicy(MLPPolicy):
         add_q_head: bool = True,
         q_head_type: str = "default",
         hidden_dim: int = 256,
+        num_hidden_layers: int = 2,
         num_q_heads: int = 2,
+        rlt_head_type: str = "sac",
+        actor_noise_sigma: float = 0.003,
     ):
         if not add_q_head:
             raise ValueError("RLTMLPPolicy requires add_q_head=True for RL training.")
+        rlt_head_type = str(rlt_head_type)
+        if rlt_head_type not in {"sac", "direct"}:
+            raise ValueError(
+                f"Unsupported RLT MLP head type: {rlt_head_type!r}. "
+                "Expected 'sac' or 'direct'."
+            )
         z_dim = int(z_dim)
         proprio_dim = int(proprio_dim)
         step_action_dim = int(action_dim)
@@ -51,17 +113,49 @@ class RLTMLPPolicy(MLPPolicy):
         actor_obs_dim = z_dim + proprio_dim + flat_action_dim
         critic_obs_dim = z_dim + proprio_dim
 
-        super().__init__(
-            obs_dim=actor_obs_dim,
-            action_dim=flat_action_dim,
-            num_action_chunks=1,
-            add_value_head=False,
-            add_q_head=add_q_head,
-            q_head_type=q_head_type,
-            hidden_dim=hidden_dim,
-            num_q_heads=num_q_heads,
-            critic_obs_dim=critic_obs_dim,
-        )
+        if rlt_head_type == "direct":
+            if q_head_type != "default":
+                raise ValueError(
+                    "RLT direct MLP head only supports q_head_type='default', "
+                    f"got {q_head_type!r}."
+                )
+            nn.Module.__init__(self)
+            self.obs_dim = actor_obs_dim
+            self.critic_obs_dim = critic_obs_dim
+            self.action_dim = flat_action_dim
+            self.num_action_chunks = 1
+            self.independent_std = False
+            self.final_tanh = False
+            self.action_scale = None
+            self.torch_compile_enabled = False
+            self.cuda_graph_manager = None
+            self.direct_actor = _make_relu_mlp(
+                input_dim=actor_obs_dim,
+                output_dim=flat_action_dim,
+                hidden_dim=int(hidden_dim),
+                num_hidden_layers=int(num_hidden_layers),
+            )
+            self.q_head = DirectRLTQHead(
+                state_dim=critic_obs_dim,
+                action_dim=flat_action_dim,
+                hidden_dim=int(hidden_dim),
+                num_hidden_layers=int(num_hidden_layers),
+                num_q_heads=int(num_q_heads),
+            )
+        else:
+            super().__init__(
+                obs_dim=actor_obs_dim,
+                action_dim=flat_action_dim,
+                num_action_chunks=1,
+                add_value_head=False,
+                add_q_head=add_q_head,
+                q_head_type=q_head_type,
+                hidden_dim=hidden_dim,
+                num_q_heads=num_q_heads,
+                critic_obs_dim=critic_obs_dim,
+            )
+        self.rlt_head_type = rlt_head_type
+        self.actor_noise_sigma = float(actor_noise_sigma)
         self.z_dim = z_dim
         self.proprio_dim = proprio_dim
         self.step_action_dim = step_action_dim
@@ -121,7 +215,9 @@ class RLTMLPPolicy(MLPPolicy):
         ref_chunk = self._get_ref_chunk(obs)
         if apply_reference_dropout:
             ref_chunk = self._maybe_drop_reference(ref_chunk, reference_dropout_prob)
-        return torch.cat([ref_chunk, self._get_z(obs), self._get_proprio(obs)], dim=-1)
+        # Match the original RLT Stage2 actor input order: x=[z_rl, proprio],
+        # then the VLA reference action chunk.
+        return torch.cat([self._get_z(obs), self._get_proprio(obs), ref_chunk], dim=-1)
 
     def _critic_state(self, obs: dict) -> torch.Tensor:
         return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
@@ -129,12 +225,25 @@ class RLTMLPPolicy(MLPPolicy):
     def _format_chunk_actions(self, actions: torch.Tensor) -> torch.Tensor:
         return actions.reshape(-1, self.chunk_len, self.step_action_dim)
 
+    def _direct_action_noise_sigma(
+        self,
+        deterministic: bool,
+        action_noise_sigma: float,
+    ) -> float:
+        if float(action_noise_sigma) > 0.0:
+            return float(action_noise_sigma)
+        if deterministic:
+            return 0.0
+        return float(self.actor_noise_sigma)
+
     def sac_forward(
         self,
         obs,
         apply_reference_dropout: bool = False,
         reference_dropout_prob: float = 0.0,
         deterministic: bool = False,
+        action_noise_sigma: float = 0.0,
+        action_noise_clip: float | None = None,
         **kwargs,
     ):
         del kwargs
@@ -143,6 +252,23 @@ class RLTMLPPolicy(MLPPolicy):
             apply_reference_dropout=apply_reference_dropout,
             reference_dropout_prob=reference_dropout_prob,
         )
+        if self.rlt_head_type == "direct":
+            action = self.direct_actor(actor_state)
+            noise_sigma = self._direct_action_noise_sigma(
+                deterministic,
+                action_noise_sigma,
+            )
+            if noise_sigma > 0.0:
+                noise = torch.randn_like(action) * noise_sigma
+                if action_noise_clip is not None and float(action_noise_clip) > 0.0:
+                    noise = noise.clamp(
+                        min=-float(action_noise_clip),
+                        max=float(action_noise_clip),
+                    )
+                action = action + noise
+            action = action.clamp(-1.0, 1.0)
+            return action, torch.zeros_like(action), None
+
         feat = self.backbone(actor_state)
         action_mean = self.actor_mean(feat)
         action_logstd = self.actor_logstd(feat)
@@ -157,6 +283,14 @@ class RLTMLPPolicy(MLPPolicy):
 
         action_normalized = torch.tanh(raw_action)
         action = action_normalized * self.action_scale + self.action_bias
+        if action_noise_sigma > 0.0:
+            noise = torch.randn_like(action) * float(action_noise_sigma)
+            if action_noise_clip is not None and float(action_noise_clip) > 0.0:
+                noise = noise.clamp(
+                    min=-float(action_noise_clip),
+                    max=float(action_noise_clip),
+                )
+            action = (action + noise).clamp(-1.0, 1.0)
 
         chunk_logprobs = probs.log_prob(raw_action)
         chunk_logprobs = chunk_logprobs - torch.log(
@@ -212,7 +346,10 @@ class RLTMLPPolicy(MLPPolicy):
             data["action"] if "action" in data else data["actions"]
         )
         actor_state = self._actor_state(obs)
-        pred_actions = self.actor_mean(self.backbone(actor_state))
+        if self.rlt_head_type == "direct":
+            pred_actions = self.direct_actor(actor_state).clamp(-1.0, 1.0)
+        else:
+            pred_actions = self.actor_mean(self.backbone(actor_state))
         return F.mse_loss(pred_actions, target_actions, reduction="none")
 
     @torch.inference_mode()
@@ -223,12 +360,28 @@ class RLTMLPPolicy(MLPPolicy):
         calculate_values=True,
         return_obs=True,
         mode="train",
+        sampling_mode: str | None = None,
+        action_noise_sigma: float = 0.0,
+        action_noise_clip: float | None = None,
         **kwargs,
     ):
         del calculate_logprobs, calculate_values
         obs = self.preprocess_env_obs(env_obs=env_obs)
+        if sampling_mode is None:
+            sampling_mode = "deterministic" if mode == "eval" else "sac_sample"
+        if sampling_mode not in {"sac_sample", "deterministic", "td3_action_noise"}:
+            raise ValueError(f"Unsupported RLT sampling_mode: {sampling_mode!r}")
+        deterministic = mode == "eval" or sampling_mode != "sac_sample"
+        noise_sigma = (
+            float(action_noise_sigma)
+            if sampling_mode == "td3_action_noise"
+            else 0.0
+        )
         action, chunk_logprobs, _ = self.sac_forward(
-            obs, deterministic=(mode == "eval")
+            obs,
+            deterministic=deterministic,
+            action_noise_sigma=noise_sigma,
+            action_noise_clip=action_noise_clip,
         )
         chunk_actions = self._format_chunk_actions(action)
 

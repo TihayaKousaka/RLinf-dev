@@ -437,19 +437,26 @@ class EnvWorker(Worker):
                     for key in infos["episode"]:
                         env_info[key] = infos["episode"][key].cpu()
         elif chunk_dones.any():
-            if "final_info" in infos:
+            if isinstance(infos, dict) and "final_info" in infos:
                 final_info = infos["final_info"]
+                done_envs = chunk_dones.any(dim=1)
                 for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+                    env_info[key] = final_info["episode"][key][done_envs].cpu()
 
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
         )
         intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
-        if self.cfg.env.train.auto_reset and chunk_dones.any():
-            if "intervene_action" in infos["final_info"]:
-                intervene_actions = infos["final_info"]["intervene_action"]
-                intervene_flags = infos["final_info"]["intervene_flag"]
+        if (
+            self.cfg.env.train.auto_reset
+            and chunk_dones.any()
+            and isinstance(infos, dict)
+            and "final_info" in infos
+        ):
+            final_info = infos["final_info"]
+            if "intervene_action" in final_info:
+                intervene_actions = final_info["intervene_action"]
+                intervene_flags = final_info["intervene_flag"]
 
         env_output = EnvOutput(
             obs=extracted_obs,
@@ -499,7 +506,7 @@ class EnvWorker(Worker):
             )
         )
 
-        current_dones = chunk_dones[:, -1]  # [num_envs] bool
+        current_dones = chunk_dones.any(dim=1)  # [num_envs] bool
         if self.cfg.env.eval.auto_reset:
             newly_done = current_dones
         else:
@@ -519,6 +526,7 @@ class EnvWorker(Worker):
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
+            env_infos=infos if isinstance(infos, dict) else None,
         )
         return env_output, env_info
 
@@ -1235,6 +1243,7 @@ class EnvWorker(Worker):
                             if "final_observation" in infos
                             else None
                         ),
+                        env_infos=infos if isinstance(infos, dict) else None,
                     )
                     env_batch = env_output.to_dict()
                     self.send_to(
@@ -1243,6 +1252,9 @@ class EnvWorker(Worker):
                         data={
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            "env_infos": self._select_rollout_env_infos(
+                                env_batch["env_infos"]
+                            ),
                         },
                         mode="eval",
                         tag="rollout_results",
@@ -1293,6 +1305,9 @@ class EnvWorker(Worker):
                         data={
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            "env_infos": self._select_rollout_env_infos(
+                                env_batch["env_infos"]
+                            ),
                         },
                         mode="eval",
                         tag="rollout_results",

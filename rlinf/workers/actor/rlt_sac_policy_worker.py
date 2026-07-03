@@ -62,6 +62,49 @@ class RLTSACLossMixin:
         }
         return any(key in self.cfg.algorithm for key in schedule_keys)
 
+    def _use_maniskill_rlt_actor_critic_isolation(self) -> bool:
+        if str(self.cfg.algorithm.get("loss_type", "")) != "rlt_sac":
+            return False
+        train_env_cfg = self.cfg.env.get("train", None)
+        eval_env_cfg = self.cfg.env.get("eval", None)
+        train_env_type = (
+            str(train_env_cfg.get("env_type", "")) if train_env_cfg is not None else ""
+        )
+        eval_env_type = (
+            str(eval_env_cfg.get("env_type", "")) if eval_env_cfg is not None else ""
+        )
+        return train_env_type == "maniskill" or eval_env_type == "maniskill"
+
+    def _before_actor_update(self) -> None:
+        if not self._use_maniskill_rlt_actor_critic_isolation():
+            return
+        qf_optimizer = getattr(self, "qf_optimizer", None)
+        if qf_optimizer is not None:
+            qf_optimizer.zero_grad(set_to_none=True)
+
+    def _after_actor_update(self) -> None:
+        if not self._use_maniskill_rlt_actor_critic_isolation():
+            return
+        qf_optimizer = getattr(self, "qf_optimizer", None)
+        if qf_optimizer is not None:
+            qf_optimizer.zero_grad(set_to_none=True)
+
+    def _clear_qf_grad_before_actor_clip(self) -> bool:
+        if not self._use_maniskill_rlt_actor_critic_isolation():
+            return False
+        qf_optimizer = getattr(self, "qf_optimizer", None)
+        if qf_optimizer is None:
+            return False
+        qf_optimizer.zero_grad(set_to_none=True)
+        return True
+
+    def _should_update_actor(self, train_actor: bool) -> bool:
+        if not self._use_maniskill_rlt_actor_critic_isolation():
+            return super()._should_update_actor(train_actor)
+        return bool(train_actor) and (
+            (int(self.update_step) + 1) % int(self.critic_actor_ratio) == 0
+        )
+
     def get_rollout_sync_version(self) -> int:
         """Expose learner update count when RLT warmup gates actor rollout."""
         if not self._use_rlt_schedule():
@@ -95,7 +138,7 @@ class RLTSACLossMixin:
         actions: torch.Tensor,
         ref_chunk: torch.Tensor,
         intervene_flags: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         chunk_len, action_dim = self._chunk_shape()
         pi_chunk = self._flatten_chunk(pi).reshape(-1, chunk_len, action_dim)
         action_chunk = self._flatten_chunk(actions).reshape(-1, chunk_len, action_dim)
@@ -138,7 +181,7 @@ class RLTSACLossMixin:
             "human_mask_ratio": human_ratio,
             "policy_mask_ratio": 1.0 - human_ratio,
         }
-        return bc_loss, metrics
+        return bc_loss, bc_target, metrics
 
     def _chunk_delta_loss(
         self,
@@ -250,6 +293,40 @@ class RLTSACLossMixin:
             self._rlt_schedule_value("warmup_post_collect_updates", 0)
         )
 
+    def _rlt_action_sampling_cfg(self):
+        return self.cfg.algorithm.get("rlt_action_sampling", {})
+
+    def _sample_mode(self, key: str, default: str) -> str:
+        return str(self._rlt_action_sampling_cfg().get(key, default))
+
+    def _sample_noise_sigma(self, key: str, default: float = 0.0) -> float:
+        return float(self._rlt_action_sampling_cfg().get(key, default))
+
+    def _sample_noise_clip(self, key: str, default_key: str | None = None) -> float | None:
+        value = self._rlt_action_sampling_cfg().get(key, None)
+        if value is None and default_key is not None:
+            value = self._rlt_action_sampling_cfg().get(default_key, None)
+        return None if value is None else float(value)
+
+    def _sac_action_kwargs(self, mode: str, *, prefix: str = "") -> dict:
+        if mode == "sac_sample":
+            return {"deterministic": False}
+        if mode == "deterministic":
+            return {"deterministic": True}
+        if mode == "td3_action_noise":
+            return {
+                "deterministic": True,
+                "action_noise_sigma": self._sample_noise_sigma(
+                    f"{prefix}noise_sigma",
+                    self._sample_noise_sigma("action_noise_sigma", 0.0),
+                ),
+                "action_noise_clip": self._sample_noise_clip(
+                    f"{prefix}noise_clip",
+                    "action_noise_clip",
+                ),
+            }
+        raise ValueError(f"Unsupported RLT SAC action sampling mode: {mode!r}")
+
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
@@ -260,15 +337,26 @@ class RLTSACLossMixin:
         next_obs = batch["next_obs"]
         actions = batch["actions"]
         rewards = batch["rewards"]
-        terminations = batch["terminations"].to(self.torch_dtype)
-        not_done = ~terminations.reshape(terminations.shape[0], -1).bool().any(
+        terminations = batch["terminations"]
+        dones = batch.get("dones", terminations)
+        not_done = ~dones.reshape(dones.shape[0], -1).bool().any(
             dim=-1, keepdim=True
         )
 
         with torch.no_grad():
-            next_actions, _, _ = self.model(
+            target_action_mode = self._sample_mode("target_action_mode", "sac_sample")
+            target_policy_model = (
+                self.target_model
+                if getattr(self, "target_model_initialized", False)
+                else self.model
+            )
+            next_actions, _, _ = target_policy_model(
                 forward_type=ForwardType.SAC,
                 obs=next_obs,
+                **self._sac_action_kwargs(
+                    target_action_mode,
+                    prefix="target_",
+                ),
             )
 
             if not use_crossq:
@@ -328,10 +416,42 @@ class RLTSACLossMixin:
         critic_loss = F.mse_loss(
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
+        bootstrap_target = (target_q_values - reward_target).to(torch.float32)
+        reward_target_f32 = reward_target.to(torch.float32)
+        q_next_f32 = q_next.to(torch.float32)
         metrics = {
             "q_data": all_data_q_values.mean().item(),
             "q_target": target_q_values.mean().item(),
+            "reward_target": reward_target_f32.mean().item(),
+            "reward_target_max": reward_target_f32.max().item(),
+            "reward_target_nonzero_rate": reward_target_f32.ne(0).float().mean().item(),
+            "q_next": q_next_f32.mean().item(),
+            "q_next_max": q_next_f32.max().item(),
+            "bootstrap_target": bootstrap_target.mean().item(),
+            "bootstrap_discount": float(bootstrap_discount),
+            "done_rate": dones.reshape(dones.shape[0], -1).float().mean().item(),
+            "termination_rate": terminations.reshape(
+                terminations.shape[0], -1
+            )
+            .float()
+            .mean()
+            .item(),
+            "not_done_mean": not_done.float().mean().item(),
+            "target_action_mode": float(
+                {
+                    "sac_sample": 0,
+                    "deterministic": 1,
+                    "td3_action_noise": 2,
+                }[target_action_mode]
+            ),
         }
+        for q_id in range(all_data_q_values.shape[-1]):
+            metrics[f"q{q_id + 1}_mean"] = all_data_q_values[..., q_id].mean().item()
+        if "truncations" in batch:
+            truncations = batch["truncations"]
+            metrics["truncation_rate"] = (
+                truncations.reshape(truncations.shape[0], -1).float().mean().item()
+            )
         if self._use_rlt_schedule():
             metrics["ready_for_online"] = float(self._ready_for_online())
         return critic_loss, metrics
@@ -347,11 +467,13 @@ class RLTSACLossMixin:
         reference_dropout_prob = float(
             self.cfg.algorithm.get("reference_dropout_prob", 0.0)
         )
+        actor_update_mode = self._sample_mode("actor_update_mode", "sac_sample")
         pi, log_pi, _ = self.model(
             forward_type=ForwardType.SAC,
             obs=curr_obs,
             apply_reference_dropout=True,
             reference_dropout_prob=reference_dropout_prob,
+            **self._sac_action_kwargs(actor_update_mode),
         )
         if log_pi.ndim == 1:
             log_pi = log_pi.unsqueeze(-1)
@@ -380,9 +502,12 @@ class RLTSACLossMixin:
         }
         qf_pi = self._aggregate_q(all_qf_pi, agg_q)
         metrics["q_pi"] = qf_pi.mean().item()
+        metrics["qf_grad_isolated_for_actor"] = float(
+            self._use_maniskill_rlt_actor_critic_isolation()
+        )
 
         ref_chunk = self._ref_chunk(curr_obs)
-        bc_loss, rlt_metrics = self._bc_metrics(
+        bc_loss, bc_target, rlt_metrics = self._bc_metrics(
             pi=pi,
             actions=batch["actions"],
             ref_chunk=ref_chunk,
@@ -391,7 +516,7 @@ class RLTSACLossMixin:
         metrics.update(rlt_metrics)
 
         entropy = -log_pi.mean()
-        delta_loss = self._chunk_delta_loss(pi, ref_chunk)
+        delta_loss = self._chunk_delta_loss(pi, bc_target)
         bc_weight, q_weight, delta_weight, weight_metrics = self._actor_loss_weights()
         actor_loss = (
             -q_weight * qf_pi.mean()
@@ -400,10 +525,20 @@ class RLTSACLossMixin:
         )
         metrics.update(weight_metrics)
         metrics["delta_loss"] = delta_loss.detach().item()
+        metrics["action_ref_abs_mean"] = (
+            self._flatten_chunk(pi) - self._flatten_chunk(ref_chunk)
+        ).abs().mean().detach().item()
         metrics["weighted_q"] = (q_weight * qf_pi.mean()).detach().item()
         metrics["weighted_bc"] = (bc_weight * bc_loss).detach().item()
         metrics["weighted_delta"] = (delta_weight * delta_loss).detach().item()
         metrics["reference_dropout_prob"] = reference_dropout_prob
+        metrics["actor_update_mode"] = float(
+            {
+                "sac_sample": 0,
+                "deterministic": 1,
+                "td3_action_noise": 2,
+            }[actor_update_mode]
+        )
         if self._use_rlt_schedule():
             metrics["ready_for_online"] = float(self._ready_for_online())
 
@@ -426,6 +561,7 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
         self.total_episodes_added = 0
         self._warmup_ready_total_transitions: int | None = None
         self._warmup_ready_total_episodes: int | None = None
+        self.pending_update_budget = 0
 
     def setup_sac_components(self):
         """Initialize replay components and let RLT schedule own readiness."""
@@ -446,6 +582,238 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
             return 0
         return int(dones.reshape(dones.shape[0], dones.shape[1], -1).any(dim=-1).sum())
 
+    @staticmethod
+    def _trajectory_forward_input_rate(traj: Trajectory, key: str) -> float | None:
+        value = traj.forward_inputs.get(key, None) if traj.forward_inputs else None
+        if not isinstance(value, torch.Tensor) or value.numel() == 0:
+            return None
+        return float(value.detach().float().mean().item())
+
+    def _use_maniskill_transition_replay(self) -> bool:
+        if str(self.cfg.algorithm.get("loss_type", "")) != "rlt_sac":
+            return False
+        train_env_cfg = self.cfg.env.get("train", None)
+        train_env_type = (
+            str(train_env_cfg.get("env_type", "")) if train_env_cfg is not None else ""
+        )
+        return train_env_type == "maniskill"
+
+    @staticmethod
+    def _row_tensor(tensor: torch.Tensor, idx: int) -> torch.Tensor:
+        return tensor[idx].detach().clone().unsqueeze(0).unsqueeze(0).cpu().contiguous()
+
+    @staticmethod
+    def _step_env_tensor(tensor: torch.Tensor, step_idx: int, env_idx: int) -> torch.Tensor:
+        return (
+            tensor[step_idx, env_idx]
+            .detach()
+            .clone()
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .cpu()
+            .contiguous()
+        )
+
+    def _row_tensor_dict(
+        self,
+        tensor_dict: dict[str, object],
+        idx: int,
+    ) -> dict[str, torch.Tensor]:
+        row_dict = {}
+        for key, value in tensor_dict.items():
+            if isinstance(value, torch.Tensor) and idx < value.shape[0]:
+                row_dict[key] = self._row_tensor(value, idx)
+        return row_dict
+
+    def _rlt_obs_from_flat_forward_inputs(
+        self,
+        flat: dict,
+        idx: int,
+    ) -> dict[str, torch.Tensor] | None:
+        forward_inputs = flat.get("forward_inputs")
+        if not isinstance(forward_inputs, dict):
+            return None
+        obs = {}
+        for key in ("z_rl", "proprio", "ref_chunk"):
+            value = forward_inputs.get(key)
+            if not isinstance(value, torch.Tensor) or idx >= value.shape[0]:
+                return None
+            obs[key] = self._row_tensor(value, idx)
+        return obs
+
+    def _rlt_obs_from_flat_dict(
+        self,
+        flat: dict,
+        dict_key: str,
+        idx: int,
+    ) -> dict[str, torch.Tensor] | None:
+        value = flat.get(dict_key)
+        if not isinstance(value, dict):
+            return None
+        obs = self._row_tensor_dict(value, idx)
+        return obs if obs else None
+
+    @staticmethod
+    def _flat_record_transition(flat: dict, idx: int) -> bool:
+        forward_inputs = flat.get("forward_inputs")
+        if not isinstance(forward_inputs, dict):
+            return True
+        record_transition = forward_inputs.get("record_transition")
+        if not isinstance(record_transition, torch.Tensor):
+            return True
+        if idx >= record_transition.shape[0]:
+            return False
+        return bool(record_transition[idx].detach().to(torch.bool).reshape(-1).all())
+
+    @staticmethod
+    def _transition_has_intervention(trajectory: Trajectory) -> bool:
+        flags = trajectory.intervene_flags
+        if isinstance(flags, torch.Tensor) and flags.detach().to(torch.bool).any():
+            return True
+        if not isinstance(trajectory.forward_inputs, dict):
+            return False
+        forward_flags = trajectory.forward_inputs.get("intervention_flags")
+        return bool(
+            isinstance(forward_flags, torch.Tensor)
+            and forward_flags.detach().to(torch.bool).any()
+        )
+
+    def _maniskill_transition_replay_trajectories(
+        self,
+        trajectory: Trajectory,
+    ) -> tuple[list[Trajectory], int]:
+        if (
+            trajectory.actions is None
+            or trajectory.rewards is None
+            or self.replay_buffer is None
+        ):
+            return [], 0
+
+        flat = self.replay_buffer._flatten_trajectory(trajectory)
+        actions = flat.get("actions")
+        rewards = flat.get("rewards")
+        if not isinstance(actions, torch.Tensor) or not isinstance(
+            rewards, torch.Tensor
+        ):
+            return [], 0
+
+        tensor_fields = (
+            "actions",
+            "intervene_flags",
+            "rewards",
+            "terminations",
+            "truncations",
+            "dones",
+            "prev_logprobs",
+            "prev_values",
+            "versions",
+        )
+        dict_fields = ("forward_inputs",)
+        replay_trajectories = []
+        completed_episodes = 0
+        traj_len = int(trajectory.actions.shape[0])
+        bsz = int(trajectory.actions.shape[1])
+        num_rows = int(actions.shape[0])
+        auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
+
+        for env_idx in range(bsz):
+            for t in range(traj_len):
+                idx = t * bsz + env_idx
+                if idx >= num_rows:
+                    break
+                if not self._flat_record_transition(flat, idx):
+                    continue
+
+                transition = Trajectory(
+                    max_episode_length=1,
+                    model_weights_id=trajectory.model_weights_id,
+                )
+                for field_name in tensor_fields:
+                    value = flat.get(field_name)
+                    if isinstance(value, torch.Tensor) and idx < value.shape[0]:
+                        setattr(transition, field_name, self._row_tensor(value, idx))
+                for field_name in dict_fields:
+                    value = flat.get(field_name)
+                    if isinstance(value, dict):
+                        setattr(
+                            transition, field_name, self._row_tensor_dict(value, idx)
+                        )
+
+                curr_obs = self._rlt_obs_from_flat_forward_inputs(flat, idx)
+                if curr_obs is None:
+                    curr_obs = self._rlt_obs_from_flat_dict(flat, "curr_obs", idx)
+                if curr_obs is not None:
+                    transition.curr_obs = curr_obs
+
+                # Match the original RLT adapter: done for transition t is read
+                # from the post-action slot t+1 when that slot is present.
+                done_idx = min(
+                    t + 1,
+                    int(trajectory.dones.shape[0]) - 1
+                    if isinstance(trajectory.dones, torch.Tensor)
+                    else traj_len - 1,
+                )
+                done_flat_idx = done_idx * bsz + env_idx
+                for done_field in ("dones", "terminations", "truncations"):
+                    done_value = getattr(trajectory, done_field, None)
+                    if (
+                        isinstance(done_value, torch.Tensor)
+                        and done_idx < done_value.shape[0]
+                        and env_idx < done_value.shape[1]
+                    ):
+                        setattr(
+                            transition,
+                            done_field,
+                            self._step_env_tensor(done_value, done_idx, env_idx),
+                        )
+
+                is_done = (
+                    isinstance(transition.dones, torch.Tensor)
+                    and transition.dones.reshape(-1).to(torch.bool).any()
+                )
+                if is_done:
+                    next_obs = curr_obs
+                else:
+                    # Prefer the same-trajectory t+1 features. The final
+                    # rollout forward pass can provide one extra feature slot.
+                    next_obs = self._rlt_obs_from_flat_forward_inputs(
+                        flat,
+                        done_flat_idx,
+                    )
+                if next_obs is None:
+                    next_obs = self._rlt_obs_from_flat_dict(flat, "next_obs", idx)
+                if next_obs is not None:
+                    transition.next_obs = next_obs
+
+                replay_trajectories.append(transition)
+                if is_done:
+                    completed_episodes += 1
+                    if not auto_reset:
+                        break
+
+        return replay_trajectories, completed_episodes
+
+    def _rollout_route_metrics(self, trajectories: list[Trajectory]) -> dict[str, float]:
+        metric_keys = {
+            "student_control": "rollout/student_control_rate",
+            "intervention_flags": "rollout/intervention_rate",
+            "intervention_requested": "rollout/intervention_requested_rate",
+            "ready_for_online": "rollout/ready_for_online_rate",
+            "in_critical_phase": "rollout/in_critical_phase_rate",
+            "record_transition": "rollout/record_transition_rate",
+        }
+        metrics = {}
+        for source_key, metric_key in metric_keys.items():
+            values = [
+                rate
+                for traj in trajectories
+                if (rate := self._trajectory_forward_input_rate(traj, source_key))
+                is not None
+            ]
+            if values:
+                metrics[metric_key] = float(sum(values) / len(values))
+        return metrics
+
     async def recv_rollout_trajectories(self, input_channel):
         clear_memory(sync=False)
 
@@ -458,24 +826,50 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
 
-        self.replay_buffer.add_trajectories(recv_list)
+        self._last_rollout_route_metrics = self._rollout_route_metrics(recv_list)
 
-        if self.demo_buffer is not None:
-            intervene_traj_list = []
+        if self._use_maniskill_transition_replay():
+            replay_list = []
+            completed = 0
             for traj in recv_list:
                 assert isinstance(traj, Trajectory)
-                intervene_trajs = traj.extract_intervene_traj()
-                if intervene_trajs is not None:
-                    intervene_traj_list.extend(intervene_trajs)
+                transition_trajs, completed_count = (
+                    self._maniskill_transition_replay_trajectories(traj)
+                )
+                replay_list.extend(transition_trajs)
+                completed += completed_count
+            self.replay_buffer.add_trajectories(replay_list)
 
-            if len(intervene_traj_list) > 0:
-                self.demo_buffer.add_trajectories(intervene_traj_list)
+            if self.demo_buffer is not None:
+                intervene_traj_list = [
+                    traj
+                    for traj in replay_list
+                    if self._transition_has_intervention(traj)
+                ]
+                if len(intervene_traj_list) > 0:
+                    self.demo_buffer.add_trajectories(intervene_traj_list)
 
-        if self._use_rlt_schedule():
+            added = len(replay_list)
+        else:
+            self.replay_buffer.add_trajectories(recv_list)
+
+            if self.demo_buffer is not None:
+                intervene_traj_list = []
+                for traj in recv_list:
+                    assert isinstance(traj, Trajectory)
+                    intervene_trajs = traj.extract_intervene_traj()
+                    if intervene_trajs is not None:
+                        intervene_traj_list.extend(intervene_trajs)
+
+                if len(intervene_traj_list) > 0:
+                    self.demo_buffer.add_trajectories(intervene_traj_list)
+
             added = sum(self._trajectory_transition_count(traj) for traj in recv_list)
             completed = sum(
                 self._trajectory_completed_episodes(traj) for traj in recv_list
             )
+
+        if self._use_rlt_schedule():
             self.transitions_since_train += added
             self.episodes_since_train += completed
             self.total_transitions_added += added
@@ -522,19 +916,25 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
             )
             self._warmup_ready_total_episodes = int(counters["total_episodes_added"])
 
+        train_every_transitions = int(
+            self._rlt_schedule_value("train_every_transitions", 0)
+        )
+        train_every_episodes = int(
+            self._rlt_schedule_value("train_every_episodes", 0)
+        )
+        update_epoch = int(self._rlt_schedule_value("update_epoch", 1))
+        max_updates = int(self._rlt_schedule_value("max_updates_per_train_step", 0))
+
         updates_to_run = 0
         skip_reason = 0
         desired_total_updates = 0
-        if not buffer_ready:
+        pending_updates = 0
+        updates_scheduled = 0
+        if update_epoch <= 0:
+            skip_reason = 3
+        elif not buffer_ready:
             skip_reason = 1
         else:
-            train_every_transitions = int(
-                self._rlt_schedule_value("train_every_transitions", 0)
-            )
-            train_every_episodes = int(
-                self._rlt_schedule_value("train_every_episodes", 0)
-            )
-            update_epoch = int(self._rlt_schedule_value("update_epoch", 1))
             online_transitions = max(
                 int(counters["total_transitions_added"])
                 - int(self._warmup_ready_total_transitions or 0),
@@ -563,14 +963,13 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
                 warmup_required_updates + online_cycles * update_epoch
             )
             pending_updates = max(desired_total_updates - int(self.update_step), 0)
+            updates_scheduled = pending_updates
             updates_to_run = pending_updates
-            max_updates = int(
-                self._rlt_schedule_value("max_updates_per_train_step", 0)
-            )
             if max_updates > 0:
                 updates_to_run = min(updates_to_run, max_updates)
             if updates_to_run <= 0:
                 skip_reason = 2
+        self.pending_update_budget = int(pending_updates)
 
         metrics = {
             "rlt_stage2/update_step": float(self.update_step),
@@ -578,8 +977,17 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
                 int(self.update_step) >= warmup_required_updates
             ),
             "rlt_stage2/warmup_required_updates": float(warmup_required_updates),
+            "rlt_stage2/update_epoch": float(update_epoch),
+            "rlt_stage2/max_updates_per_train_step": float(max_updates),
+            "rlt_stage2/train_every_transitions": float(train_every_transitions),
+            "rlt_stage2/train_every_episodes": float(train_every_episodes),
             "rlt_stage2/desired_total_updates": float(desired_total_updates),
+            "rlt_stage2/pending_update_budget": float(self.pending_update_budget),
+            "rlt_stage2/updates_scheduled": float(updates_scheduled),
             "rlt_stage2/updates_to_run": float(updates_to_run),
+            "rlt_stage2/critic_updates_run": 0.0,
+            "rlt_stage2/actor_updates_run": 0.0,
+            "rlt_stage2/should_train": float(updates_to_run > 0),
             "rlt_stage2/skip_reason": float(skip_reason),
             "rlt_stage2/global_min_replay_size": float(counters["min_replay_size"]),
             "rlt_stage2/min_replay_buffer_size": float(min_buffer_size),
@@ -590,6 +998,7 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
                 counters["total_transitions_added"]
             ),
         }
+        metrics.update(getattr(self, "_last_rollout_route_metrics", {}))
         return updates_to_run, metrics
 
     def run_training(self):
@@ -621,11 +1030,25 @@ class RLTSACFSDPPolicy(RLTSACLossMixin, EmbodiedSACFSDPPolicy):
 
         self.model.train()
         metrics = {}
+        critic_updates_run = 0
+        actor_updates_run = 0
         for _ in range(updates_to_run):
+            update_actor = self._should_update_actor(True)
             metrics_data = self.update_one_epoch(train_actor=True)
             append_to_dict(metrics, metrics_data)
             self.update_step += 1
+            critic_updates_run += 1
+            actor_updates_run += int(update_actor)
 
+        schedule_metrics["rlt_stage2/critic_updates_run"] = float(critic_updates_run)
+        schedule_metrics["rlt_stage2/actor_updates_run"] = float(actor_updates_run)
+        self.pending_update_budget = max(
+            int(self.pending_update_budget) - critic_updates_run,
+            0,
+        )
+        schedule_metrics["rlt_stage2/pending_update_budget"] = float(
+            self.pending_update_budget
+        )
         append_to_dict(metrics, schedule_metrics)
         mean_metric_dict = self.process_train_metrics(metrics)
         self.transitions_since_train = 0

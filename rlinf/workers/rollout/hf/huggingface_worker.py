@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import os
 import time
 from typing import Any, Callable, Literal, Optional
 
@@ -132,6 +133,24 @@ class MultiStepRolloutWorker(Worker):
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
 
+    @staticmethod
+    def _resolve_model_ckpt_path(ckpt_path: str) -> str:
+        if not os.path.isdir(ckpt_path):
+            return ckpt_path
+        full_weights_path = os.path.join(
+            ckpt_path, "model_state_dict", "full_weights.pt"
+        )
+        if os.path.exists(full_weights_path):
+            return full_weights_path
+        actor_full_weights_path = os.path.join(
+            ckpt_path, "actor", "model_state_dict", "full_weights.pt"
+        )
+        if os.path.exists(actor_full_weights_path):
+            return actor_full_weights_path
+        raise FileNotFoundError(
+            f"Could not find model_state_dict/full_weights.pt under {ckpt_path}"
+        )
+
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
         with open_dict(rollout_model_config):
@@ -141,7 +160,8 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
-            model_dict = torch.load(self.cfg.runner.ckpt_path)
+            ckpt_path = self._resolve_model_ckpt_path(self.cfg.runner.ckpt_path)
+            model_dict = torch.load(ckpt_path, map_location="cpu")
             self.hf_model.load_state_dict(model_dict)
 
         rlt_feature_model_config = OmegaConf.select(
@@ -729,6 +749,26 @@ class MultiStepRolloutWorker(Worker):
             self._rlt_schedule_value("warmup_post_collect_updates", 0)
         )
 
+    def _rlt_action_sampling_cfg(self):
+        return self.cfg.algorithm.get("rlt_action_sampling", {})
+
+    def _rlt_train_rollout_action_kwargs(self) -> dict[str, Any]:
+        sampling_cfg = self._rlt_action_sampling_cfg()
+        sampling_mode = str(sampling_cfg.get("train_rollout_mode", "sac_sample"))
+        if sampling_mode == "sac_sample":
+            return {"sampling_mode": sampling_mode}
+        if sampling_mode == "deterministic":
+            return {"sampling_mode": sampling_mode}
+        if sampling_mode == "td3_action_noise":
+            return {
+                "sampling_mode": sampling_mode,
+                "action_noise_sigma": float(
+                    sampling_cfg.get("action_noise_sigma", 0.0)
+                ),
+                "action_noise_clip": sampling_cfg.get("action_noise_clip", None),
+            }
+        raise ValueError(f"Unsupported RLT train_rollout_mode: {sampling_mode!r}")
+
     def _rlt_base_actions(
         self,
         ref_chunk: torch.Tensor,
@@ -903,10 +943,14 @@ class MultiStepRolloutWorker(Worker):
             rlt_obs = self.rlt_feature_model.extract_rlt_stage2_obs(
                 env_obs,
             )
+            rlt_predict_kwargs = {}
+            if mode == "train" and self._use_rlt_maniskill_route():
+                rlt_predict_kwargs.update(self._rlt_train_rollout_action_kwargs())
             actions, result = self.hf_model.predict_action_batch(
                 env_obs=rlt_obs,
                 mode=mode,
                 return_obs=True,
+                **rlt_predict_kwargs,
             )
             if isinstance(actions, np.ndarray):
                 actions = torch.from_numpy(actions)

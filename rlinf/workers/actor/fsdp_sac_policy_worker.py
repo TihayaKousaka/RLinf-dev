@@ -184,6 +184,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             enable_cache=self.cfg.algorithm.replay_buffer.enable_cache,
             cache_size=self.cfg.algorithm.replay_buffer.cache_size,
             sample_window_size=self.cfg.algorithm.replay_buffer.sample_window_size,
+            max_num_samples=self.cfg.algorithm.replay_buffer.get(
+                "max_num_samples", None
+            ),
             auto_save=self.cfg.algorithm.replay_buffer.get("auto_save", False),
             auto_save_path=auto_save_path,
             trajectory_format=self.cfg.algorithm.replay_buffer.get(
@@ -205,6 +208,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 enable_cache=self.cfg.algorithm.demo_buffer.enable_cache,
                 cache_size=self.cfg.algorithm.demo_buffer.cache_size,
                 sample_window_size=self.cfg.algorithm.demo_buffer.sample_window_size,
+                max_num_samples=self.cfg.algorithm.demo_buffer.get(
+                    "max_num_samples", None
+                ),
                 auto_save=self.cfg.algorithm.demo_buffer.get("auto_save", False),
                 auto_save_path=auto_save_path,
                 trajectory_format="pt",
@@ -248,6 +254,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         assert self.target_update_type in ["all", "q_head_only"], (
             f"{self.target_update_type=} is not suppported!"
         )
+
+    def _should_update_actor(self, train_actor: bool) -> bool:
+        return bool(train_actor) and self.update_step % self.critic_actor_ratio == 0
 
     def _init_target_shadow(self):
         """Create persistent float32 shadow of target model parameters.
@@ -596,8 +605,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             **all_critic_metrics,
         }
 
-        if self.update_step % self.critic_actor_ratio == 0 and train_actor:
+        if self._should_update_actor(train_actor):
             self.optimizer.zero_grad()
+            if hasattr(self, "_before_actor_update"):
+                self._before_actor_update()
             gbs_actor_loss = []
             gbs_entropy = []
             all_actor_metrics = {}
@@ -612,11 +623,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 f"actor/{key}": np.mean(value)
                 for key, value in all_actor_metrics.items()
             }
+            if hasattr(self, "_clear_qf_grad_before_actor_clip"):
+                self._clear_qf_grad_before_actor_clip()
             actor_grad_norm = self.model.clip_grad_norm_(
                 max_norm=self.cfg.actor.optim.clip_grad
             )
             self.optimizer.step()
             self.lr_scheduler.step()
+            if hasattr(self, "_after_actor_update"):
+                self._after_actor_update()
 
             # Update temperature parameter if using automatic entropy tuning
             gbs_alpha_loss = [0]
@@ -845,3 +860,26 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
         )
         self.replay_buffer.load_checkpoint(buffer_load_path)
+
+    def load_model_checkpoint_only(self, load_base_path):
+        full_weights_path = os.path.join(
+            load_base_path, "model_state_dict", "full_weights.pt"
+        )
+        if not os.path.exists(full_weights_path):
+            raise FileNotFoundError(
+                f"Could not find model weights at {full_weights_path}"
+            )
+        model_state_dict = torch.load(full_weights_path, map_location="cpu")
+        self._strategy.load_model_with_state_dict(
+            self.model,
+            model_state_dict,
+            cpu_offload=False,
+            full_state_dict=True,
+        )
+        if getattr(self, "target_model_initialized", False):
+            self._strategy.load_model_with_state_dict(
+                self.target_model,
+                model_state_dict,
+                cpu_offload=False,
+                full_state_dict=True,
+            )

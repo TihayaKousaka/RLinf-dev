@@ -431,3 +431,201 @@ class RLTTokenTransformer(nn.Module):
         self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         return self.loss(prefix_embs, mask)
+
+
+class LegacyRLTTokenEncoder(nn.Module):
+    """Compatibility encoder for ablation RL-token checkpoints.
+
+    Older Stage1 checkpoints saved keys under ``encoder.e_rl`` and
+    ``encoder.transformer.layers.*`` using PyTorch's stock Transformer blocks.
+    """
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int = 2048,
+        num_rl_tokens: int = 1,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout_rate: float = 0.0,
+        e_rl_shape: tuple[int, ...] | None = None,
+    ):
+        super().__init__()
+        e_rl_shape = e_rl_shape or (1, int(num_rl_tokens), int(embed_dim))
+        self.e_rl = nn.Parameter(torch.zeros(*e_rl_shape, dtype=torch.float32))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=int(embed_dim),
+            nhead=int(num_heads),
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=float(dropout_rate),
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=int(num_layers),
+        )
+
+    def _expanded_rl_tokens(self, batch_size: int, prefix_embs: torch.Tensor):
+        e_rl = self.e_rl.to(device=prefix_embs.device, dtype=prefix_embs.dtype)
+        if e_rl.dim() == 2:
+            return e_rl.unsqueeze(0).expand(batch_size, -1, -1)
+        if e_rl.dim() == 3 and e_rl.shape[0] == 1:
+            return e_rl.expand(batch_size, -1, -1)
+        if e_rl.dim() == 3 and e_rl.shape[1] == 1:
+            return e_rl.transpose(0, 1).expand(batch_size, -1, -1)
+        if e_rl.dim() == 3 and e_rl.shape[0] == batch_size:
+            return e_rl
+        raise ValueError(f"Unsupported legacy e_rl shape: {tuple(e_rl.shape)}")
+
+    def forward(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        batch_size = prefix_embs.shape[0]
+        rl_tokens = self._expanded_rl_tokens(batch_size, prefix_embs)
+        x = torch.cat([prefix_embs, rl_tokens], dim=1)
+
+        key_padding_mask = None
+        if mask is not None:
+            mask = mask.to(device=prefix_embs.device, dtype=torch.bool)
+            rl_mask = torch.ones(
+                batch_size,
+                rl_tokens.shape[1],
+                device=prefix_embs.device,
+                dtype=torch.bool,
+            )
+            key_padding_mask = ~torch.cat([mask, rl_mask], dim=1)
+
+        x = self.transformer(x, src_key_padding_mask=key_padding_mask)
+        return x[:, -rl_tokens.shape[1] :]
+
+
+class LegacyRLTTokenDecoder(nn.Module):
+    """Compatibility decoder for ablation RL-token checkpoints."""
+
+    def __init__(
+        self,
+        *,
+        input_dim: int = 2048,
+        embed_dim: int = 2048,
+        prefix_seq_len: int = 768,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout_rate: float = 0.0,
+    ):
+        super().__init__()
+        self.prefix_seq_len = int(prefix_seq_len)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=int(embed_dim),
+            nhead=int(num_heads),
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=float(dropout_rate),
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=int(num_layers),
+        )
+        self.h_phi = nn.Linear(int(embed_dim), int(input_dim))
+
+    def forward(self, rl_tokens: torch.Tensor, target_seq_len: int | None = None):
+        target_seq_len = int(target_seq_len or self.prefix_seq_len)
+        tgt = torch.zeros(
+            rl_tokens.shape[0],
+            target_seq_len,
+            rl_tokens.shape[-1],
+            device=rl_tokens.device,
+            dtype=rl_tokens.dtype,
+        )
+        return self.h_phi(self.transformer(tgt=tgt, memory=rl_tokens))
+
+
+class LegacyRLTTokenTransformer(nn.Module):
+    """Ablation-compatible RL-token module for old ``rl_token_model.pt`` files."""
+
+    def __init__(
+        self,
+        *,
+        input_dim: int = 2048,
+        embed_dim: int = 2048,
+        num_rl_tokens: int = 1,
+        prefix_seq_len: int = 768,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout_rate: float = 0.0,
+        e_rl_shape: tuple[int, ...] | None = None,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.embed_dim = int(embed_dim)
+        self.num_rl_tokens = int(num_rl_tokens)
+        self.prefix_seq_len = int(prefix_seq_len)
+        self.encoder = LegacyRLTTokenEncoder(
+            embed_dim=embed_dim,
+            num_rl_tokens=num_rl_tokens,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            dropout_rate=dropout_rate,
+            e_rl_shape=e_rl_shape,
+        )
+        self.decoder = LegacyRLTTokenDecoder(
+            input_dim=input_dim,
+            embed_dim=embed_dim,
+            prefix_seq_len=prefix_seq_len,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            dropout_rate=dropout_rate,
+        )
+
+    @property
+    def z_dim(self) -> int:
+        return self.num_rl_tokens * self.embed_dim
+
+    def encode(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return self.encoder(prefix_embs, mask)
+
+    def encode_flat(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return self.encode(prefix_embs, mask).reshape(prefix_embs.shape[0], -1)
+
+    def decode(
+        self, rl_tokens: torch.Tensor, target_seq_len: int | None = None
+    ) -> torch.Tensor:
+        return self.decoder(rl_tokens, target_seq_len)
+
+    def reconstruct(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rl_tokens = self.encode(prefix_embs, mask)
+        reconstructed = self.decode(rl_tokens, prefix_embs.shape[-2])
+        return reconstructed, rl_tokens
+
+    def loss(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        reconstructed, rl_tokens = self.reconstruct(prefix_embs, mask)
+        target = prefix_embs.detach().to(dtype=torch.float32)
+        reconstructed = reconstructed.to(dtype=torch.float32)
+        sq_error = torch.square(reconstructed - target)
+        if mask is not None:
+            mask_expanded = mask.to(device=sq_error.device, dtype=sq_error.dtype)[
+                ..., None
+            ]
+            sq_error = sq_error * mask_expanded
+            denom = torch.clamp(mask_expanded.sum() * prefix_embs.shape[-1], min=1.0)
+            mse = sq_error.sum() / denom
+        else:
+            mse = sq_error.mean()
+        return mse, {"mse": mse, "z_rl": rl_tokens.reshape(prefix_embs.shape[0], -1)}
+
+    def forward(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        return self.loss(prefix_embs, mask)

@@ -143,7 +143,7 @@ actor:
   model:
     # Unified Stage1 checkpoint directory. The OpenPI loader reads
     # model_state_dict/full_weights.pt from this actor directory.
-    model_path: "/logs/20260630-12:57:56/rlt_stage1_maniskill_joint_alpha1/checkpoints/global_step_1000/actor"
+    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs/20260630-12:57:56/rlt_stage1_maniskill_joint_alpha1/checkpoints/global_step_1000/actor"
     precision: null
     model_type: "openpi"
     num_action_chunks: 10

@@ -175,6 +175,9 @@ class EmbodiedRunner:
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is None:
             return
+        if self.cfg.runner.get("eval_only_after_resume", False):
+            self.global_step = int(resume_dir.split("global_step_")[-1])
+            return
 
         self.logger.info(f"Resuming training from checkpoint directory {resume_dir}.")
         actor_checkpoint_path = os.path.join(resume_dir, "actor")
@@ -478,6 +481,24 @@ class EmbodiedRunner:
     def run(self):
         if self.cfg.runner.get("use_training_pipeline", False):
             return self.run_pipeline()
+
+        if self.cfg.runner.get("eval_only_after_resume", False):
+            resume_dir = self.cfg.runner.get("resume_dir", None)
+            if resume_dir is None:
+                raise ValueError("runner.eval_only_after_resume=True requires runner.resume_dir.")
+            actor_checkpoint_path = os.path.join(resume_dir, "actor")
+            self.logger.info(
+                f"Loading actor model weights for eval from {actor_checkpoint_path}."
+            )
+            self.actor.load_model_checkpoint_only(actor_checkpoint_path).wait()
+            with self.timer("eval"):
+                self.update_rollout_weights()
+                eval_metrics = self.evaluate()
+                eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                self.metric_logger.log(data=eval_metrics, step=self.global_step)
+                self.logger.info(eval_metrics)
+            self._finish_run()
+            return
 
         start_step = self.global_step
         start_time = time.time()
