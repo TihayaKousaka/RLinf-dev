@@ -132,7 +132,7 @@ algorithm:
     near_hole_x_min: -0.03
     near_hole_yz_margin: 1.5
     exit_hole_x_min: -0.10
-    fallback_hole_radius: 0.035
+    fallback_hole_radius: 0.03
 
   replay_buffer:
     enable_cache: True
@@ -159,7 +159,7 @@ env:
     num_action_chunks: ${rlt.num_action_chunks}
     ref_num_action_chunks: ${rlt.ref_num_action_chunks}
     init_params:
-      id: "PegInsertionSideWideClearance-v1"
+      id: "PegInsertionSideHardClearance-v1"
       obs_mode: "rgb"
       control_mode: "pd_joint_delta_pos"
       reward_mode: "sparse"
@@ -192,7 +192,7 @@ env:
       record_every: 1
       video_base_dir: ${runner.logger.log_path}/video/eval
     init_params:
-      id: "PegInsertionSideWideClearance-v1"
+      id: "PegInsertionSideHardClearance-v1"
       obs_mode: "rgb"
       control_mode: "pd_joint_delta_pos"
       reward_mode: "sparse"

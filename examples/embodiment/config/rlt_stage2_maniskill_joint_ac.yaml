@@ -83,7 +83,7 @@ algorithm:
 
   q_weight: 1.0
   bc_weight: 1.0
-  reference_dropout_prob: 0.0
+  reference_dropout_prob: 0.4
 
   entropy_tuning:
     alpha_type: fixed_alpha
@@ -95,14 +95,15 @@ algorithm:
 
   replay_buffer:
     enable_cache: True
-    cache_size: 10000
-    sample_window_size: 10000
-    min_buffer_size: 1
+    cache_size: 16
+    sample_window_size: 16
+    max_num_samples: 50000
+    min_buffer_size: 2
     auto_save: False
 
   target_update_freq: 1
   target_update_type: all
-  train_actor_steps: 1
+  train_actor_steps: 2
   critic_actor_ratio: 4
   critic_subsample_size: 0
   backup_entropy: False
@@ -119,7 +120,7 @@ algorithm:
     near_hole_x_min: -0.03
     near_hole_yz_margin: 1.5
     exit_hole_x_min: -0.10
-    fallback_hole_radius: 0.035
+    fallback_hole_radius: 0.03
 
 env:
   group_name: "EnvGroup"
@@ -139,7 +140,7 @@ env:
     num_action_chunks: ${rlt.num_action_chunks}
     ref_num_action_chunks: ${rlt.ref_num_action_chunks}
     init_params:
-      id: "PegInsertionSideWideClearance-v1"
+      id: "PegInsertionSideHardClearance-v1"
       obs_mode: "rgb"
       control_mode: "pd_joint_delta_pos"
       reward_mode: "sparse"
@@ -173,7 +174,7 @@ env:
       record_every: 1
       video_base_dir: ${runner.logger.log_path}/video/eval
     init_params:
-      id: "PegInsertionSideWideClearance-v1"
+      id: "PegInsertionSideHardClearance-v1"
       obs_mode: "rgb"
       control_mode: "pd_joint_delta_pos"
       reward_mode: "sparse"

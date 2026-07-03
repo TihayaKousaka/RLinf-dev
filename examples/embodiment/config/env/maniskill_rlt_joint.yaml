@@ -24,7 +24,7 @@ video_cfg:
 enable_offload: False
 
 init_params:
-  id: "PegInsertionSideWideClearance-v1"
+  id: "PegInsertionSideHardClearance-v1"
   num_envs: null
   obs_mode: "rgb"
   control_mode: "pd_joint_delta_pos"

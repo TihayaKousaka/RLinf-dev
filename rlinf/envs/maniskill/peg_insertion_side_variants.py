@@ -24,9 +24,14 @@ PEG_INSERTION_SIDE_WIDE_ENV_ID = "PegInsertionSideWideClearance-v1"
 PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID = (
     "PegInsertionSideWideClearanceObserverWideWrist-v1"
 )
+PEG_INSERTION_SIDE_HARD_ENV_ID = "PegInsertionSideHardClearance-v1"
+PEG_INSERTION_SIDE_HARD_OBSERVER_WIDE_WRIST_ENV_ID = (
+    "PegInsertionSideHardClearanceObserverWideWrist-v1"
+)
 PANDA_WIDE_WRISTCAM_UID = "panda_wristcam_wide"
 PEG_INSERTION_SIDE_BASE_CLEARANCE = 0.003
 PEG_INSERTION_SIDE_WIDE_CLEARANCE = 0.02
+PEG_INSERTION_SIDE_HARD_CLEARANCE = 0.01
 RLT_OPENPI_JOINT_WRAP_MODE = "rlt_openpi_joint"
 
 _RLT_JOINT_STATE_DIM = 9
@@ -42,6 +47,8 @@ def is_peg_insertion_side_env_id(env_id: str | None) -> bool:
     return env_id in {
         PEG_INSERTION_SIDE_WIDE_ENV_ID,
         PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID,
+        PEG_INSERTION_SIDE_HARD_ENV_ID,
+        PEG_INSERTION_SIDE_HARD_OBSERVER_WIDE_WRIST_ENV_ID,
     }
 
 
@@ -51,6 +58,11 @@ def get_joint_observer_env_id(env_id: str | None) -> str | None:
         PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID,
     }:
         return PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID
+    if env_id in {
+        PEG_INSERTION_SIDE_HARD_ENV_ID,
+        PEG_INSERTION_SIDE_HARD_OBSERVER_WIDE_WRIST_ENV_ID,
+    }:
+        return PEG_INSERTION_SIDE_HARD_OBSERVER_WIDE_WRIST_ENV_ID
     return None
 
 
@@ -307,6 +319,7 @@ def augment_peg_insertion_info(
             "peg_head_hole_abs_z": peg_head_hole_abs_z,
             "peg_head_goal_yz_dist": peg_head_goal_yz_dist,
             "peg_body_goal_yz_dist": peg_body_goal_yz_dist,
+            "hole_radii": hole_radii,
             "tcp_peg_dist": tcp_peg_dist,
             "is_grasped_current": is_grasped_current,
             "consecutive_grasp_current": consecutive_grasp_current,
@@ -374,10 +387,13 @@ def register_rlinf_peg_insertion_side_variants() -> None:
     global _PEG_VARIANTS_REGISTERED
     if _PEG_VARIANTS_REGISTERED:
         return
-    if (
-        PEG_INSERTION_SIDE_WIDE_ENV_ID in gym.registry
-        and PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID in gym.registry
-    ):
+    required_env_ids = {
+        PEG_INSERTION_SIDE_WIDE_ENV_ID,
+        PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID,
+        PEG_INSERTION_SIDE_HARD_ENV_ID,
+        PEG_INSERTION_SIDE_HARD_OBSERVER_WIDE_WRIST_ENV_ID,
+    }
+    if all(env_id in gym.registry for env_id in required_env_ids):
         _PEG_VARIANTS_REGISTERED = True
         return
 
@@ -545,6 +561,10 @@ def register_rlinf_peg_insertion_side_variants() -> None:
                 self.add_to_state_dict_registry(self.peg)
                 self.add_to_state_dict_registry(self.box)
 
+    class _PegInsertionSideHardSceneMixin(_PegInsertionSideWideSceneMixin):
+        hole_clearance = PEG_INSERTION_SIDE_HARD_CLEARANCE
+        success_clearance = PEG_INSERTION_SIDE_HARD_CLEARANCE
+
     @register_env(PEG_INSERTION_SIDE_WIDE_ENV_ID, max_episode_steps=100)
     class PegInsertionSideWideClearanceEnv(
         _PegInsertionSideWideSceneMixin, PegInsertionSideEnv
@@ -557,6 +577,28 @@ def register_rlinf_peg_insertion_side_variants() -> None:
     )
     class PegInsertionSideWideClearanceObserverWideWristEnv(
         PegInsertionSideWideClearanceEnv
+    ):  # type: ignore[unused-ignore]
+        SUPPORTED_ROBOTS = ["panda_wristcam", PANDA_WIDE_WRISTCAM_UID]
+
+        def __init__(self, *args, robot_uids=PANDA_WIDE_WRISTCAM_UID, **kwargs):
+            super().__init__(*args, robot_uids=robot_uids, **kwargs)
+
+        @property
+        def _default_sensor_configs(self):
+            return _observer_sensor_configs(super())
+
+    @register_env(PEG_INSERTION_SIDE_HARD_ENV_ID, max_episode_steps=100)
+    class PegInsertionSideHardClearanceEnv(
+        _PegInsertionSideHardSceneMixin, PegInsertionSideEnv
+    ):  # type: ignore[unused-ignore]
+        _clearance = PEG_INSERTION_SIDE_BASE_CLEARANCE
+
+    @register_env(
+        PEG_INSERTION_SIDE_HARD_OBSERVER_WIDE_WRIST_ENV_ID,
+        max_episode_steps=100,
+    )
+    class PegInsertionSideHardClearanceObserverWideWristEnv(
+        PegInsertionSideHardClearanceEnv
     ):  # type: ignore[unused-ignore]
         SUPPORTED_ROBOTS = ["panda_wristcam", PANDA_WIDE_WRISTCAM_UID]
 
