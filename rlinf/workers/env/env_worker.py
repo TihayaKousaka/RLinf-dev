@@ -992,7 +992,10 @@ class EnvWorker(Worker):
             )
             for _ in range(self.stage_num)
         ]
-        use_rlt_stage2 = self.cfg.algorithm.get("loss_type", "") == "rlt_sac"
+        use_rlt_stage2 = self.cfg.algorithm.get("loss_type", "") in {
+            "rlt_ac",
+            "rlt_sac",
+        }
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
         env_metrics = defaultdict(list)
 

@@ -16,18 +16,12 @@ action_dim: 7
 num_action_chunks: 50
 ref_num_action_chunks: 100
 
-hidden_dim: 256
-num_q_heads: 2
-
-precision: "32"
+# RLT AC defaults to fp32 for Q-learning and target-update stability.
+precision: fp32
 add_value_head: False
 add_q_head: True
 q_head_type: "default"
+fixed_std: 0.002
 
 is_lora: False
 lora_rank: 32
-
-# RLT SAC loss weights live under algorithm in the task config:
-# algorithm:
-#   q_weight: 1.0
-#   bc_weight: 1.0

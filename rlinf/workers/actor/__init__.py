@@ -24,6 +24,7 @@ def get_actor_worker(cfg: DictConfig) -> type[Worker]:
         ):
             if cfg.algorithm.loss_type in {
                 "embodied_sac",
+                "rlt_ac",
                 "rlt_sac",
                 "embodied_dagger",
                 "embodied_nft",

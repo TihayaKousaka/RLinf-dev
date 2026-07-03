@@ -653,8 +653,9 @@ class MultiStepRolloutWorker(Worker):
 
     def _use_rlt_maniskill_route(self) -> bool:
         train_env_cfg = self.cfg.env.get("train", None)
+        loss_type = str(self.cfg.algorithm.get("loss_type", ""))
         return (
-            str(self.cfg.algorithm.get("loss_type", "")) == "rlt_sac"
+            loss_type in {"rlt_ac", "rlt_sac"}
             and train_env_cfg is not None
             and str(train_env_cfg.get("env_type", "")) == "maniskill"
         )
