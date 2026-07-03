@@ -16,7 +16,6 @@ hydra:
 rlt:
   task_name: "maniskill_joint_peg_insertion"
   stage1_model_path: "/path/to/stage1/actor"
-  expert_model_path: "/path/to/expert/actor"
   openpi_repo_id: "maniskill_peginsertionside_joint"
   openpi_config_name: "pi05_rlt_maniskill_joint"
   default_prompt: "insert the peg in the hole"
@@ -64,7 +63,14 @@ runner:
   ckpt_path: null
 
 algorithm:
-  update_epoch: 32
+  update_epoch: 5
+  rlt_schedule:
+    enable: True
+    max_updates_per_train_step: 1600
+    warmup_min_size: 1000
+    warmup_post_collect_updates: 30000
+    train_every_episodes: 0
+    train_every_transitions: 5
   group_size: 1
   rollout_epoch: 1
   eval_rollout_epoch: 1
@@ -81,9 +87,17 @@ algorithm:
   gamma: 0.99
   tau: 0.005
 
+  # RLT actor objective: -q_weight * Q + bc_weight * BC + delta_weight * delta.
   q_weight: 1.0
   bc_weight: 1.0
   reference_dropout_prob: 0.4
+  actor_loss_warmup_updates: 20000
+  actor_loss_ramp_updates: 50000
+  warmup_bc_weight: 7.0
+  warmup_q_weight: 0.05
+  online_bc_weight: 2.5
+  online_q_weight: 0.30
+  delta_weight: 0.1
 
   entropy_tuning:
     alpha_type: fixed_alpha
@@ -95,15 +109,15 @@ algorithm:
 
   replay_buffer:
     enable_cache: True
-    cache_size: 16
-    sample_window_size: 16
+    cache_size: 10000
+    sample_window_size: 50000
     max_num_samples: 50000
-    min_buffer_size: 2
+    min_buffer_size: 1000
     auto_save: False
 
   target_update_freq: 1
   target_update_type: all
-  train_actor_steps: 2
+  train_actor_steps: 1000
   critic_actor_ratio: 4
   critic_subsample_size: 0
   backup_entropy: False
@@ -202,6 +216,7 @@ rollout:
     model_type: ${actor.model.model_type}
     model_path: ""
     precision: ${actor.model.precision}
+    policy_setup: ${actor.model.policy_setup}
     action_dim: ${actor.model.action_dim}
     num_action_chunks: ${actor.model.num_action_chunks}
     ref_num_action_chunks: ${actor.model.ref_num_action_chunks}
@@ -248,10 +263,6 @@ rollout:
       rlt_image_only: False
       rlt_use_mask: True
 
-  expert_model:
-    model_path: ${rlt.expert_model_path}
-    precision: null
-
   enable_torch_compile: False
   enable_cuda_graph: False
 
@@ -264,6 +275,7 @@ actor:
   enable_offload: False
 
   model:
+    policy_setup: "panda-qpos"
     action_dim: ${rlt.action_dim}
     num_action_chunks: ${rlt.num_action_chunks}
     ref_num_action_chunks: ${rlt.ref_num_action_chunks}

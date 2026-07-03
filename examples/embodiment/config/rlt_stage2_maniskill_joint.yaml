@@ -16,7 +16,6 @@ hydra:
 rlt:
   task_name: "maniskill_joint_peg_insertion"
   stage1_model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs/20260630-12:57:56/rlt_stage1_maniskill_joint_alpha1/checkpoints/global_step_1000/actor"
-  expert_model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs/20260630-12:57:56/rlt_stage1_maniskill_joint_alpha1/checkpoints/global_step_4000/actor"
   stage1_feature_model_path: ""
   stage1_rlt_module_path: ""
   openpi_repo_id: "maniskill_peginsertionside_joint"
@@ -270,10 +269,6 @@ rollout:
       rlt_encoder_type: ${rlt.rlt_encoder_type}
       rlt_image_only: False
       rlt_use_mask: True
-
-  expert_model:
-    model_path: ${rlt.expert_model_path}
-    precision: null
 
   enable_torch_compile: False
   enable_cuda_graph: False

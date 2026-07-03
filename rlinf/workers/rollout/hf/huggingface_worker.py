@@ -638,7 +638,7 @@ class MultiStepRolloutWorker(Worker):
         return self.cfg.algorithm.get(key, default)
 
     def _use_rlt_schedule(self) -> bool:
-        if str(self.cfg.algorithm.get("loss_type", "")) != "rlt_sac":
+        if str(self.cfg.algorithm.get("loss_type", "")) not in {"rlt_ac", "rlt_sac"}:
             return False
         schedule_cfg = self._rlt_schedule_cfg()
         if schedule_cfg is not None and "enable" in schedule_cfg:
@@ -847,10 +847,14 @@ class MultiStepRolloutWorker(Worker):
             device=actions.device,
             default=False,
         )
+        expert_available = (
+            self.expert_model is not None or self._rlt_expert_model_config is not None
+        )
         expert_takeover = (
             requested_expert_takeover
             & ready_for_online
             & bool(allow_expert)
+            & expert_available
             & (mode == "train")
         )
         use_actor = env_obs.get("rlt_use_actor", None)
@@ -868,6 +872,13 @@ class MultiStepRolloutWorker(Worker):
             actor_control = torch.as_tensor(
                 use_actor, device=actions.device
             ).bool().reshape(batch_size, -1).any(dim=1)
+            if self._use_rlt_schedule():
+                actor_control = actor_control & torch.full(
+                    (batch_size,),
+                    bool(ready_for_online),
+                    dtype=torch.bool,
+                    device=actions.device,
+                )
 
         base_actions = self._rlt_base_actions(
             rlt_obs["ref_chunk"],
