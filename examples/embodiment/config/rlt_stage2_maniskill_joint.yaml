@@ -193,6 +193,7 @@ actor:
       mlp_hidden_dim: 256
       mlp_num_hidden_layers: 2
       actor_noise_sigma: 0.003  # Fixed Gaussian std; eval uses the mean.
+      best_of_n: 8  # Q-rerank N stochastic actor chunks during ManiSkill rollout.
       ref_action_dropout: 0.4  # Drop reference actions to force state usage.
       bc_regularizer_beta: 3.0  # Fallback BC weight.
       warmup_bc_weight: 7.0  # BC weight during warmup.

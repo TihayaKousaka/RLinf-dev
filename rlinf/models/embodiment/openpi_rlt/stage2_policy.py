@@ -42,7 +42,7 @@ from .rollout import RLTStage2RolloutRouteConfig, route_rlt_stage2_rollout
 
 
 class RLTStage2Policy(torch.nn.Module, BasePolicy):
-    ROLLOUT_SYNC_PREFIXES = ("actor.",)
+    ROLLOUT_SYNC_PREFIXES = ("actor.", "critic.q1.", "critic.q2.")
     accepts_rollout_context = True
 
     def __init__(
@@ -189,7 +189,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         if not filtered:
             raise ValueError(
                 "RLT Stage2 rollout sync state_dict is empty. Expected actor.* "
-                "parameters for direct actor weight sync."
+                "or online critic parameters for direct actor weight sync."
             )
         return filtered
 
@@ -318,6 +318,42 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         return self.critic.q_min(x, actions)
 
     @torch.no_grad()
+    def _best_of_n_actor_forward(
+        self,
+        x: torch.Tensor,
+        a_tilde: torch.Tensor,
+        *,
+        best_of_n: int,
+    ) -> torch.Tensor:
+        if best_of_n <= 1:
+            return self.actor_forward(x, a_tilde, deterministic=False)
+
+        batch_size = int(x.shape[0])
+        repeated_x = x.repeat_interleave(best_of_n, dim=0)
+        repeated_a_tilde = a_tilde.repeat_interleave(best_of_n, dim=0)
+        candidate_actions = self.actor_forward(
+            repeated_x,
+            repeated_a_tilde,
+            deterministic=False,
+            apply_ref_dropout=False,
+            apply_action_noise=True,
+        )
+        q_values = self.critic_min(repeated_x, candidate_actions).reshape(
+            batch_size,
+            best_of_n,
+        )
+        best_indices = q_values.argmax(dim=1)
+        candidate_actions = candidate_actions.reshape(
+            batch_size,
+            best_of_n,
+            self.action_chunk_dim,
+        )
+        return candidate_actions[
+            torch.arange(batch_size, device=candidate_actions.device),
+            best_indices,
+        ]
+
+    @torch.no_grad()
     def compute_td_target_batch(
         self,
         *,
@@ -411,15 +447,32 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
 
         x, a_tilde = self._prepare_features(env_obs)
         deterministic = mode == "eval"
+        ready_for_online = self.global_step >= self.online_gate_updates
+        is_maniskill_train = (
+            mode == "train"
+            and env_cfg is not None
+            and str(env_cfg.get("env_type", "")) == "maniskill"
+        )
         if deterministic or self.act_as_vla_reference:
             self.actor.eval()
         if self.act_as_vla_reference:
             action_flat = a_tilde
-        else:
+        elif deterministic:
             action_flat = self.actor_forward(
                 x,
                 a_tilde,
-                deterministic=deterministic,
+                deterministic=True,
+            )
+        else:
+            best_of_n = (
+                max(1, int(self.cfg.rlt_stage2.get("best_of_n", 1)))
+                if is_maniskill_train and ready_for_online and not deterministic
+                else 1
+            )
+            action_flat = self._best_of_n_actor_forward(
+                x,
+                a_tilde,
+                best_of_n=best_of_n,
             )
         actions = action_flat.reshape(
             action_flat.shape[0],
@@ -448,7 +501,6 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             dict,
         ):
             policy_info = env_infos["policy_info"]
-        ready_for_online = self.global_step >= self.online_gate_updates
         is_realworld_train = (
             mode == "train"
             and env_cfg is not None
