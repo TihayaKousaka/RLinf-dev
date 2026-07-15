@@ -1048,6 +1048,7 @@ class DynamicRolloutResult:
     is_end: list[bool]
     rewards: Optional[torch.Tensor | list[float]] = None
     advantages: Optional[torch.Tensor] = None
+    versions: Optional[list[list[int]]] = None
 
     # extra fields used in training for custom process
     extra_fields_train: dict[str, list] = field(default_factory=dict)  # [num_sequence]
@@ -1210,6 +1211,29 @@ class DynamicRolloutResult:
         if self.ref_logprobs is not None:
             batch["ref_logprobs"] = self.ref_logprobs.cuda()
 
+        if self.versions is not None:
+            versions_list = [
+                torch.as_tensor(version_seq, dtype=torch.long)
+                for version_seq in self.versions
+            ]
+            assert len(versions_list) == self.num_sequence, (
+                f"versions has {len(versions_list)} sequences, "
+                f"expected {self.num_sequence}"
+            )
+            for idx, (version_seq, input_ids) in enumerate(
+                zip(versions_list, self.input_ids, strict=True)
+            ):
+                assert version_seq.numel() == len(input_ids), (
+                    f"versions[{idx}] has {version_seq.numel()} tokens, "
+                    f"expected {len(input_ids)}"
+                )
+            versions = batch_pad_to_fixed_len(
+                versions_list,
+                max_batch_len=seq_length,
+                pad_token=-1,
+            )
+            batch["versions"] = versions.to(Worker.torch_device_type)
+
         return batch
 
     def get_batch_pad(
@@ -1256,6 +1280,9 @@ class DynamicRolloutResult:
             ),
             "advantages": torch.zeros(
                 *pad_seq_shape, dtype=torch.float32, device=torch.cuda.current_device()
+            ),
+            "versions": torch.full(
+                pad_seq_shape, -1, dtype=torch.long, device=torch.cuda.current_device()
             ),
             "loss_scales": torch.zeros(
                 *pad_seq_shape, dtype=torch.float32, device=torch.cuda.current_device()
@@ -1402,6 +1429,7 @@ class DynamicRolloutResult:
             "ref_logprobs",
             "rewards",
             "advantages",
+            "versions",
             "loss_scales",
             *(k for k in batch.keys() if k.startswith("extra:")),
         ]
@@ -1431,6 +1459,12 @@ class DynamicRolloutResult:
                     for idx in idxes
                 ]
                 split_params[key][suffix] = torch.stack(value).sum(dim=0)
+
+            if "versions" in split_params:
+                value = [split_params["versions"][idx] for idx in idxes]
+                split_params["versions"][suffix] = torch.stack(value).max(
+                    dim=0
+                ).values
 
             # Re-scale loss_scales to preserve total per-turn contribution.
             masked_counts = [
@@ -1512,6 +1546,7 @@ class DynamicRolloutResult:
             prompt_lengths=[],
             response_lengths=[],
             is_end=[],
+            versions=[],
             extra_fields_train=dict.fromkeys(
                 rollout_results[0].extra_fields_train.keys()
             ),
@@ -1524,6 +1559,8 @@ class DynamicRolloutResult:
             merged_result.prompt_lengths.extend(res.prompt_lengths)
             merged_result.response_lengths.extend(res.response_lengths)
             merged_result.is_end.extend(res.is_end)
+            if res.versions is not None:
+                merged_result.versions.extend(res.versions)
             if res.rollout_logprobs is not None:
                 merged_result.rollout_logprobs = (
                     merged_result.rollout_logprobs or []
@@ -1567,6 +1604,14 @@ class DynamicRolloutResult:
                     if merged_result.extra_fields_train[k] is None:
                         merged_result.extra_fields_train[k] = []
                     merged_result.extra_fields_train[k].extend(v)
+
+        if len(merged_result.versions) == 0:
+            merged_result.versions = None
+        elif len(merged_result.versions) != merged_result.num_sequence:
+            raise ValueError(
+                "Merged versions length does not match num_sequence: "
+                f"{len(merged_result.versions)} vs {merged_result.num_sequence}"
+            )
 
         return merged_result
 
@@ -1622,6 +1667,10 @@ class DynamicRolloutResult:
             if rollout_result.ref_logprobs is not None:
                 split_ref_logprobs = rollout_result.ref_logprobs[start_idx:end_idx]
 
+            split_versions = None
+            if rollout_result.versions is not None:
+                split_versions = rollout_result.versions[start_idx:end_idx]
+
             # construct the split DynamicRolloutResult
             split_result = DynamicRolloutResult(
                 num_sequence=split_size,
@@ -1635,6 +1684,7 @@ class DynamicRolloutResult:
                 response_lengths=split_response_lengths,
                 is_end=split_is_end,
                 rewards=split_rewards,
+                versions=split_versions,
                 extra_fields_train=split_extra_fields_train,
             )
 

@@ -390,7 +390,11 @@ class ReasoningRunner:
     def epoch(self):
         return self.global_steps // self.num_steps_per_epoch
 
-    def _put_batch(self, batch: dict[str, torch.Tensor], split_size=None):
+    def _put_batch(
+        self,
+        batch: dict[str, torch.Tensor],
+        split_size=None,
+    ):
         prompt_ids = batch["prompt"].tolist()
         lengths = batch["length"].tolist()
         answers = batch["answer"]
@@ -415,7 +419,7 @@ class ReasoningRunner:
             )
             self.dataloader_channel.put(request, async_op=True)
 
-    def _sync_weights(self):
+    def _sync_weights(self, version: int | None = None):
         if self.has_dedicated_actor_inference:
             self.actor.sync_model_to_inference()
             self.actor_inference.sync_model_from_actor().wait()
@@ -425,7 +429,10 @@ class ReasoningRunner:
             self.critic_inference.sync_model_from_actor().wait()  # TODO change this name
 
         self.actor.sync_model_to_rollout()
-        self.rollout.sync_model_from_actor().wait()
+        if version is None:
+            self.rollout.sync_model_from_actor().wait()
+        else:
+            self.rollout.sync_model_from_actor(version=version).wait()
         self.actor.del_reshard_state_dict().wait()
 
     def run(self):

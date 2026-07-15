@@ -400,6 +400,31 @@ def compute_decoupled_ppo_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dic
     return loss, metrics_data
 
 
+@register_policy_loss("async_actor")
+def compute_async_ppo_actor_loss_fn(**kwargs) -> tuple[torch.Tensor, dict]:
+    """Compute actor-only async PPO loss for agent rollouts.
+
+    This loss uses per-token rollout versions to approximate the proximal policy
+    anchor. It is intentionally registered separately from embodied
+    ``decoupled_actor_critic`` so the agent path can require version metadata
+    without changing existing embodied configs.
+    """
+    if kwargs.get("task_type") == "embodied":
+        raise ValueError("async_actor is only supported for agent rollouts.")
+    if kwargs.get("versions") is None:
+        raise ValueError("async_actor requires batch['versions'].")
+    if kwargs.get("current_version") is None:
+        raise ValueError("async_actor requires current_version.")
+
+    actor_loss, metrics_data = compute_decoupled_ppo_actor_loss(**kwargs)
+
+    # MAMegatronActor uses actor/ratio for early-stop checks. In this loss the
+    # PPO ratio is computed against the version-aware proximal policy.
+    if "actor/ratio" not in metrics_data:
+        metrics_data["actor/ratio"] = metrics_data["actor/proximal_ratio"]
+    return actor_loss, metrics_data
+
+
 @register_policy_loss("actor_critic")
 def compute_ppo_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     """

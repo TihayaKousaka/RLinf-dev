@@ -60,6 +60,8 @@ class AgentLoopOutput:
     num_turns: int = 0
     """Whether the sequence ends."""
     is_end: bool = False
+    """Policy versions for each generated response token."""
+    output_versions: Optional[list[int]] = None
     """Reward score for the trajectory."""
     reward_score: Optional[float] = None
     """Debug information to print."""
@@ -472,6 +474,7 @@ class MultiAgentLoopWorker(AgentLoopWorker):
         extra_fields = self.gen_extra_fields(task_results, answer)
         rollout_result = self.get_rollout_result(task_results, *extra_fields)
         agent_metrics = self.get_rollout_metrics(rollout_result)
+        agent_metrics.update(self.get_version_metrics(rollout_result))
 
         await output_channel.put(rollout_result, async_op=True).async_wait()
         return agent_metrics
@@ -594,6 +597,25 @@ class MultiAgentLoopWorker(AgentLoopWorker):
         """Hook for subclasses to compute task-specific rollout metrics."""
         return {}
 
+    def get_version_metrics(self, rollout_result: DynamicRolloutResult) -> dict:
+        """Return version stats metrics."""
+        if rollout_result.versions is None:
+            return {}
+
+        raw_versions = [
+            version
+            for version_seq in rollout_result.versions
+            for version in version_seq
+        ]
+        versions = [int(version) for version in raw_versions if int(version) >= 0]
+        if len(versions) == 0:
+            return {}
+
+        return {
+            "__min__/async/head_version": min(versions),
+            "__max__/async/tail_version": max(versions),
+        }
+
     def get_rollout_result(
         self,
         task_results: list[MultiAgentLoopOutput],
@@ -628,6 +650,7 @@ class MultiAgentLoopWorker(AgentLoopWorker):
             rollout_logprobs = []
         is_end = []
         rewards = []
+        versions = []
 
         # Flatten all retained turns while keeping trajectory mapping.
         for idx, task_result in enumerate(task_results):
@@ -646,8 +669,25 @@ class MultiAgentLoopWorker(AgentLoopWorker):
                         single_turn_output.response_ids
                     ), "response_logprobs should have the same length as response_ids"
                     rollout_logprobs.append(single_turn_output.response_logprobs)
+                if single_turn_output.output_versions is None:
+                    raise ValueError(
+                        "AgentLoopOutput.output_versions is required for "
+                        "version-aware agent rollout."
+                    )
+                if len(single_turn_output.output_versions) != len(
+                    single_turn_output.response_ids
+                ):
+                    raise ValueError(
+                        "output_versions should have the same length as response_ids: "
+                        f"{len(single_turn_output.output_versions)} vs "
+                        f"{len(single_turn_output.response_ids)}"
+                    )
                 is_end.append(single_turn_output.is_end)
                 rewards.append(single_turn_output.reward_score)
+                versions.append(
+                    [-1] * len(single_turn_output.prompt_ids)
+                    + [int(version) for version in single_turn_output.output_versions]
+                )
 
         return DynamicRolloutResult(
             num_sequence=len(idx_to_traj),
@@ -659,6 +699,7 @@ class MultiAgentLoopWorker(AgentLoopWorker):
             rollout_logprobs=rollout_logprobs,
             is_end=is_end,
             rewards=rewards,
+            versions=versions,
             extra_fields_turn=extra_fields_turn,
             extra_fields_traj=extra_fields_traj,
             extra_fields_group=extra_fields_group,

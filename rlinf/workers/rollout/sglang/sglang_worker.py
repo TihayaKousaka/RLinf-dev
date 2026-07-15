@@ -70,6 +70,7 @@ class SGLangWorker(Worker):
             self._cfg_rollout.model.model_path
         )
         self._return_logprobs = self._cfg_rollout.return_logprobs
+        self.version = 0
         sampling_params = None
         if config_rollout is not None:
             sampling_params = config_rollout.get("sampling_params", None)
@@ -324,11 +325,13 @@ class SGLangWorker(Worker):
             obj=io_struct.AbortGenerationInput()
         )
 
-    async def sync_model_from_actor(self):
+    async def sync_model_from_actor(self, version: int | None = None):
         """Update the weights of the SGLang engine."""
         await self._engine.tokenizer_manager.sync_hf_weight(
             obj=io_struct.SyncHFWeightInput()
         )
+        if version is not None:
+            self.version = int(version)
 
     async def check_running_state(self):
         state = await self._engine.tokenizer_manager.run_task_method(
@@ -480,6 +483,7 @@ class SGLangWorker(Worker):
             for key, value in sampling_params.items():
                 final_sampling_params[key] = value
 
+        version = self.version
         result = await self._engine.async_generate(
             input_ids=prompt_ids,
             sampling_params=final_sampling_params,
@@ -489,6 +493,7 @@ class SGLangWorker(Worker):
         result_dict = {
             "output_ids": result["output_ids"],
             "finish_reason": result["meta_info"]["finish_reason"]["type"],
+            "output_versions": [version] * len(result["output_ids"]),
         }
         if self._return_logprobs:
             result_dict["logprobs"] = [

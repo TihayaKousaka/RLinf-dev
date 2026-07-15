@@ -120,19 +120,23 @@ class Searchr1AgentLoopWorker(MultiAgentLoopWorker):
             turn_prompt_ids, sampling_params={"max_new_tokens": max_resp_len}
         )
         llm_response_ids: list[int] = generate_result["output_ids"]
+        output_versions: list[int] = generate_result["output_versions"]
 
         if len(llm_response_ids) > max_resp_len:
             llm_response_ids = llm_response_ids[:max_resp_len]
+            output_versions = output_versions[:max_resp_len]
         llm_response_text = self.tokenizer.decode(llm_response_ids)
 
         # split </search> manually
         if "</search>" in llm_response_text:
             llm_response_text = llm_response_text.split("</search>")[0] + "</search>"
             llm_response_ids = self.tokenizer.encode(llm_response_text)
+            output_versions = output_versions[: len(llm_response_ids)]
 
         llm_output = AgentLoopOutput(
             prompt_ids=copy.deepcopy(turn_prompt_ids),
             response_ids=llm_response_ids,
+            output_versions=output_versions,
         )
         generate_context["all_llm_response_ids"] += llm_response_ids
 

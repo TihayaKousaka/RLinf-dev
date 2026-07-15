@@ -1,0 +1,14 @@
+defaults:
+  - train_qwen2.5
+  - _self_
+
+runner:
+  experiment_name: searchr1-grpo-qwen2.5-3b-ins-async
+  async_rl:
+    enable: true
+    max_concurrent_rollout_batches: 2
+    prefill_rollout_batches: 1
+    max_head_offpolicyness: 2
+
+algorithm:
+  loss_type: async_actor

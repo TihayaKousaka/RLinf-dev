@@ -77,6 +77,7 @@ class MAMegatronActor(MegatronActor):
             "enable_dp_load_balance must be True when is_dynamic_rollout_batch is True"
         )
         self.placement = placement
+        self.current_version = 0
 
         assert self.placement_mode == PlacementMode.COLLOCATED, (
             "Only collocated placement is supported for multi-agent actor"
@@ -84,6 +85,9 @@ class MAMegatronActor(MegatronActor):
         loss_scales = self.cfg.algorithm.get("loss_scales", [])
         self.loss_scale_fns = get_loss_scales(loss_scales)
         self.pack_traj = self.cfg.actor.get("pack_traj", True)
+
+    def set_current_version(self, version: int):
+        self.current_version = int(version)
 
     def get_batch(
         self, channel: Channel
@@ -236,6 +240,8 @@ class MAMegatronActor(MegatronActor):
                         "clip_log_ratio_max", None
                     ),
                     fast_path_zero_loss_mask=True,
+                    versions=batch.get("versions"),
+                    current_version=self.current_version,
                 )
 
                 entropy_loss = torch.zeros(1, device=loss.device)
@@ -412,6 +418,11 @@ class MAMegatronActor(MegatronActor):
 
         # metrics
         rollout_metrics = self._compute_rollout_metrics(batch)
+        version_metrics = self._compute_version_metrics(batch)
+        if version_metrics:
+            if rollout_metrics is None:
+                rollout_metrics = {}
+            rollout_metrics.update(version_metrics)
 
         # pack traj
         scale_context = {
@@ -479,6 +490,63 @@ class MAMegatronActor(MegatronActor):
         self._gather_weights_among_dp()
 
         return rollout_metrics, training_metrics_list
+
+    def _compute_version_metrics(self, batch):
+        if "versions" not in batch:
+            return {}
+
+        versions = batch["versions"].cuda()
+        valid_mask = versions >= 0
+        if "response_mask" in batch:
+            valid_mask = valid_mask & batch["response_mask"].cuda()
+
+        valid_versions = versions[valid_mask].float()
+        count = torch.tensor(float(valid_versions.numel()), device=versions.device)
+        if valid_versions.numel() > 0:
+            staleness = float(self.current_version) - valid_versions
+            stale_sum = staleness.sum()
+            stale_min = staleness.min()
+            stale_max = staleness.max()
+            head_version = valid_versions.min()
+            tail_version = valid_versions.max()
+        else:
+            stale_sum = torch.tensor(0.0, device=versions.device)
+            stale_min = torch.tensor(float("inf"), device=versions.device)
+            stale_max = torch.tensor(float("-inf"), device=versions.device)
+            head_version = torch.tensor(float("inf"), device=versions.device)
+            tail_version = torch.tensor(float("-inf"), device=versions.device)
+
+        dp_group = parallel_state.get_data_parallel_group()
+        torch.distributed.all_reduce(
+            count, op=torch.distributed.ReduceOp.SUM, group=dp_group
+        )
+        torch.distributed.all_reduce(
+            stale_sum, op=torch.distributed.ReduceOp.SUM, group=dp_group
+        )
+        torch.distributed.all_reduce(
+            stale_min, op=torch.distributed.ReduceOp.MIN, group=dp_group
+        )
+        torch.distributed.all_reduce(
+            stale_max, op=torch.distributed.ReduceOp.MAX, group=dp_group
+        )
+        torch.distributed.all_reduce(
+            head_version, op=torch.distributed.ReduceOp.MIN, group=dp_group
+        )
+        torch.distributed.all_reduce(
+            tail_version, op=torch.distributed.ReduceOp.MAX, group=dp_group
+        )
+
+        if count.item() == 0:
+            return {}
+
+        return {
+            "async/current_version": float(self.current_version),
+            "async/head_version": head_version.item(),
+            "async/tail_version": tail_version.item(),
+            "async/staleness_mean": (stale_sum / count.clamp_min(1.0)).item(),
+            "async/staleness_min": stale_min.item(),
+            "async/staleness_max": stale_max.item(),
+        }
 
     def _compute_rollout_metrics(self, batch):
         rollout_metrics_compute_data_group = self.get_rollout_metrics_group(batch)
