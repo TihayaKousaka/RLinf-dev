@@ -280,10 +280,18 @@ class MegatronWorker(MegatronModelManager, Worker):
         if channel.is_local:
             # Local channel, every process will put its own data locally
             # No need to broadcast
+            self._log_data_io("get_batch waiting on local channel", channel)
             result: RolloutResult = channel.get()
+            self._log_data_io("get_batch received local channel", channel, result)
         else:
             if self.is_data_io_rank:
-                result: RolloutResult = channel.get()
+                self._log_data_io("get_batch waiting on channel", channel)
+                result: RolloutResult = self._wait_channel_work_with_logs(
+                    channel.get(async_op=True),
+                    f"{self.role} get_batch",
+                    channel,
+                )
+                self._log_data_io("get_batch received channel", channel, result)
             else:
                 result = None
             result = self.broadcast(
@@ -309,6 +317,48 @@ class MegatronWorker(MegatronModelManager, Worker):
             duration = time.perf_counter() - start_time
             self._timer_metrics[tag] = self._timer_metrics.get(tag, 0.0) - duration
         return batch, result
+
+    def _log_data_io(
+        self,
+        message: str,
+        channel: Channel | None = None,
+        result: RolloutResult | None = None,
+    ) -> None:
+        if not self.is_data_io_rank:
+            return
+        details = [f"role={self.role}"]
+        if channel is not None:
+            details.append(
+                f"channel={getattr(channel, '_channel_name', type(channel).__name__)}"
+            )
+        if result is not None:
+            details.append(f"num_sequence={result.num_sequence}")
+        self.log_info(f"{message}: {', '.join(details)}")
+
+    def _wait_channel_work_with_logs(self, work, description: str, channel: Channel):
+        async_cfg = self.cfg.runner.get("async_rl", {})
+        interval_s = float(async_cfg.get("wait_log_interval_s", 30.0))
+        start_time = time.monotonic()
+        last_log_time = start_time
+        while not work.done():
+            now = time.monotonic()
+            if now - last_log_time >= interval_s:
+                self._log_data_io(
+                    f"still waiting for {description}, elapsed_s={now - start_time:.1f}",
+                    channel,
+                )
+                last_log_time = now
+            time.sleep(0.5)
+        return work.wait()
+
+    def _sync_intermediate_channel_put(self) -> bool:
+        async_cfg = self.cfg.runner.get("async_rl", {})
+        return bool(
+            async_cfg.get(
+                "sync_intermediate_channel_put",
+                async_cfg.get("enable", False),
+            )
+        )
 
     def _get_sample_count_from_rollout_results(
         self, rollout_results: list[RolloutResult]
@@ -429,7 +479,12 @@ class MegatronWorker(MegatronModelManager, Worker):
                 ch.put(result)
             else:
                 if self.is_data_io_rank:
-                    ch.put(result, async_op=True)
+                    self._log_data_io("put_result begin", ch, result)
+                    if self._sync_intermediate_channel_put():
+                        ch.put(result)
+                    else:
+                        ch.put(result, async_op=True)
+                    self._log_data_io("put_result end", ch, result)
 
     def _get_num_microbatches(self, batch: dict[str, torch.Tensor], forward_only: bool):
         if forward_only:
@@ -1174,6 +1229,10 @@ class MegatronWorker(MegatronModelManager, Worker):
         assert self.total_batch_size_per_dp % inference_split == 0, (
             f"MegatronWorker: total_batch_size_per_dp[{self.total_batch_size_per_dp}] should be divisible by inference_split[{inference_split}]"
         )
+        self._log_data_io(
+            "run_inference begin",
+            input_channel,
+        )
 
         min_num_samples = 1
         max_num_samples = self.total_batch_size_per_dp // inference_split
@@ -1202,6 +1261,11 @@ class MegatronWorker(MegatronModelManager, Worker):
             )
             total_result_len += result_len
             total_num_samples += rollout_result.num_sequence
+            self._log_data_io(
+                "run_inference got batch",
+                input_channel,
+                rollout_result,
+            )
             self.log_debug(
                 f"[dynamic inference rank-{self._rank}] inference result_len={result_len}, total_num_samples={total_num_samples}/{self.total_batch_size_per_dp}"
             )
@@ -1215,6 +1279,11 @@ class MegatronWorker(MegatronModelManager, Worker):
                 # For critic, infer_out is values
                 # The specific logic is implemented in subclasses.
                 self.process_inference_output(rollout_result, infer_out)
+                self._log_data_io(
+                    "run_inference forward end",
+                    input_channel,
+                    rollout_result,
+                )
 
                 # Ref logprobs
                 if compute_ref_logprobs:
@@ -1231,7 +1300,17 @@ class MegatronWorker(MegatronModelManager, Worker):
                 # should do split to ensure actor won't get too much batches.
                 split_results = RolloutResult.split_results(rollout_result, result_len)
                 for split_result in split_results:
+                    self._log_data_io(
+                        "run_inference put split begin",
+                        None,
+                        split_result,
+                    )
                     self.put_result(split_result, output_channel)
+                    self._log_data_io(
+                        "run_inference put split end",
+                        None,
+                        split_result,
+                    )
             else:
                 coll_rollout_results.append(rollout_result)
 
@@ -1247,6 +1326,7 @@ class MegatronWorker(MegatronModelManager, Worker):
         assert total_num_samples == self.total_batch_size_per_dp, (
             f"Expected {self.total_batch_size_per_dp} sequences from channel, but got {total_result_len}"
         )
+        self._log_data_io("run_inference end", input_channel)
         self.scheduler_offload_sync()
         if do_offload:
             self._offload_weight_and_optimizer()
