@@ -23,6 +23,7 @@ runner:
     max_head_offpolicyness: 1
     refill_before_train: true
     wait_log_interval_s: 30.0
+    sync_reward_output_put: true
     sync_intermediate_channel_put: true
 
 algorithm:

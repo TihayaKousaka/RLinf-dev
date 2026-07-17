@@ -14,6 +14,7 @@
 
 import asyncio
 import os
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -57,6 +58,13 @@ class RewardWorker(Worker):
             * self.cfg.algorithm.get("group_size", 1)
             // self._world_size
         )
+        async_cfg = self.cfg.runner.get("async_rl", {})
+        self._reward_wait_log_interval_s = float(
+            async_cfg.get("wait_log_interval_s", 30.0)
+        )
+        self._sync_reward_output_put = bool(
+            async_cfg.get("sync_reward_output_put", async_cfg.get("enable", False))
+        )
         self.do_down_sampling = self.cfg.algorithm.get("down_sampling", {}).get(
             "do_down_sampling", False
         )
@@ -76,6 +84,44 @@ class RewardWorker(Worker):
 
         if self.cfg.reward.get("tokenizer", None) is not None:
             self.tokenizer = hf_tokenizer(self.cfg.reward.tokenizer.tokenizer_model)
+
+    def _log_reward_timeline(self, message: str, **kwargs) -> None:
+        details = ", ".join(f"{key}={value}" for key, value in kwargs.items())
+        suffix = f" ({details})" if details else ""
+        self.log_info(f"RewardWorker rank={self._rank}: {message}{suffix}")
+
+    def _wait_async_work_with_logs(self, work, description: str):
+        start_time = time.monotonic()
+        last_log_time = start_time
+        while not work.done():
+            now = time.monotonic()
+            if now - last_log_time >= self._reward_wait_log_interval_s:
+                self._log_reward_timeline(
+                    f"still waiting for {description}",
+                    elapsed_s=f"{now - start_time:.1f}",
+                )
+                last_log_time = now
+            time.sleep(0.5)
+        return work.wait()
+
+    def _get_channel_with_logs(self, channel: Channel, description: str):
+        if channel.is_local:
+            return channel.get()
+        return self._wait_async_work_with_logs(
+            channel.get(async_op=True), description
+        )
+
+    def _put_channel_with_logs(
+        self, channel: Channel, rollout_result: RolloutResult, description: str
+    ) -> None:
+        if channel.is_local:
+            channel.put(rollout_result)
+        elif self._sync_reward_output_put:
+            self._wait_async_work_with_logs(
+                channel.put(rollout_result, async_op=True), description
+            )
+        else:
+            channel.put(rollout_result)
 
     @Worker.timer("compute_rewards")
     def compute_rewards(
@@ -103,15 +149,43 @@ class RewardWorker(Worker):
                 f"Total batch size {total_batch_size} is not divisible by world size {self._world_size}"
             )
             total_batch_size_per_dp = total_batch_size // self._world_size
+        self._log_reward_timeline(
+            "compute_rewards begin",
+            input_channel=getattr(input_channel, "_channel_name", type(input_channel)),
+            output_channel=getattr(
+                output_channel, "_channel_name", type(output_channel)
+            ),
+            total_batch_size_per_dp=total_batch_size_per_dp,
+        )
         while recv_batch_size < total_batch_size_per_dp:
-            rollout_result: RolloutResult = input_channel.get()
+            self._log_reward_timeline(
+                "waiting for rollout result",
+                recv_batch_size=recv_batch_size,
+                target_batch_size=total_batch_size_per_dp,
+            )
+            rollout_result: RolloutResult = self._get_channel_with_logs(
+                input_channel, "reward input"
+            )
+            self._log_reward_timeline(
+                "received rollout result",
+                recv_batch_size=recv_batch_size,
+                num_sequence=rollout_result.num_sequence,
+            )
             recv_batch_size += rollout_result.num_sequence
             if rollout_result.rewards is None:
                 if self.cfg.reward.use_reward_model:
                     raise NotImplementedError
                 else:
+                    self._log_reward_timeline(
+                        "compute rule based rewards begin",
+                        num_sequence=rollout_result.num_sequence,
+                    )
                     rollout_result.rewards = self._compute_rule_based_rewards(
                         rollout_result
+                    )
+                    self._log_reward_timeline(
+                        "compute rule based rewards end",
+                        num_sequence=rollout_result.num_sequence,
                     )
             if self.do_down_sampling:
                 if rollout_result.response_texts is None:
@@ -125,10 +199,25 @@ class RewardWorker(Worker):
             # answer is not needed in training
             rollout_result.answers = None
 
-            output_channel.put(rollout_result, async_op=True)
+            self._log_reward_timeline(
+                "sending rewarded result begin",
+                recv_batch_size=recv_batch_size,
+                num_sequence=rollout_result.num_sequence,
+            )
+            self._put_channel_with_logs(
+                output_channel, rollout_result, "reward output"
+            )
+            self._log_reward_timeline(
+                "sending rewarded result end",
+                recv_batch_size=recv_batch_size,
+                total_batch_size_per_dp=total_batch_size_per_dp,
+            )
 
         assert recv_batch_size == total_batch_size_per_dp, (
             f"Expected {total_batch_size_per_dp} sequences from channel, but got {recv_batch_size}"
+        )
+        self._log_reward_timeline(
+            "compute_rewards end", recv_batch_size=recv_batch_size
         )
 
     def _compute_rule_based_rewards(self, rollout_result: RolloutResult):
