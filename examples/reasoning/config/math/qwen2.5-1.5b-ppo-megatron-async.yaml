@@ -1,0 +1,34 @@
+defaults:
+  - /math/qwen2.5-1.5b-ppo-megatron
+  - _self_
+
+cluster:
+  component_placement:
+    actor: 0
+    critic: 1
+    rollout: 2
+    critic_inference: 3
+    reward: all
+
+runner:
+  experiment_name: ppo-1.5b-async
+  async_rl:
+    enable: true
+    max_concurrent_rollout_batches: 1
+    prefill_rollout_batches: 1
+    max_head_offpolicyness: 1
+
+algorithm:
+  recompute_logprobs: false
+
+rollout:
+  return_logprobs: true
+
+critic_inference:
+  model_type: ${rollout.model.model_type}
+  group_name: "CriticInferenceGroup"
+  load_from_actor: true
+  model:
+    tensor_model_parallel_size: ${critic.model.tensor_model_parallel_size}
+    pipeline_model_parallel_size: ${critic.model.pipeline_model_parallel_size}
+    sequence_parallel: ${critic.model.sequence_parallel}

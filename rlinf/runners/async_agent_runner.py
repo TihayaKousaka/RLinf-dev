@@ -90,6 +90,7 @@ class AsyncAgentRunner(AgentRunner):
             range(self.max_concurrent_rollout_batches)
         )
         self._train_iter = None
+        self._submit_rollout_duration = 0.0
 
     def _sync_weights(self, version: int | None = None):
         if version is None:
@@ -160,8 +161,9 @@ class AsyncAgentRunner(AgentRunner):
             batch = self._next_train_batch()
             if batch is None:
                 return
-            with self.timer("submit_rollout"):
-                self._submit_rollout_batch(batch)
+            start_time = time.perf_counter()
+            self._submit_rollout_batch(batch)
+            self._submit_rollout_duration += time.perf_counter() - start_time
 
     def _get_optional_int_metric(self, metrics: dict, key: str) -> int | None:
         value = metrics.get(key)
@@ -255,11 +257,6 @@ class AsyncAgentRunner(AgentRunner):
                 "AsyncAgentRunner currently supports agent-loop rewards only. "
                 "RewardWorker support should be added with an async experience buffer."
             )
-        if self.is_pipeline:
-            raise NotImplementedError(
-                "AsyncAgentRunner does not support pipeline mode yet."
-            )
-
         global_pbar = tqdm(
             initial=self.global_steps,
             total=self.max_steps,
@@ -282,6 +279,11 @@ class AsyncAgentRunner(AgentRunner):
             with self.timer("sync_weights"):
                 self._sync_weights()
             self._fill_rollout_backlog(self.prefill_rollout_batches)
+            # Warmup timings happen before the first train step and may reuse
+            # names inside the loop. Drop them to keep ScopedTimer's strict
+            # one-record-per-name semantics intact.
+            self.timer.consume_durations()
+            self._submit_rollout_duration = 0.0
 
             while self.global_steps < self.max_steps:
                 with self.timer("step"):
@@ -335,6 +337,9 @@ class AsyncAgentRunner(AgentRunner):
                         return
 
                 time_metrics = self.timer.consume_durations()
+                if self._submit_rollout_duration > 0:
+                    time_metrics["submit_rollout"] = self._submit_rollout_duration
+                    self._submit_rollout_duration = 0.0
                 time_metrics["rollout"] = completed.handle.consume_duration()
                 time_metrics["training"] = actor_handle.consume_duration()
                 if infer_handle is not None:

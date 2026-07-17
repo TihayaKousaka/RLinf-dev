@@ -2,13 +2,49 @@ defaults:
   - train_qwen2.5
   - _self_
 
+cluster:
+  component_placement:
+    # Disaggregated placement is the intended mode for async agent training:
+    # rollout keeps serving generation while inference/actor train on separate
+    # GPUs. Adjust the ranges to match the machine.
+    actor: 0-3
+    rollout: 4-5
+    inference: 6-7
+
 runner:
   experiment_name: searchr1-grpo-qwen2.5-3b-ins-async
   async_rl:
     enable: true
+    # Start conservatively for Search-R1 because async rollout also increases
+    # concurrent tool-search requests and rollout KV-cache pressure.
+    # Increase to 2+ after the smoke run is stable.
     max_concurrent_rollout_batches: 2
     prefill_rollout_batches: 1
     max_head_offpolicyness: 2
+
+data:
+  # Total prompts submitted per rollout batch. Search-R1 async can OOM with the
+  # synchronous default because multiple rollout batches may be in flight.
+  rollout_batch_size: 128
+  # Keep validation disabled unless data.val_data_paths is also provided.
+  val_rollout_batch_size: null
+
+agentloop:
+  # Lower max_turns to 1 for an even smaller smoke test. Keeping 2 preserves the
+  # synchronous Search-R1 behavior.
+  max_turns: 2
+  max_tool_response_length: 500
+
+tools:
+  search:
+    # Lowering topk reduces retriever work and tool-response tokens.
+    topk: 3
+
+rollout:
+  # These bound SGLang-side in-flight request/KV-cache pressure.
+  gpu_memory_utilization: 0.65
+  max_running_requests: 32
+  cuda_graph_max_bs: 32
 
 algorithm:
   loss_type: async_actor
