@@ -1083,8 +1083,10 @@ class MegatronWorker(MegatronModelManager, Worker):
 
     # Inference
     def _setup_inference_weight_dst_ranks(self):
+        inference_tp_size = self.inference_cfg.model.tensor_model_parallel_size
+        self.inference_dst_tp_rank = self._rank % inference_tp_size
         self._weight_dst_rank_in_inference = self.get_inference_weight_dst_ranks(
-            self.inference_cfg.model.tensor_model_parallel_size,
+            inference_tp_size,
             self.inference_cfg.model.pipeline_model_parallel_size,
         )
 
@@ -1110,7 +1112,7 @@ class MegatronWorker(MegatronModelManager, Worker):
                 continue
             model_state_dict[key] = val
         return self.inference_weights_reshard.gather_and_reshard_model(
-            model_state_dict, self.dst_tp_rank
+            model_state_dict, self.inference_dst_tp_rank
         )
 
     def sync_model_to_inference(self):

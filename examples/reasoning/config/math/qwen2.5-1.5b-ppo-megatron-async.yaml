@@ -1,28 +1,46 @@
 defaults:
-  - /math/qwen2.5-1.5b-ppo-megatron
+  - qwen2.5-1.5b-ppo-megatron
   - _self_
 
 cluster:
   component_placement:
     actor: 0
     critic: 1
-    rollout: 2
-    critic_inference: 3
+    rollout: 2-6
+    critic_inference: 7
     reward: all
 
 runner:
   experiment_name: ppo-1.5b-async
+  max_steps: 10
+  seq_length: 1024
+  enable_dynamic_batch_size: false
+  max_tokens_per_mbs: 1024
   async_rl:
     enable: true
     max_concurrent_rollout_batches: 1
     prefill_rollout_batches: 1
     max_head_offpolicyness: 1
+    refill_before_train: true
+    wait_log_interval_s: 30.0
 
 algorithm:
+  training_batch_size_per_gpu: 1
+  logprob_forward_micro_batch_size: 1
   recompute_logprobs: false
 
 rollout:
   return_logprobs: true
+  enforce_eager: false
+  max_running_requests: 4
+  cuda_graph_max_bs: 1
+  sglang:
+    disable_overlap_schedule: false
+    weight_sync_idle_timeout_s: 300.0
+    weight_sync_idle_poll_interval_s: 0.1
+
+data:
+  rollout_batch_size: 4
 
 critic_inference:
   model_type: ${rollout.model.model_type}

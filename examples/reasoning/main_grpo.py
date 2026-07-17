@@ -67,7 +67,7 @@ def main(cfg) -> None:
         )
         inference_worker_cls = get_inference_backend_worker(cfg, "critic")
         critic_inference_group = inference_worker_cls.create_group(
-            cfg, component_placement, train_role="critic"
+            cfg, component_placement
         ).launch(
             cluster,
             name=cfg.critic_inference.group_name,

@@ -84,6 +84,8 @@ class AsyncReasoningRunner(ReasoningRunner):
                 async_cfg.get("max_staleness", self.max_concurrent_rollout_batches),
             )
         )
+        self.refill_before_train = bool(async_cfg.get("refill_before_train", True))
+        self.wait_log_interval_s = float(async_cfg.get("wait_log_interval_s", 30.0))
         if self.recompute_logprobs:
             raise ValueError(
                 "AsyncReasoningRunner requires algorithm.recompute_logprobs=false "
@@ -121,6 +123,30 @@ class AsyncReasoningRunner(ReasoningRunner):
         self._sync_rollout_duration = 0.0
         self._sync_inference_duration = 0.0
 
+    def _log_timeline(self, message: str, **kwargs) -> None:
+        details = ", ".join(f"{key}={value}" for key, value in kwargs.items())
+        suffix = f" ({details})" if details else ""
+        logging.info(
+            "AsyncReasoningRunner step=%s: %s%s",
+            self.global_steps,
+            message,
+            suffix,
+        )
+
+    def _wait_handle_with_logs(self, handle: Handle, description: str):
+        start_time = time.monotonic()
+        last_log_time = start_time
+        while not handle.done():
+            now = time.monotonic()
+            if now - last_log_time >= self.wait_log_interval_s:
+                self._log_timeline(
+                    f"still waiting for {description}",
+                    elapsed_s=f"{now - start_time:.1f}",
+                )
+                last_log_time = now
+            time.sleep(0.5)
+        return handle.wait()
+
     def _next_train_batch(self):
         if self._submitted_rollout_steps >= self.max_steps:
             return None
@@ -137,26 +163,49 @@ class AsyncReasoningRunner(ReasoningRunner):
     def _sync_inference_weights(self) -> None:
         start_time = time.perf_counter()
         if self.has_dedicated_actor_inference:
+            self._log_timeline("sync actor inference weights begin")
             self.actor.sync_model_to_inference()
-            self.actor_inference.sync_model_from_actor().wait()
+            self._wait_handle_with_logs(
+                self.actor_inference.sync_model_from_actor(),
+                "actor inference weight sync",
+            )
+            self._log_timeline("sync actor inference weights end")
 
         if self.has_dedicated_critic_inference:
+            self._log_timeline("sync critic inference weights begin")
             self.critic.sync_model_to_inference()
-            self.critic_inference.sync_model_from_actor().wait()
+            self._wait_handle_with_logs(
+                self.critic_inference.sync_model_from_actor(),
+                "critic inference weight sync",
+            )
+            self._log_timeline("sync critic inference weights end")
         self._sync_inference_duration += time.perf_counter() - start_time
 
     def _sync_rollout_weights_if_idle(self, version: int) -> bool:
         if self._rollout_weight_version == version:
             return True
         if self._running_rollouts:
+            self._log_timeline(
+                "skip rollout weight sync because rollout is running",
+                target_version=version,
+                running_rollouts=len(self._running_rollouts),
+            )
             return False
 
         start_time = time.perf_counter()
+        self._log_timeline("sync rollout weights begin", target_version=version)
         self.actor.sync_model_to_rollout()
-        self.rollout.sync_model_from_actor(version=version).wait()
-        self.actor.del_reshard_state_dict().wait()
+        self._wait_handle_with_logs(
+            self.rollout.sync_model_from_actor(version=version),
+            "rollout weight sync",
+        )
+        self._wait_handle_with_logs(
+            self.actor.del_reshard_state_dict(),
+            "actor rollout sync cleanup",
+        )
         self._rollout_weight_version = int(version)
         self._sync_rollout_duration += time.perf_counter() - start_time
+        self._log_timeline("sync rollout weights end", synced_version=version)
         return True
 
     def _submit_rollout_batch(self, batch, submitted_version: int) -> bool:
@@ -170,6 +219,12 @@ class AsyncReasoningRunner(ReasoningRunner):
         if self.scheduler is not None:
             scheduler_handle = self.scheduler.schedule()
 
+        self._log_timeline(
+            "submit rollout begin",
+            rollout_step_id=self._submitted_rollout_steps,
+            channel_id=channel_id,
+            submitted_version=submitted_version,
+        )
         handle = self.rollout.rollout(
             input_channel=self.dataloader_channel,
             output_channel=output_channel,
@@ -186,6 +241,12 @@ class AsyncReasoningRunner(ReasoningRunner):
         )
         self._submitted_rollout_steps += 1
         self.staleness_manager.on_rollout_submitted()
+        self._log_timeline(
+            "submit rollout end",
+            rollout_step_id=self._submitted_rollout_steps - 1,
+            channel_id=channel_id,
+            running_rollouts=len(self._running_rollouts),
+        )
         return True
 
     def _release_rollout_channel_id(self, channel_id: int) -> None:
@@ -232,6 +293,12 @@ class AsyncReasoningRunner(ReasoningRunner):
             if not submitted.handle.done():
                 still_running.append(submitted)
                 continue
+            self._log_timeline(
+                "rollout completed",
+                rollout_step_id=submitted.step_id,
+                channel_id=submitted.channel_id,
+                submitted_version=submitted.submitted_version,
+            )
             submitted.handle.wait()
             if submitted.scheduler_handle is not None:
                 submitted.scheduler_handle.wait()
@@ -258,6 +325,12 @@ class AsyncReasoningRunner(ReasoningRunner):
         self, completed_rollouts: list[CompletedRollout]
     ) -> None:
         for completed in completed_rollouts:
+            self._log_timeline(
+                "discard stale rollout",
+                rollout_step_id=completed.step_id,
+                channel_id=completed.channel_id,
+                head_version=completed.head_version,
+            )
             self._drain_completed_rollout(completed)
             self._release_rollout_channel_id(completed.channel_id)
             self.staleness_manager.on_rollout_discarded()
@@ -289,23 +362,33 @@ class AsyncReasoningRunner(ReasoningRunner):
             raise RuntimeError("AsyncReasoningRunner requires a reward worker.")
 
         with self.timer("sync_inference_weights"):
+            self._log_timeline(
+                "training chain begin",
+                rollout_step_id=completed.step_id,
+                channel_id=completed.channel_id,
+                head_version=completed.head_version,
+            )
             self._sync_inference_weights()
 
+        self._log_timeline("reward submit begin", channel_id=completed.channel_id)
         reward_handle: Handle = self.reward.compute_rewards(
             input_channel=completed.output_channel,
             output_channel=self.reward_channel,
         )
+        self._log_timeline("reward submit end")
 
         actor_infer_handle = None
         actor_inference_channel = self.reward_channel
 
         if self.critic:
+            self._log_timeline("critic inference submit begin")
             critic_infer_handle: Handle = self.critic_inference.run_inference(
                 input_channel=actor_inference_channel,
                 output_channel=self.value_channel,
                 do_offload=False,
             )
             training_input_channel = self.value_channel
+            self._log_timeline("critic inference submit end")
         else:
             critic_infer_handle = None
             training_input_channel = actor_inference_channel
@@ -332,6 +415,7 @@ class AsyncReasoningRunner(ReasoningRunner):
                 actor_training_input_channel = training_input_channel
 
         if self.critic:
+            self._log_timeline("critic training submit begin")
             critic_train_handle: Handle = self.critic.run_training(
                 input_channel=critic_training_input_channel,
                 output_channel=(
@@ -339,22 +423,32 @@ class AsyncReasoningRunner(ReasoningRunner):
                 ),
                 compute_rollout_metrics=False,
             )
+            self._log_timeline("critic training submit end")
         else:
             critic_train_handle = None
 
+        self._log_timeline("actor training submit begin")
         actor_handle: Handle = self.actor.run_training(
             input_channel=actor_training_input_channel,
             do_offload=False,
         )
+        self._log_timeline("actor training submit end")
 
-        actor_metrics = actor_handle.wait()
+        self._log_timeline("actor training wait begin")
+        actor_metrics = self._wait_handle_with_logs(actor_handle, "actor training")
+        self._log_timeline("actor training wait end")
         critic_training_metrics = None
         if critic_train_handle is not None:
-            critic_metrics = critic_train_handle.wait()
+            self._log_timeline("critic training wait begin")
+            critic_metrics = self._wait_handle_with_logs(
+                critic_train_handle, "critic training"
+            )
             _, critic_training_metrics = critic_metrics[0]
+            self._log_timeline("critic training wait end")
 
         actor_rollout_metrics = actor_metrics[0][0]
         actor_training_metrics = actor_metrics[0][1]
+        self._log_timeline("training chain end")
 
         return _TrainingChainResult(
             actor_handle=actor_handle,
@@ -474,7 +568,16 @@ class AsyncReasoningRunner(ReasoningRunner):
         self._train_iter = None
         self._rollout_weight_version = None
         try:
+            self._log_timeline(
+                "initial rollout prefill begin",
+                prefill_rollout_batches=self.prefill_rollout_batches,
+                max_concurrent_rollout_batches=self.max_concurrent_rollout_batches,
+            )
             self._fill_rollout_backlog(self.prefill_rollout_batches)
+            self._log_timeline(
+                "initial rollout prefill end",
+                running_rollouts=len(self._running_rollouts),
+            )
             self.timer.consume_durations()
             self._submit_rollout_duration = 0.0
             self._sync_rollout_duration = 0.0
@@ -485,11 +588,24 @@ class AsyncReasoningRunner(ReasoningRunner):
                     with self.timer("wait_rollout"):
                         completed = self._wait_trainable_rollout()
 
-                    self._fill_rollout_backlog()
+                    if self.refill_before_train:
+                        self._log_timeline("refill rollout backlog before train begin")
+                        self._fill_rollout_backlog()
+                        self._log_timeline(
+                            "refill rollout backlog before train end",
+                            running_rollouts=len(self._running_rollouts),
+                        )
                     train_version = self.global_steps
                     chain_result = self._run_training_chain(completed)
                     self._release_rollout_channel_id(completed.channel_id)
                     self.global_steps += 1
+                    if not self.refill_before_train:
+                        self._log_timeline("refill rollout backlog after train begin")
+                        self._fill_rollout_backlog()
+                        self._log_timeline(
+                            "refill rollout backlog after train end",
+                            running_rollouts=len(self._running_rollouts),
+                        )
 
                     run_time_exceeded = self.run_timer.is_finished()
                     _, save_model, is_train_end = check_progress(

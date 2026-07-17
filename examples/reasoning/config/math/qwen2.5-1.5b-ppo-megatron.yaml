@@ -9,7 +9,10 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,critic,rollout,reward: all
+    actor: all
+    critic: all
+    rollout: all
+    reward: all
 
 runner:
   task_type: reasoning
@@ -17,7 +20,7 @@ runner:
     log_path: ${runner.output_dir}/${runner.experiment_name}
     project_name: rlinf
     experiment_name: ${runner.experiment_name}
-    logger_backends: ["tensorboard"] # wandb, swanlab
+    logger_backends: ["wandb"] # wandb, swanlab
 
   max_epochs: 15
 
@@ -31,7 +34,7 @@ runner:
 
   resume_dir: null
   experiment_name: ppo-1.5b
-  output_dir: /path/to/output
+  output_dir: /mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs
 algorithm:
   group_size: 1 # PPO has a group_size of 1
 
@@ -91,7 +94,7 @@ rollout:
   gpu_memory_utilization: 0.3
 
   model:
-    model_path: /path/to/model/Qwen2.5-1.5B-Instruct/ # https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct
+    model_path: /mnt/public2/xiekaizhi/rlt-openpi-sim/data/Qwen2.5-3B-Instruct # https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct
     model_type: qwen2.5
     precision: ${actor.model.precision}
   enforce_eager: False         # if False, rollout engine will capture cuda graph, which will take more time to initialize.
@@ -138,8 +141,8 @@ data:
   shuffle: True
   validation_shuffle: True
   seed: 42
-  train_data_paths: ["/dataset/boba/AReaL-boba-106k.jsonl"]
-  val_data_paths: ["/dataset/boba/AReaL-boba-106k.jsonl"]
+  train_data_paths: ["/mnt/public2/xiekaizhi/rlt-openpi-sim/data/AReaL-boba-Data/AReaL-boba-106k.jsonl"]
+  val_data_paths: ["/mnt/public2/xiekaizhi/rlt-openpi-sim/data/AReaL-boba-Data/AReaL-boba-106k.jsonl"]
   prompt_key: prompt
   answer_key: solutions
   apply_chat_template: False
