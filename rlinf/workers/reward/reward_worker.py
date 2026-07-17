@@ -149,6 +149,14 @@ class RewardWorker(Worker):
                 f"Total batch size {total_batch_size} is not divisible by world size {self._world_size}"
             )
             total_batch_size_per_dp = total_batch_size // self._world_size
+        if total_batch_size_per_dp <= 0:
+            raise ValueError(
+                "RewardWorker received an empty per-rank batch. "
+                f"rollout_batch_size={self.cfg.data.rollout_batch_size}, "
+                f"group_size={self.cfg.algorithm.get('group_size', 1)}, "
+                f"reward_world_size={self._world_size}. "
+                "Use fewer reward workers or increase rollout_batch_size * group_size."
+            )
         self._log_reward_timeline(
             "compute_rewards begin",
             input_channel=getattr(input_channel, "_channel_name", type(input_channel)),

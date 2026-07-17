@@ -8,7 +8,7 @@ cluster:
     critic: 1
     rollout: 2-6
     critic_inference: 7
-    reward: all
+    reward: 0
 
 runner:
   experiment_name: ppo-1.5b-async
