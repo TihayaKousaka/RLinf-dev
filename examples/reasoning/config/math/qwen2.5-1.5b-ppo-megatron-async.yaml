@@ -4,25 +4,23 @@ defaults:
 
 cluster:
   component_placement:
-    actor: 0
-    critic: 1
-    rollout: 2-6
-    critic_inference: 7
-    reward: 0
+    actor: 0-1
+    critic: 2-3
+    rollout: 4-5
+    critic_inference: 6
+    reward: 7
 
 runner:
   experiment_name: ppo-1.5b-async
-  max_steps: 10
-  seq_length: 1024
   enable_dynamic_batch_size: false
-  max_tokens_per_mbs: 1024
   async_rl:
     enable: true
-    max_concurrent_rollout_batches: 1
-    prefill_rollout_batches: 1
-    max_head_offpolicyness: 1
+    max_concurrent_rollout_batches: 2
+    prefill_rollout_batches: 2
+    max_head_offpolicyness: 4
+    rollout_weight_sync_interval: 4
+    max_completed_rollout_batches: 4
     refill_before_train: true
-    wait_log_interval_s: 30.0
     sync_reward_output_put: true
     sync_intermediate_channel_put: true
 
@@ -30,19 +28,19 @@ algorithm:
   training_batch_size_per_gpu: 1
   logprob_forward_micro_batch_size: 1
   recompute_logprobs: false
+  sampling_params:
+    max_new_tokens: 512
 
 rollout:
   return_logprobs: true
   enforce_eager: false
-  max_running_requests: 4
-  cuda_graph_max_bs: 1
   sglang:
     disable_overlap_schedule: false
     weight_sync_idle_timeout_s: 300.0
     weight_sync_idle_poll_interval_s: 0.1
-
-data:
-  rollout_batch_size: 4
+  validate_weight_first_sync: true
+  detokenize: true
+  print_outputs: true
 
 critic_inference:
   model_type: ${rollout.model.model_type}

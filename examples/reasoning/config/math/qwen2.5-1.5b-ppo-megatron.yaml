@@ -94,7 +94,7 @@ rollout:
   gpu_memory_utilization: 0.3
 
   model:
-    model_path: /mnt/public2/xiekaizhi/rlt-openpi-sim/data/Qwen2.5-3B-Instruct # https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct
+    model_path: /mnt/public2/xiekaizhi/rlt-openpi-sim/data/Qwen2.5-1.5B-Instruct # https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct
     model_type: qwen2.5
     precision: ${actor.model.precision}
   enforce_eager: False         # if False, rollout engine will capture cuda graph, which will take more time to initialize.
