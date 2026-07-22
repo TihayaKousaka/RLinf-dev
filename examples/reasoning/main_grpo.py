@@ -61,6 +61,7 @@ def main(cfg) -> None:
         component_placement.placement_mode
         in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO]
         and cfg.critic.use_critic_model
+        and component_placement.has_dedicated_critic_inference
     ):
         inference_placement_strategy = component_placement.get_strategy(
             "critic_inference"

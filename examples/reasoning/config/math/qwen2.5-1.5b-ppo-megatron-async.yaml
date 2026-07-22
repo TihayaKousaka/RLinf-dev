@@ -7,7 +7,6 @@ cluster:
     actor: 0-1
     critic: 2-3
     rollout: 4-5
-    critic_inference: 6
     reward: 7
 
 runner:
@@ -42,11 +41,10 @@ rollout:
   detokenize: true
   print_outputs: true
 
-critic_inference:
-  model_type: ${rollout.model.model_type}
-  group_name: "CriticInferenceGroup"
-  load_from_actor: true
-  model:
-    tensor_model_parallel_size: ${critic.model.tensor_model_parallel_size}
-    pipeline_model_parallel_size: ${critic.model.pipeline_model_parallel_size}
-    sequence_parallel: ${critic.model.sequence_parallel}
+reward:
+  dump_rollouts:
+    enable: true
+    dir: ${runner.logger.log_path}/rollout_dumps
+    max_samples_per_rank: 128
+    max_text_chars: 20000
+    include_prompt: true
