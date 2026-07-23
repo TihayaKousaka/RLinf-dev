@@ -92,7 +92,7 @@ class ReasoningRunner:
         self.inference = self.actor_inference
 
         self.critic_inference = (
-            critic_inference if self.has_dedicated_actor_inference else self.critic
+            critic_inference if self.has_dedicated_critic_inference else self.critic
         )
 
         # Scheduler task
@@ -390,7 +390,11 @@ class ReasoningRunner:
     def epoch(self):
         return self.global_steps // self.num_steps_per_epoch
 
-    def _put_batch(self, batch: dict[str, torch.Tensor], split_size=None):
+    def _put_batch(
+        self,
+        batch: dict[str, torch.Tensor],
+        split_size=None,
+    ):
         prompt_ids = batch["prompt"].tolist()
         lengths = batch["length"].tolist()
         answers = batch["answer"]
@@ -415,7 +419,7 @@ class ReasoningRunner:
             )
             self.dataloader_channel.put(request, async_op=True)
 
-    def _sync_weights(self):
+    def _sync_weights(self, version: int | None = None):
         if self.has_dedicated_actor_inference:
             self.actor.sync_model_to_inference()
             self.actor_inference.sync_model_from_actor().wait()
@@ -425,7 +429,10 @@ class ReasoningRunner:
             self.critic_inference.sync_model_from_actor().wait()  # TODO change this name
 
         self.actor.sync_model_to_rollout()
-        self.rollout.sync_model_from_actor().wait()
+        if version is None:
+            self.rollout.sync_model_from_actor().wait()
+        else:
+            self.rollout.sync_model_from_actor(version=version).wait()
         self.actor.del_reshard_state_dict().wait()
 
     def run(self):
@@ -526,7 +533,11 @@ class ReasoningRunner:
                     if self.critic:
                         critic_train_handle: Handle = self.critic.run_training(
                             input_channel=critic_training_input_channel,
-                            output_channel=critic_training_output_channel,
+                            output_channel=(
+                                None
+                                if self.is_pipeline
+                                else critic_training_output_channel
+                            ),
                             compute_rollout_metrics=False,
                         )
                     else:
@@ -581,7 +592,9 @@ class ReasoningRunner:
 
                 time_metrics = self.timer.consume_durations()
 
-                time_metrics["actor/training"] = actor_handle.consume_duration()
+                actor_train_metrics = actor_handle.consume_durations()
+                time_metrics["actor/training"] = actor_train_metrics.pop("run_training")
+                time_metrics.update(actor_train_metrics)
                 time_metrics["rollout"] = rollout_handle.consume_duration()
                 time_metrics["reward"] = reward_handle.consume_duration()
                 if actor_infer_handle is not None:
@@ -598,9 +611,11 @@ class ReasoningRunner:
                         critic_infer_handle.consume_duration()
                     )
                 if critic_train_handle is not None:
-                    time_metrics["critic/training"] = (
-                        critic_train_handle.consume_duration()
+                    critic_train_metrics = critic_train_handle.consume_durations()
+                    time_metrics["critic/training"] = critic_train_metrics.pop(
+                        "run_training"
                     )
+                    time_metrics.update(critic_train_metrics)
 
                 logging_steps = (
                     self.global_steps - 1

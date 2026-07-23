@@ -48,6 +48,7 @@ class VLLMWorker(Worker):
 
         self._prepare_vllm_environment()
         self._return_logprobs = self._cfg.rollout.return_logprobs
+        self.version = 0
         self._sampling_params = self._get_sampling_params_from_config()
         self._tokenizer = self._load_tokenizer()
         self._vllm_engine = None
@@ -173,12 +174,14 @@ class VLLMWorker(Worker):
         await self._async_engine.reset_prefix_cache()
         await self._async_engine.collective_rpc("offload_model_weights")
 
-    async def sync_model_from_actor(self) -> None:
+    async def sync_model_from_actor(self, version: int | None = None) -> None:
         """
         Sync model weights from actor to the vllm workers.
         """
         await self._async_engine.collective_rpc("sync_hf_weight")
         await self._async_engine.reset_prefix_cache()
+        if version is not None:
+            self.version = int(version)
 
     async def _get_output_from_async_generator(
         self, async_generator: AsyncGenerator[RequestOutput, None]

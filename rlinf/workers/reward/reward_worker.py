@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 from typing import Any, Optional
 
@@ -57,6 +58,26 @@ class RewardWorker(Worker):
             * self.cfg.algorithm.get("group_size", 1)
             // self._world_size
         )
+        dump_cfg = self.cfg.reward.get("dump_rollouts", {})
+        self.dump_rollouts = bool(dump_cfg.get("enable", False))
+        self.dump_rollouts_include_prompt = bool(dump_cfg.get("include_prompt", True))
+        self.dump_rollouts_max_samples = int(dump_cfg.get("max_samples_per_rank", -1))
+        self.dump_rollouts_max_text_chars = int(dump_cfg.get("max_text_chars", 20000))
+        self._dumped_rollout_samples = 0
+        self._reward_call_idx = 0
+        self._rollout_dump_path = None
+        if self.dump_rollouts:
+            dump_dir = dump_cfg.get("dir", None)
+            if dump_dir is None:
+                dump_dir = os.path.join(
+                    str(self.cfg.runner.logger.log_path), "rollout_dumps"
+                )
+            os.makedirs(dump_dir, exist_ok=True)
+            self._rollout_dump_path = os.path.join(
+                dump_dir, f"reward_rank_{self._rank}.jsonl"
+            )
+            self.log_info(f"Dumping rollout rewards to {self._rollout_dump_path}")
+
         self.do_down_sampling = self.cfg.algorithm.get("down_sampling", {}).get(
             "do_down_sampling", False
         )
@@ -103,6 +124,14 @@ class RewardWorker(Worker):
                 f"Total batch size {total_batch_size} is not divisible by world size {self._world_size}"
             )
             total_batch_size_per_dp = total_batch_size // self._world_size
+        if total_batch_size_per_dp <= 0:
+            raise ValueError(
+                "RewardWorker received an empty per-rank batch. "
+                f"rollout_batch_size={self.cfg.data.rollout_batch_size}, "
+                f"group_size={self.cfg.algorithm.get('group_size', 1)}, "
+                f"reward_world_size={self._world_size}. "
+                "Use fewer reward workers or increase rollout_batch_size * group_size."
+            )
         while recv_batch_size < total_batch_size_per_dp:
             rollout_result: RolloutResult = input_channel.get()
             recv_batch_size += rollout_result.num_sequence
@@ -150,11 +179,79 @@ class RewardWorker(Worker):
         scores = self.rule_based_reward.get_reward(
             texts, rollout_result.answers, **kwargs
         )
+        self._dump_rollout_rewards(rollout_result, texts, scores)
         return (
             torch.as_tensor(scores, dtype=torch.float, device=torch.device("cpu"))
             .view(-1, 1)
             .flatten()
         )
+
+    def _truncate_dump_text(self, text: Any) -> str:
+        text = str(text)
+        if (
+            self.dump_rollouts_max_text_chars > 0
+            and len(text) > self.dump_rollouts_max_text_chars
+        ):
+            omitted = len(text) - self.dump_rollouts_max_text_chars
+            return text[: self.dump_rollouts_max_text_chars] + (
+                f"...<truncated {omitted} chars>"
+            )
+        return text
+
+    def _dump_rollout_rewards(
+        self,
+        rollout_result: RolloutResult,
+        response_texts: list[str],
+        scores: list[float],
+    ) -> None:
+        if not self.dump_rollouts or self._rollout_dump_path is None:
+            return
+        if (
+            self.dump_rollouts_max_samples >= 0
+            and self._dumped_rollout_samples >= self.dump_rollouts_max_samples
+        ):
+            return
+
+        prompt_texts = rollout_result.prompt_texts
+        if self.dump_rollouts_include_prompt and prompt_texts is None:
+            prompt_texts = self.tokenizer.batch_decode(
+                rollout_result.prompt_ids, skip_special_tokens=True
+            )
+
+        records = []
+        for idx, (response, score) in enumerate(zip(response_texts, scores)):
+            if (
+                self.dump_rollouts_max_samples >= 0
+                and self._dumped_rollout_samples + len(records)
+                >= self.dump_rollouts_max_samples
+            ):
+                break
+            record = {
+                "reward_rank": self._rank,
+                "reward_call_idx": self._reward_call_idx,
+                "sample_idx_in_call": idx,
+                "reward": float(score),
+                "answer": rollout_result.answers[idx]
+                if rollout_result.answers is not None
+                else None,
+                "response": self._truncate_dump_text(response),
+                "response_len": rollout_result.response_lengths[idx],
+                "is_end": bool(rollout_result.is_end[idx]),
+            }
+            if self.dump_rollouts_include_prompt:
+                record["prompt"] = (
+                    self._truncate_dump_text(prompt_texts[idx])
+                    if prompt_texts is not None
+                    else None
+                )
+            records.append(record)
+
+        if records:
+            with open(self._rollout_dump_path, "a", encoding="utf-8") as f:
+                for record in records:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._dumped_rollout_samples += len(records)
+        self._reward_call_idx += 1
 
 
 class EmbodiedRewardWorker(Worker):

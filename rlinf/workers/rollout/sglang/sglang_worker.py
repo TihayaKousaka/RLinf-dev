@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import dataclasses
+import time
 from typing import Any, Literal, Optional
 
 from omegaconf import DictConfig
@@ -70,6 +71,7 @@ class SGLangWorker(Worker):
             self._cfg_rollout.model.model_path
         )
         self._return_logprobs = self._cfg_rollout.return_logprobs
+        self.version = 0
         sampling_params = None
         if config_rollout is not None:
             sampling_params = config_rollout.get("sampling_params", None)
@@ -161,35 +163,48 @@ class SGLangWorker(Worker):
         else:
             load_format = "auto"
 
-        server_args = ServerArgs(
-            model_path=self._cfg_rollout.model.model_path,
-            disable_cuda_graph=not use_cudagraph,
-            cuda_graph_max_bs=min(
+        server_args_kwargs = {
+            "model_path": self._cfg_rollout.model.model_path,
+            "disable_cuda_graph": not use_cudagraph,
+            "cuda_graph_max_bs": min(
                 self._cfg_rollout.cuda_graph_max_bs,
                 self._cfg_rollout.max_running_requests,
             ),
-            tp_size=self._cfg_rollout.tensor_parallel_size,
-            mem_fraction_static=self._cfg_rollout.gpu_memory_utilization,
-            enable_memory_saver=use_cudagraph,
-            enable_torch_compile=self._cfg_rollout.sglang.use_torch_compile,
-            torch_compile_max_bs=min(
+            "tp_size": self._cfg_rollout.tensor_parallel_size,
+            "mem_fraction_static": self._cfg_rollout.gpu_memory_utilization,
+            "enable_memory_saver": use_cudagraph,
+            "enable_torch_compile": self._cfg_rollout.sglang.use_torch_compile,
+            "torch_compile_max_bs": min(
                 self._cfg_rollout.sglang.torch_compile_max_bs,
                 self._cfg_rollout.max_running_requests,
             ),
-            load_format=load_format,
-            # disable_overlap_schedule=True,
-            dtype=torch_dtype_from_precision(self._cfg_rollout.model.precision),
+            "load_format": load_format,
+            "dtype": torch_dtype_from_precision(self._cfg_rollout.model.precision),
             # sglang will only return text/output_ids when skip_tokenizer_init=False/True
             # text is not needed in RL training, so set to True can save time.
-            skip_tokenizer_init=not self._cfg_rollout.detokenize,
+            "skip_tokenizer_init": not self._cfg_rollout.detokenize,
             # sglang will print statistics every decode_log_interval decode steps.
-            decode_log_interval=self._cfg_rollout.sglang.decode_log_interval,
-            attention_backend=self._cfg_rollout.sglang.attention_backend,
-            log_level="info",
-            max_running_requests=self._cfg_rollout.max_running_requests,
-            dist_init_addr=f"127.0.0.1:{str(self.acquire_free_port())}",
-            tool_call_parser=self._cfg_rollout.sglang.get("tool_call_parser", None),
+            "decode_log_interval": self._cfg_rollout.sglang.decode_log_interval,
+            "attention_backend": self._cfg_rollout.sglang.attention_backend,
+            "log_level": "info",
+            "max_running_requests": self._cfg_rollout.max_running_requests,
+            "dist_init_addr": f"127.0.0.1:{str(self.acquire_free_port())}",
+            "tool_call_parser": self._cfg_rollout.sglang.get(
+                "tool_call_parser", None
+            ),
+        }
+        disable_overlap_schedule = self._cfg_rollout.sglang.get(
+            "disable_overlap_schedule", False
         )
+        if disable_overlap_schedule:
+            if "disable_overlap_schedule" in ServerArgs.__dataclass_fields__:
+                server_args_kwargs["disable_overlap_schedule"] = True
+            else:
+                self.log_warning(
+                    "rollout.sglang.disable_overlap_schedule is set, but this "
+                    "SGLang version does not expose ServerArgs.disable_overlap_schedule."
+                )
+        server_args = ServerArgs(**server_args_kwargs)
 
         self.log_on_first_rank(f"{server_args=}")
         self._engine = Engine(
@@ -324,11 +339,20 @@ class SGLangWorker(Worker):
             obj=io_struct.AbortGenerationInput()
         )
 
-    async def sync_model_from_actor(self):
+    async def sync_model_from_actor(self, version: int | None = None):
         """Update the weights of the SGLang engine."""
-        await self._engine.tokenizer_manager.sync_hf_weight(
-            obj=io_struct.SyncHFWeightInput()
-        )
+        await self._wait_generation_idle()
+        with self.device_lock:
+            await self._wait_generation_idle()
+            self.log_info(
+                f"Start syncing SGLang weights from actor, target_version={version}."
+            )
+            await self._engine.tokenizer_manager.sync_hf_weight(
+                obj=io_struct.SyncHFWeightInput()
+            )
+        if version is not None:
+            self.version = int(version)
+        self.log_info(f"Finished syncing SGLang weights, version={self.version}.")
 
     async def check_running_state(self):
         state = await self._engine.tokenizer_manager.run_task_method(
@@ -337,6 +361,50 @@ class SGLangWorker(Worker):
         state = RolloutEngineStats(**state)
 
         return state
+
+    async def _wait_generation_idle(self):
+        timeout_s = float(
+            self._cfg_rollout.sglang.get("weight_sync_idle_timeout_s", 300.0)
+        )
+        poll_interval_s = float(
+            self._cfg_rollout.sglang.get("weight_sync_idle_poll_interval_s", 0.1)
+        )
+        deadline = time.monotonic() + timeout_s
+        last_log_time = 0.0
+        while True:
+            local_running = self.status_manager.num_seq_group_running
+            local_total = self.status_manager.num_seq_group
+            state = await self.check_running_state()
+            is_idle = (
+                local_running == 0
+                and local_total == 0
+                and state.num_running_reqs == 0
+                and state.num_queue_reqs == 0
+            )
+            if is_idle:
+                return
+
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for SGLang generation to become idle before "
+                    "weight sync: "
+                    f"local_running={local_running}, local_total={local_total}, "
+                    f"engine_running={state.num_running_reqs}, "
+                    f"engine_queue={state.num_queue_reqs}, "
+                    f"token_usage={state.token_usage:.4f}"
+                )
+            if now - last_log_time >= 10.0:
+                self.log_info(
+                    "Waiting for SGLang generation to become idle before weight "
+                    "sync: "
+                    f"local_running={local_running}, local_total={local_total}, "
+                    f"engine_running={state.num_running_reqs}, "
+                    f"engine_queue={state.num_queue_reqs}, "
+                    f"token_usage={state.token_usage:.4f}"
+                )
+                last_log_time = now
+            await asyncio.sleep(poll_interval_s)
 
     async def _async_generate_group(self, seq_group_info: SeqGroupInfo):
         """Generate a group of responses for a request (for GRPO-like behavior)."""
@@ -480,6 +548,7 @@ class SGLangWorker(Worker):
             for key, value in sampling_params.items():
                 final_sampling_params[key] = value
 
+        version = self.version
         result = await self._engine.async_generate(
             input_ids=prompt_ids,
             sampling_params=final_sampling_params,
@@ -489,6 +558,7 @@ class SGLangWorker(Worker):
         result_dict = {
             "output_ids": result["output_ids"],
             "finish_reason": result["meta_info"]["finish_reason"]["type"],
+            "output_versions": [version] * len(result["output_ids"]),
         }
         if self._return_logprobs:
             result_dict["logprobs"] = [

@@ -1,0 +1,50 @@
+defaults:
+  - qwen2.5-1.5b-ppo-megatron
+  - _self_
+
+cluster:
+  component_placement:
+    actor: 0-1
+    critic: 2-3
+    rollout: 4-5
+    reward: 7
+
+runner:
+  experiment_name: ppo-1.5b-async
+  enable_dynamic_batch_size: false
+  async_rl:
+    enable: true
+    max_concurrent_rollout_batches: 2
+    prefill_rollout_batches: 2
+    max_head_offpolicyness: 4
+    rollout_weight_sync_interval: 4
+    max_completed_rollout_batches: 4
+    refill_before_train: true
+    sync_reward_output_put: true
+    sync_intermediate_channel_put: true
+
+algorithm:
+  training_batch_size_per_gpu: 1
+  logprob_forward_micro_batch_size: 1
+  recompute_logprobs: false
+  sampling_params:
+    max_new_tokens: 512
+
+rollout:
+  return_logprobs: true
+  enforce_eager: false
+  sglang:
+    disable_overlap_schedule: false
+    weight_sync_idle_timeout_s: 300.0
+    weight_sync_idle_poll_interval_s: 0.1
+  validate_weight_first_sync: true
+  detokenize: true
+  print_outputs: true
+
+reward:
+  dump_rollouts:
+    enable: true
+    dir: ${runner.logger.log_path}/rollout_dumps
+    max_samples_per_rank: 128
+    max_text_chars: 20000
+    include_prompt: true

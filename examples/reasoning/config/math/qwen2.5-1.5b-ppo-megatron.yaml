@@ -9,15 +9,18 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,critic,rollout,reward: all
+    actor: 0-1
+    critic: 2-3
+    rollout: 4-5
+    reward: 7
 
 runner:
   task_type: reasoning
   logger:
     log_path: ${runner.output_dir}/${runner.experiment_name}
-    project_name: rlinf
+    project_name: rlinf-async
     experiment_name: ${runner.experiment_name}
-    logger_backends: ["tensorboard"] # wandb, swanlab
+    logger_backends: ["wandb"] # wandb, swanlab
 
   max_epochs: 15
 
@@ -26,17 +29,17 @@ runner:
 
   seq_length: 12288
 
-  enable_dynamic_batch_size: True
+  enable_dynamic_batch_size: False
   max_tokens_per_mbs: 12288
 
   resume_dir: null
   experiment_name: ppo-1.5b
-  output_dir: /path/to/output
+  output_dir: /mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs
 algorithm:
   group_size: 1 # PPO has a group_size of 1
 
   n_minibatches: 1
-  training_batch_size_per_gpu: 16
+  training_batch_size_per_gpu: 1
   rollout_batch_size_per_gpu: null # If set to null, rollout_batch_size will be evenly divided across all inference instances. You can reduce this parameter if inference consumes too much GPU memory.
 
   # mbs to do log prob inference, can be set to
@@ -82,7 +85,7 @@ algorithm:
     top_k: 1000000
     top_p: 1.0
     repetition_penalty: 1.0
-    max_new_tokens: ${subtract:${runner.seq_length}, ${data.max_prompt_length}}
+    max_new_tokens: 512
     min_new_tokens: 1
 
 rollout:
@@ -91,7 +94,7 @@ rollout:
   gpu_memory_utilization: 0.3
 
   model:
-    model_path: /path/to/model/Qwen2.5-1.5B-Instruct/ # https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct
+    model_path: /mnt/public2/xiekaizhi/rlt-openpi-sim/data/Qwen2.5-1.5B-Instruct # https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct
     model_type: qwen2.5
     precision: ${actor.model.precision}
   enforce_eager: False         # if False, rollout engine will capture cuda graph, which will take more time to initialize.
@@ -121,6 +124,7 @@ rollout:
   pipeline_parallel_size: 1
   
   validate_weight: False # whether to send all weights at first for weight comparison.
+  validate_weight_first_sync: False
   validate_save_dir: null # the directory to save the weights for comparison. If validate_weight is True, this will be used to save the weights for comparison.
   print_outputs: False         # whether to print the outputs (token ids, texts, etc.) of rollout engine.
 
@@ -138,8 +142,8 @@ data:
   shuffle: True
   validation_shuffle: True
   seed: 42
-  train_data_paths: ["/dataset/boba/AReaL-boba-106k.jsonl"]
-  val_data_paths: ["/dataset/boba/AReaL-boba-106k.jsonl"]
+  train_data_paths: ["/mnt/public2/xiekaizhi/rlt-openpi-sim/data/gsm8k/gsm8k_train_boba.jsonl"]
+  val_data_paths: ["/mnt/public2/xiekaizhi/rlt-openpi-sim/data/gsm8k/gsm8k_train_boba.jsonl"]
   prompt_key: prompt
   answer_key: solutions
   apply_chat_template: False

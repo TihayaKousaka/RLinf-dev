@@ -21,6 +21,7 @@ from omegaconf.omegaconf import OmegaConf
 from rlinf.config import validate_cfg
 from rlinf.data.datasets import create_rl_dataset
 from rlinf.data.tokenizers import hf_tokenizer
+from rlinf.runners.async_reasoning_runner import AsyncReasoningRunner
 from rlinf.runners.reasoning_runner import ReasoningRunner
 from rlinf.scheduler import Cluster, NodePlacementStrategy
 from rlinf.scheduler.dynamic_scheduler.scheduler_worker import SchedulerWorker
@@ -60,13 +61,14 @@ def main(cfg) -> None:
         component_placement.placement_mode
         in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO]
         and cfg.critic.use_critic_model
+        and component_placement.has_dedicated_critic_inference
     ):
         inference_placement_strategy = component_placement.get_strategy(
             "critic_inference"
         )
         inference_worker_cls = get_inference_backend_worker(cfg, "critic")
         critic_inference_group = inference_worker_cls.create_group(
-            cfg, component_placement, train_role="critic"
+            cfg, component_placement
         ).launch(
             cluster,
             name=cfg.critic_inference.group_name,
@@ -79,6 +81,7 @@ def main(cfg) -> None:
         component_placement.placement_mode
         in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO]
         and cfg.algorithm.recompute_logprobs
+        and component_placement.has_dedicated_actor_inference
     ):
         inference_placement_strategy = component_placement.get_strategy(
             "actor_inference" if critic_inference_group else "inference"
@@ -135,7 +138,12 @@ def main(cfg) -> None:
     tokenizer = hf_tokenizer(cfg.actor.tokenizer.tokenizer_model)
     train_ds, val_ds = create_rl_dataset(cfg, tokenizer)
 
-    runner = ReasoningRunner(
+    runner_cls = (
+        AsyncReasoningRunner
+        if cfg.runner.get("async_rl", {}).get("enable", False)
+        else ReasoningRunner
+    )
+    runner = runner_cls(
         cfg=cfg,
         placement=component_placement,
         train_dataset=train_ds,
