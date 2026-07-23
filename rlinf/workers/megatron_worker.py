@@ -272,11 +272,16 @@ class MegatronWorker(MegatronModelManager, Worker):
         torch.distributed.barrier()
 
     def get_batch(
-        self, channel: Channel, tag: Optional[str] = None
+        self,
+        channel: Channel,
+        tag: Optional[str] = None,
+        wait_timer_tag: Optional[str] = None,
     ) -> tuple[dict[str, torch.Tensor], RolloutResult]:
         if tag is not None:
             # for pipeline mode to filter channel communicate time.
             start_time = time.perf_counter()
+        if wait_timer_tag is not None:
+            wait_start_time = time.perf_counter()
         if channel.is_local:
             # Local channel, every process will put its own data locally
             # No need to broadcast
@@ -297,6 +302,12 @@ class MegatronWorker(MegatronModelManager, Worker):
                 groups=[
                     (self._group_name, parallel_state._CONTEXT_PARALLEL_GLOBAL_RANKS)
                 ],
+            )
+
+        if wait_timer_tag is not None:
+            wait_duration = time.perf_counter() - wait_start_time
+            self._timer_metrics[wait_timer_tag] = (
+                self._timer_metrics.get(wait_timer_tag, 0.0) + wait_duration
             )
 
         batch = result.to_actor_batch(
@@ -476,16 +487,29 @@ class MegatronWorker(MegatronModelManager, Worker):
                 else self.megatron_forward_backward_record
             )
             forward_backward_record.start()
-        forward_outputs = fwd_bwd_function(
-            forward_step_func=self.get_forward_step_func(),
-            data_iterator=self.make_data_iterator_list(batch_iter),
-            model=self.model,
-            num_microbatches=num_microbatches,
-            forward_only=forward_only,
-            seq_length=total_seqlen,
-            micro_batch_size=1,
-            collect_non_loss_data=forward_only,
-        )
+        if forward_only:
+            forward_outputs = fwd_bwd_function(
+                forward_step_func=self.get_forward_step_func(),
+                data_iterator=self.make_data_iterator_list(batch_iter),
+                model=self.model,
+                num_microbatches=num_microbatches,
+                forward_only=forward_only,
+                seq_length=total_seqlen,
+                micro_batch_size=1,
+                collect_non_loss_data=forward_only,
+            )
+        else:
+            with self.worker_timer(f"{self.role}/forward_backward"):
+                forward_outputs = fwd_bwd_function(
+                    forward_step_func=self.get_forward_step_func(),
+                    data_iterator=self.make_data_iterator_list(batch_iter),
+                    model=self.model,
+                    num_microbatches=num_microbatches,
+                    forward_only=forward_only,
+                    seq_length=total_seqlen,
+                    micro_batch_size=1,
+                    collect_non_loss_data=forward_only,
+                )
         if self.use_profiler:
             forward_backward_record.stop()
             self.profiler.stop(forward_only=forward_only)
@@ -528,16 +552,29 @@ class MegatronWorker(MegatronModelManager, Worker):
                 else self.megatron_forward_backward_record
             )
             forward_backward_record.start()
-        forward_outputs = fwd_bwd_function(
-            forward_step_func=self.get_forward_step_func(),
-            data_iterator=self.make_data_iterator_list(batch_iterator),
-            model=self.model,
-            num_microbatches=num_microbatches,
-            forward_only=forward_only,
-            seq_length=total_seqlen,
-            micro_batch_size=1,
-            collect_non_loss_data=forward_only,
-        )
+        if forward_only:
+            forward_outputs = fwd_bwd_function(
+                forward_step_func=self.get_forward_step_func(),
+                data_iterator=self.make_data_iterator_list(batch_iterator),
+                model=self.model,
+                num_microbatches=num_microbatches,
+                forward_only=forward_only,
+                seq_length=total_seqlen,
+                micro_batch_size=1,
+                collect_non_loss_data=forward_only,
+            )
+        else:
+            with self.worker_timer(f"{self.role}/forward_backward"):
+                forward_outputs = fwd_bwd_function(
+                    forward_step_func=self.get_forward_step_func(),
+                    data_iterator=self.make_data_iterator_list(batch_iterator),
+                    model=self.model,
+                    num_microbatches=num_microbatches,
+                    forward_only=forward_only,
+                    seq_length=total_seqlen,
+                    micro_batch_size=1,
+                    collect_non_loss_data=forward_only,
+                )
         if self.use_profiler:
             forward_backward_record.stop()
             self.profiler.stop(forward_only=forward_only)
@@ -596,7 +633,8 @@ class MegatronWorker(MegatronModelManager, Worker):
             * parallel_state.get_data_parallel_world_size()
             // self.cfg.algorithm.n_minibatches
         )
-        success, grad_norm, num_zeros_in_grad, lr = self.optimizer_step(increment)
+        with self.worker_timer(f"{self.role}/optimizer_step"):
+            success, grad_norm, num_zeros_in_grad, lr = self.optimizer_step(increment)
 
         # Training metrics
         train_metrics[f"{self.role}/grad_norm"] = (
@@ -678,7 +716,10 @@ class MegatronWorker(MegatronModelManager, Worker):
         rollout_results = []
         recv_batch_size = 0
         while recv_batch_size < self.total_batch_size_per_dp:
-            batch, rollout_result = self.get_batch(input_channel)
+            batch, rollout_result = self.get_batch(
+                input_channel,
+                wait_timer_tag=f"{self.role}/get_batch_wait",
+            )
             batches.append(batch)
             rollout_results.append(rollout_result)
             recv_batch_size += rollout_result.num_sequence
@@ -708,12 +749,15 @@ class MegatronWorker(MegatronModelManager, Worker):
         # Rollout metrics
         rollout_metrics = None
         if compute_rollout_metrics:
-            rollout_metrics = self._compute_rollout_metrics(batch)
+            with self.worker_timer(f"{self.role}/rollout_metrics"):
+                rollout_metrics = self._compute_rollout_metrics(batch)
 
         # Must be called after batch is retrieved, which is when rollout has stopped
         # Otherwise, loading model might cause OOM
-        self._load_weight_and_optimizer()
-        self._training_setup()
+        with self.worker_timer(f"{self.role}/load_weight_and_optimizer"):
+            self._load_weight_and_optimizer()
+        with self.worker_timer(f"{self.role}/training_setup"):
+            self._training_setup()
 
         # DP batch load balance
         if (
@@ -781,14 +825,20 @@ class MegatronWorker(MegatronModelManager, Worker):
     def run_training_pipeline(self, input_channel: Channel):
         """Run the training loop for the actor."""
         self.scheduler_pre_process()
-        self._load_weight_and_optimizer()
-        self._training_setup()
+        with self.worker_timer(f"{self.role}/load_weight_and_optimizer"):
+            self._load_weight_and_optimizer()
+        with self.worker_timer(f"{self.role}/training_setup"):
+            self._training_setup()
         # Built iterator for Megatron's pipeline schedule to run
         # NOTE: We cannot iterate over the iterator here, as Megatron's pipeline schedule is responsible for iterating over data
         # As a result, we need to separate the implementation for pipeline and non-pipeline mode for Megatron
         train_batch_iterator = BatchResizingIterator(
             cfg=self.cfg,
-            get_batch_fn=partial(self.get_batch, input_channel),
+            get_batch_fn=partial(
+                self.get_batch,
+                input_channel,
+                wait_timer_tag=f"{self.role}/get_batch_wait",
+            ),
             micro_batch_size=self.role_cfg.micro_batch_size,
             total_batch_size=self.total_batch_size_per_dp,
             num_global_batches=self.num_train_steps,
@@ -843,7 +893,8 @@ class MegatronWorker(MegatronModelManager, Worker):
 
         # Rollout metrics
         batch = train_batch_iterator.get_all_batches()
-        rollout_metrics = self._compute_rollout_metrics(batch)
+        with self.worker_timer(f"{self.role}/rollout_metrics"):
+            rollout_metrics = self._compute_rollout_metrics(batch)
 
         return rollout_metrics, training_metrics_list
 
@@ -1257,7 +1308,7 @@ class MegatronWorker(MegatronModelManager, Worker):
         Args:
             batch (Dict[str, torch.Tensor]): The rollout batch.
         """
-        with self.worker_timer():
+        with self.worker_timer(f"{self.role}/compute_advantages"):
             if batch["rewards"].numel() == 0:
                 batch["advantages"] = torch.zeros(
                     0, dtype=torch.float32, device=batch["rewards"].device

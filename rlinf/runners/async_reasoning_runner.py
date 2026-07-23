@@ -150,19 +150,30 @@ class AsyncReasoningRunner(ReasoningRunner):
         self._submit_rollout_duration = 0.0
         self._sync_rollout_duration = 0.0
         self._sync_inference_duration = 0.0
+        self._async_runner_durations: dict[str, float] = {}
+
+    def _record_runner_duration(self, name: str, start_time: float) -> None:
+        duration = time.perf_counter() - start_time
+        self._async_runner_durations[name] = (
+            self._async_runner_durations.get(name, 0.0) + duration
+        )
 
     def _next_train_batch(self):
-        if self._submitted_rollout_steps >= self.max_steps:
-            return None
-        if self._train_iter is None:
-            epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
-            self._train_iter = (
-                batch for _ in epoch_iter for batch in self.train_dataloader
-            )
+        start_time = time.perf_counter()
         try:
-            return next(self._train_iter)
-        except StopIteration:
-            return None
+            if self._submitted_rollout_steps >= self.max_steps:
+                return None
+            if self._train_iter is None:
+                epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
+                self._train_iter = (
+                    batch for _ in epoch_iter for batch in self.train_dataloader
+                )
+            try:
+                return next(self._train_iter)
+            except StopIteration:
+                return None
+        finally:
+            self._record_runner_duration("next_train_batch", start_time)
 
     def _sync_inference_weights(self) -> None:
         start_time = time.perf_counter()
@@ -235,25 +246,38 @@ class AsyncReasoningRunner(ReasoningRunner):
         self._available_rollout_channel_ids.append(channel_id)
         self._available_rollout_channel_ids.sort()
 
-    def _fill_rollout_backlog(self, target_size: int | None = None) -> None:
-        if target_size is None:
-            target_size = self.max_concurrent_rollout_batches
-        target_size = min(target_size, self.max_concurrent_rollout_batches)
+    def _fill_rollout_backlog(
+        self,
+        target_size: int | None = None,
+        timer_tag: str = "refill_rollout_backlog",
+    ) -> None:
+        start_time = time.perf_counter()
+        try:
+            if target_size is None:
+                target_size = self.max_concurrent_rollout_batches
+            target_size = min(target_size, self.max_concurrent_rollout_batches)
 
-        while (
-            len(self._running_rollouts) < target_size
-            and len(self.completed_rollout_buffer) < self.max_completed_rollout_batches
-            and self._available_rollout_channel_ids
-            and self.staleness_manager.get_capacity(self.global_steps) > 0
-        ):
-            if not self._prepare_rollout_weights_for_submit():
-                return
-            batch = self._next_train_batch()
-            if batch is None:
-                return
-            start_time = time.perf_counter()
-            self._submit_rollout_batch(batch, self._rollout_weight_version)
-            self._submit_rollout_duration += time.perf_counter() - start_time
+            while (
+                len(self._running_rollouts) < target_size
+                and len(self.completed_rollout_buffer)
+                < self.max_completed_rollout_batches
+                and self._available_rollout_channel_ids
+                and self.staleness_manager.get_capacity(self.global_steps) > 0
+            ):
+                if not self._prepare_rollout_weights_for_submit():
+                    return
+                batch = self._next_train_batch()
+                if batch is None:
+                    return
+                submit_start_time = time.perf_counter()
+                self._submit_rollout_batch(batch, self._rollout_weight_version)
+                self._submit_rollout_duration += (
+                    time.perf_counter() - submit_start_time
+                )
+        finally:
+            self._record_runner_duration("refill_rollout_backlog", start_time)
+            if timer_tag != "refill_rollout_backlog":
+                self._record_runner_duration(timer_tag, start_time)
 
     def _to_completed_rollout(self, submitted: _SubmittedRollout) -> CompletedRollout:
         metrics = {
@@ -320,7 +344,7 @@ class AsyncReasoningRunner(ReasoningRunner):
             completed = self._pop_trainable_completed_rollout()
             if completed is not None:
                 return completed
-            self._fill_rollout_backlog()
+            self._fill_rollout_backlog(timer_tag="refill_rollout_backlog/wait")
             if not self._running_rollouts and len(self.completed_rollout_buffer) == 0:
                 raise RuntimeError(
                     "No running rollouts are available. "
@@ -429,9 +453,14 @@ class AsyncReasoningRunner(ReasoningRunner):
         if self._sync_inference_duration > 0:
             time_metrics["sync_inference_weights"] = self._sync_inference_duration
             self._sync_inference_duration = 0.0
+        if self._async_runner_durations:
+            time_metrics.update(self._async_runner_durations)
+            self._async_runner_durations = {}
 
         time_metrics["rollout"] = completed.handle.consume_duration()
-        time_metrics["actor/training"] = chain_result.actor_handle.consume_duration()
+        actor_train_metrics = chain_result.actor_handle.consume_durations()
+        time_metrics["actor/training"] = actor_train_metrics.pop("run_training")
+        time_metrics.update(actor_train_metrics)
         time_metrics["reward"] = chain_result.reward_handle.consume_duration()
         if chain_result.actor_infer_handle is not None:
             chain_result.actor_infer_handle.wait()
@@ -444,9 +473,11 @@ class AsyncReasoningRunner(ReasoningRunner):
                 chain_result.critic_infer_handle.consume_duration()
             )
         if chain_result.critic_train_handle is not None:
-            time_metrics["critic/training"] = (
-                chain_result.critic_train_handle.consume_duration()
+            critic_train_metrics = chain_result.critic_train_handle.consume_durations()
+            time_metrics["critic/training"] = critic_train_metrics.pop(
+                "run_training"
             )
+            time_metrics.update(critic_train_metrics)
 
         log_time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
         rollout_metrics = {
@@ -525,11 +556,15 @@ class AsyncReasoningRunner(ReasoningRunner):
         self._train_iter = None
         self._rollout_weight_version = None
         try:
-            self._fill_rollout_backlog(self.prefill_rollout_batches)
+            self._fill_rollout_backlog(
+                self.prefill_rollout_batches,
+                timer_tag="refill_rollout_backlog/prefill",
+            )
             self.timer.consume_durations()
             self._submit_rollout_duration = 0.0
             self._sync_rollout_duration = 0.0
             self._sync_inference_duration = 0.0
+            self._async_runner_durations = {}
 
             while self.global_steps < self.max_steps:
                 with self.timer("step"):
@@ -537,13 +572,23 @@ class AsyncReasoningRunner(ReasoningRunner):
                         completed = self._wait_trainable_rollout()
 
                     if self.refill_before_train:
-                        self._fill_rollout_backlog()
+                        self._fill_rollout_backlog(
+                            timer_tag="refill_rollout_backlog/before_train"
+                        )
                     train_version = self.global_steps
-                    chain_result = self._run_training_chain(completed)
+                    training_chain_start_time = time.perf_counter()
+                    try:
+                        chain_result = self._run_training_chain(completed)
+                    finally:
+                        self._record_runner_duration(
+                            "training_chain_wall", training_chain_start_time
+                        )
                     self._release_rollout_channel_id(completed.channel_id)
                     self.global_steps += 1
                     if not self.refill_before_train:
-                        self._fill_rollout_backlog()
+                        self._fill_rollout_backlog(
+                            timer_tag="refill_rollout_backlog/after_train"
+                        )
 
                     run_time_exceeded = self.run_timer.is_finished()
                     _, save_model, is_train_end = check_progress(

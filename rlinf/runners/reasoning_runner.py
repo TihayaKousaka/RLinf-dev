@@ -533,7 +533,11 @@ class ReasoningRunner:
                     if self.critic:
                         critic_train_handle: Handle = self.critic.run_training(
                             input_channel=critic_training_input_channel,
-                            output_channel=critic_training_output_channel,
+                            output_channel=(
+                                None
+                                if self.is_pipeline
+                                else critic_training_output_channel
+                            ),
                             compute_rollout_metrics=False,
                         )
                     else:
@@ -588,7 +592,9 @@ class ReasoningRunner:
 
                 time_metrics = self.timer.consume_durations()
 
-                time_metrics["actor/training"] = actor_handle.consume_duration()
+                actor_train_metrics = actor_handle.consume_durations()
+                time_metrics["actor/training"] = actor_train_metrics.pop("run_training")
+                time_metrics.update(actor_train_metrics)
                 time_metrics["rollout"] = rollout_handle.consume_duration()
                 time_metrics["reward"] = reward_handle.consume_duration()
                 if actor_infer_handle is not None:
@@ -605,9 +611,11 @@ class ReasoningRunner:
                         critic_infer_handle.consume_duration()
                     )
                 if critic_train_handle is not None:
-                    time_metrics["critic/training"] = (
-                        critic_train_handle.consume_duration()
+                    critic_train_metrics = critic_train_handle.consume_durations()
+                    time_metrics["critic/training"] = critic_train_metrics.pop(
+                        "run_training"
                     )
+                    time_metrics.update(critic_train_metrics)
 
                 logging_steps = (
                     self.global_steps - 1

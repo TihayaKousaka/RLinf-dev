@@ -81,6 +81,7 @@ def main(cfg) -> None:
         component_placement.placement_mode
         in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO]
         and cfg.algorithm.recompute_logprobs
+        and component_placement.has_dedicated_actor_inference
     ):
         inference_placement_strategy = component_placement.get_strategy(
             "actor_inference" if critic_inference_group else "inference"
