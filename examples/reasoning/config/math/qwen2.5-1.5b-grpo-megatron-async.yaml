@@ -1,0 +1,60 @@
+defaults:
+  - qwen2.5-1.5b-grpo-megatron
+  - _self_
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 0-3
+    rollout: 4-7
+    reward: 7
+
+runner:
+  experiment_name: grpo-1.5b-async
+  logger:
+    project_name: rlinf-async
+    logger_backends: ["wandb"] # wandb, swanlab
+  seq_length: 2048
+  max_tokens_per_mbs: 2048
+  async_rl:
+    enable: true
+    max_concurrent_rollout_batches: 1
+    prefill_rollout_batches: 1
+    max_head_offpolicyness: 4
+    rollout_weight_sync_interval: 4
+    max_completed_rollout_batches: 4
+    refill_before_train: true
+    sync_reward_output_put: true
+    sync_intermediate_channel_put: true
+
+algorithm:
+  group_size: 8
+  recompute_logprobs: false
+  max_num_gen_batches: 1
+  calculate_entropy: true
+  normalize_advantages: false
+  use_valid_token_scale: true
+  sampling_params:
+    max_new_tokens: 1024
+
+rollout:
+  model:
+    model_path: /mnt/public2/xiekaizhi/rlt-openpi-sim/data/Qwen2.5-1.5B-Instruct # https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct
+  sglang:
+    disable_overlap_schedule: false
+    weight_sync_idle_timeout_s: 300.0
+    weight_sync_idle_poll_interval_s: 0.1
+  return_logprobs: true
+  validate_weight_first_sync: true
+
+data:
+  max_prompt_length: 512
+  rollout_batch_size: 32
+  prompt_key: text
+  answer_key: label
+  train_data_paths: ["/Users/lixiaoqun/Downloads/pixiv/rlt-openpi-sim/checkpoints/train.json"]
+  val_data_paths: ["/Users/lixiaoqun/Downloads/pixiv/rlt-openpi-sim/checkpoints/train.json"]
+
+actor:
+  tokenizer:
+    tokenizer_model: ${rollout.model.model_path}

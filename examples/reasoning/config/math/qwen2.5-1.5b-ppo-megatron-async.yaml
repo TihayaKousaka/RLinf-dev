@@ -6,7 +6,7 @@ cluster:
   component_placement:
     actor: 0-1
     critic: 2-3
-    rollout: 4-5
+    rollout: 4-7
     reward: 7
 
 runner:
@@ -14,8 +14,8 @@ runner:
   enable_dynamic_batch_size: false
   async_rl:
     enable: true
-    max_concurrent_rollout_batches: 2
-    prefill_rollout_batches: 2
+    max_concurrent_rollout_batches: 1
+    prefill_rollout_batches: 1
     max_head_offpolicyness: 4
     rollout_weight_sync_interval: 4
     max_completed_rollout_batches: 4
@@ -28,7 +28,7 @@ algorithm:
   logprob_forward_micro_batch_size: 1
   recompute_logprobs: false
   sampling_params:
-    max_new_tokens: 512
+    max_new_tokens: 1024
 
 rollout:
   return_logprobs: true

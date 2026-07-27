@@ -11,7 +11,7 @@ cluster:
   component_placement:
     actor: 0-1
     critic: 2-3
-    rollout: 4-5
+    rollout: 4-7
     reward: 7
 
 runner:
@@ -27,10 +27,10 @@ runner:
   val_check_interval: 1
   save_interval: 1000
 
-  seq_length: 12288
+  seq_length: 2048
 
   enable_dynamic_batch_size: False
-  max_tokens_per_mbs: 12288
+  max_tokens_per_mbs: 2048
 
   resume_dir: null
   experiment_name: ppo-1.5b
@@ -85,7 +85,7 @@ algorithm:
     top_k: 1000000
     top_p: 1.0
     repetition_penalty: 1.0
-    max_new_tokens: 512
+    max_new_tokens: 1024
     min_new_tokens: 1
 
 rollout:
@@ -100,7 +100,7 @@ rollout:
   enforce_eager: False         # if False, rollout engine will capture cuda graph, which will take more time to initialize.
   distributed_executor_backend: mp   # ray or mp
   disable_log_stats: False
-  detokenize: False             # Whether to detokenize the output. During RL we actually don't need to detokenize it. Can be set to True for debugging.
+  detokenize: True             # Whether to detokenize the output. During RL we actually don't need to detokenize it. Can be set to True for debugging.
   padding: null               # will be tokenizer.pad_token_id if null. it is used to filter megatron's padding for rollout engine
   eos: null                   # will be tokenizer.eos_token_id if null.
     
@@ -124,9 +124,9 @@ rollout:
   pipeline_parallel_size: 1
   
   validate_weight: False # whether to send all weights at first for weight comparison.
-  validate_weight_first_sync: False
+  validate_weight_first_sync: True
   validate_save_dir: null # the directory to save the weights for comparison. If validate_weight is True, this will be used to save the weights for comparison.
-  print_outputs: False         # whether to print the outputs (token ids, texts, etc.) of rollout engine.
+  print_outputs: True         # whether to print the outputs (token ids, texts, etc.) of rollout engine.
 
   max_running_requests: 64 # the maximum number of running requests in the rollout engine.
   cuda_graph_max_bs: 128 # the maximum batch size for cuda graph. If the batch size is larger than this, cuda graph will not be used.
@@ -270,6 +270,13 @@ reward:
   use_reward_model: false
   reward_type: 'math'
   reward_scale: 5.0
+
+  dump_rollouts:
+    enable: true
+    dir: ${runner.logger.log_path}/rollout_dumps
+    max_samples_per_rank: 128
+    max_text_chars: 20000
+    include_prompt: true
 
   tokenizer:
     tokenizer_model: ${actor.tokenizer.tokenizer_model}

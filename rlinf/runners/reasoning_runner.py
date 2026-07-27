@@ -592,11 +592,6 @@ class ReasoningRunner:
 
                 time_metrics = self.timer.consume_durations()
 
-                actor_train_metrics = actor_handle.consume_durations()
-                time_metrics["actor/training"] = actor_train_metrics.pop("run_training")
-                time_metrics.update(actor_train_metrics)
-                time_metrics["rollout"] = rollout_handle.consume_duration()
-                time_metrics["reward"] = reward_handle.consume_duration()
                 if actor_infer_handle is not None:
                     actor_infer_handle.wait()
                     # Inference time should be the min time across ranks, because different DP receive the rollout results differently
@@ -605,6 +600,11 @@ class ReasoningRunner:
                     time_metrics["actor/inference"] = (
                         actor_infer_handle.consume_duration(reduction_type="min")
                     )
+                actor_train_metrics = actor_handle.consume_durations()
+                time_metrics["actor/training"] = actor_train_metrics.pop("run_training")
+                time_metrics.update(actor_train_metrics)
+                time_metrics["rollout"] = rollout_handle.consume_duration()
+                time_metrics["reward"] = reward_handle.consume_duration()
                 if critic_infer_handle is not None:
                     critic_infer_handle.wait()
                     time_metrics["critic/inference"] = (

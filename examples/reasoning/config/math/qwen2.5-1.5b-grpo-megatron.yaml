@@ -9,7 +9,9 @@ hydra:
 cluster:
   num_nodes: 16
   component_placement:
-    actor,rollout,reward: all
+    actor: all
+    rollout: all
+    reward: all
 
 runner:
   task_type: reasoning
