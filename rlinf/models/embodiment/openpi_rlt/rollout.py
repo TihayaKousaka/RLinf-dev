@@ -144,6 +144,18 @@ def require_rlt_stage2_forward_inputs(
             field_name=key,
             context=context,
         )
+    optional_shapes = {
+        "base_chunks": (batch_size, None, action_chunk_dim),
+    }
+    for key, expected_shape in optional_shapes.items():
+        if key not in forward_inputs:
+            continue
+        _require_tensor_shape(
+            forward_inputs[key],
+            expected_shape,
+            field_name=key,
+            context=context,
+        )
     return forward_inputs
 
 

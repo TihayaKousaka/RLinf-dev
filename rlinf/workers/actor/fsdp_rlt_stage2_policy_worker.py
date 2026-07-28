@@ -279,6 +279,12 @@ class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
             )
         return min_replay_buffer_size, min_demo_buffer_size
 
+    def _is_expo_ft(self) -> bool:
+        return (
+            str(self.cfg.actor.model.rlt_stage2.get("policy_mode", "td3")).lower()
+            == "expo_ft"
+        )
+
     def soft_update_target_model(self, tau: float | None = None) -> None:
         if tau is None:
             tau = float(self.cfg.algorithm.tau)
@@ -691,9 +697,12 @@ class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
         global_min_replay_size: int,
     ) -> dict[str, float]:
         stage2_cfg = self.cfg.actor.model.rlt_stage2
+        is_expo_ft = self._is_expo_ft()
         critic_losses = []
         q1_values = []
         q2_values = []
+        q_values = []
+        target_q_values = []
 
         self.optimizer.zero_grad(set_to_none=True)
         self.qf_optimizer.zero_grad(set_to_none=True)
@@ -704,25 +713,45 @@ class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
             )
             with backward_ctx:
                 with self.amp_context:
+                    next_base_chunks = batch.get("next_base_chunks", None)
+                    if next_base_chunks is not None:
+                        next_base_chunks = next_base_chunks.to(torch.float32)
                     td_target = self.model.compute_td_target_batch(
                         rewards=batch["rewards"].to(torch.float32),
                         dones=batch["dones"].to(torch.float32),
                         next_x=batch["next_x"].to(torch.float32),
                         next_a_tilde=batch["next_a_tilde"].to(torch.float32),
+                        next_base_chunks=next_base_chunks,
                     )
-                    q1, q2 = self.model.critic_forward(
-                        batch["x"].to(torch.float32),
-                        batch["a"].to(torch.float32),
-                    )
-                    loss = (
-                        critic_loss(q1, q2, td_target) / self.gradient_accumulation
-                    )
+                    if is_expo_ft:
+                        all_q = self.model.critic_forward(
+                            batch["x"].to(torch.float32),
+                            batch["a"].to(torch.float32),
+                        )
+                        td_target = td_target.to(dtype=all_q.dtype)
+                        loss = (
+                            (all_q - td_target).square().mean()
+                            / self.gradient_accumulation
+                        )
+                    else:
+                        q1, q2 = self.model.critic_forward(
+                            batch["x"].to(torch.float32),
+                            batch["a"].to(torch.float32),
+                        )
+                        loss = (
+                            critic_loss(q1, q2, td_target)
+                            / self.gradient_accumulation
+                        )
                 self.grad_scaler.scale(loss).backward()
             critic_losses.append(
                 loss.detach().float().item() * self.gradient_accumulation
             )
-            q1_values.append(q1.detach().float().mean().item())
-            q2_values.append(q2.detach().float().mean().item())
+            if is_expo_ft:
+                q_values.append(all_q.detach().float().mean().item())
+                target_q_values.append(td_target.detach().float().mean().item())
+            else:
+                q1_values.append(q1.detach().float().mean().item())
+                q2_values.append(q2.detach().float().mean().item())
 
         self.grad_scaler.unscale_(self.qf_optimizer)
         critic_grad_norm = self._strategy.clip_grad_norm_(self.model)
@@ -733,11 +762,23 @@ class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
 
         metrics = {
             "rlt_stage2/critic_loss": float(np.mean(critic_losses)),
-            "critic/q1_mean": float(np.mean(q1_values)),
-            "critic/q2_mean": float(np.mean(q2_values)),
             "critic/grad_norm": float(critic_grad_norm),
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
         }
+        if is_expo_ft:
+            metrics.update(
+                {
+                    "critic/q_mean": float(np.mean(q_values)),
+                    "critic/target_q_mean": float(np.mean(target_q_values)),
+                }
+            )
+        else:
+            metrics.update(
+                {
+                    "critic/q1_mean": float(np.mean(q1_values)),
+                    "critic/q2_mean": float(np.mean(q2_values)),
+                }
+            )
 
         replay_cfg = self.cfg.algorithm.get("replay_buffer", {})
         warmup_min_size = int(
@@ -769,6 +810,11 @@ class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
                 )
                 with backward_ctx:
                     with self.amp_context:
+                        q_indices = (
+                            self.model.sample_q_indices(mode="train")
+                            if is_expo_ft
+                            else None
+                        )
                         actions = self.model.actor_forward(
                             batch["x"].to(torch.float32),
                             batch["a_tilde"].to(torch.float32),
@@ -793,6 +839,7 @@ class RLTStage2FSDPPolicyWorker(EmbodiedFSDPActor):
                         q_value = self.model.critic_min(
                             batch["x"].to(torch.float32),
                             actions,
+                            q_indices=q_indices,
                         )
                         actor_total_loss, actor_loss_metrics = actor_loss(
                             q_value=q_value,

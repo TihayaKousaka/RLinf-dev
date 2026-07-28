@@ -51,9 +51,11 @@ class RLTStage2TrajectoryReplayAdapter:
         x: torch.Tensor,
         action_chunk: torch.Tensor,
         ref_chunk: torch.Tensor,
+        base_chunks: torch.Tensor | None,
         rewards: torch.Tensor,
         next_x: torch.Tensor,
         next_ref_chunk: torch.Tensor,
+        next_base_chunks: torch.Tensor | None,
         done: torch.Tensor | float | bool,
         intervention: torch.Tensor,
         source_chunk: torch.Tensor,
@@ -95,6 +97,17 @@ class RLTStage2TrajectoryReplayAdapter:
                 .reshape(1, 1, -1)
                 .cpu()
                 .contiguous(),
+                **(
+                    {
+                        "base_chunks": base_chunks.detach()
+                        .to(torch.float32)
+                        .reshape(1, 1, *base_chunks.shape)
+                        .cpu()
+                        .contiguous()
+                    }
+                    if base_chunks is not None
+                    else {}
+                ),
                 "rewards": rewards.detach()
                 .to(torch.float32)
                 .reshape(1, 1, chunk_length)
@@ -115,6 +128,17 @@ class RLTStage2TrajectoryReplayAdapter:
                 .reshape(1, 1, -1)
                 .cpu()
                 .contiguous(),
+                **(
+                    {
+                        "next_base_chunks": next_base_chunks.detach()
+                        .to(torch.float32)
+                        .reshape(1, 1, *next_base_chunks.shape)
+                        .cpu()
+                        .contiguous()
+                    }
+                    if next_base_chunks is not None
+                    else {}
+                ),
                 "dones": torch.as_tensor(done, dtype=torch.float32)
                 .reshape(1, 1, 1)
                 .cpu()
@@ -247,6 +271,7 @@ class RLTStage2TrajectoryReplayAdapter:
 
         x_all = traj.forward_inputs.get("x")
         a_tilde_all = traj.forward_inputs.get("a_tilde")
+        base_chunks_all = traj.forward_inputs.get("base_chunks")
         if x_all is None or a_tilde_all is None:
             return [], 0
 
@@ -310,6 +335,10 @@ class RLTStage2TrajectoryReplayAdapter:
 
                 x = x_all[t, env_idx].detach()
                 a_tilde = a_tilde_all[t, env_idx].detach()
+                if base_chunks_all is None:
+                    base_chunks = a_tilde.unsqueeze(0)
+                else:
+                    base_chunks = base_chunks_all[t, env_idx].detach()
                 rewards = rewards_all[t, env_idx].detach()
 
                 if done > 0.0:
@@ -328,6 +357,20 @@ class RLTStage2TrajectoryReplayAdapter:
                         )
                     next_x = x_all[t + 1, env_idx].detach()
                     next_a_tilde = a_tilde_all[t + 1, env_idx].detach()
+                if done > 0.0:
+                    next_base_chunks = base_chunks
+                elif base_chunks_all is None:
+                    next_base_chunks = next_a_tilde.unsqueeze(0)
+                elif t + 1 < base_chunks_all.shape[0]:
+                    next_base_chunks = base_chunks_all[t + 1, env_idx].detach()
+                else:
+                    raise RuntimeError(
+                        "RLT Stage2 EXPO boundary transition is non-terminal but "
+                        "missing cached final base_chunks. Rollout must send the "
+                        "final student forward_inputs so actor training can build "
+                        "top-Q bootstrap candidates without re-encoding VLA "
+                        "observations."
+                    )
 
                 source_chunk = source_chunk.reshape(chunk_len).clone()
                 if self.is_realworld and bool(
@@ -341,9 +384,11 @@ class RLTStage2TrajectoryReplayAdapter:
                         x=x,
                         action_chunk=action,
                         ref_chunk=a_tilde,
+                        base_chunks=base_chunks,
                         rewards=rewards,
                         next_x=next_x,
                         next_ref_chunk=next_a_tilde,
+                        next_base_chunks=next_base_chunks,
                         done=done,
                         intervention=intervention_mask,
                         source_chunk=source_chunk,

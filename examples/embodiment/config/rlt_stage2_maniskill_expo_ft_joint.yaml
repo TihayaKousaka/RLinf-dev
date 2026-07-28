@@ -1,0 +1,22 @@
+defaults:
+  - rlt_stage2_maniskill_joint
+  - _self_
+
+runner:
+  logger:
+    project_name: rlinf-expo-ft
+    experiment_name: "rlt_stage2_maniskill_expo_ft_joint"
+
+rollout:
+  expert_model:
+    rlt_stage2:
+      policy_mode: "td3"
+
+actor:
+  model:
+    rlt_stage2:
+      policy_mode: "expo_ft"
+      num_q_heads: 10
+      num_base_candidates: 8
+      num_edit_samples: 8
+      num_min_qs: 2

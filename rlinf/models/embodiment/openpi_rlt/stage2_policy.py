@@ -31,18 +31,25 @@ from typing import Any, Literal
 
 import torch
 from omegaconf import DictConfig
+from torch.utils._pytree import tree_map
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.openpi import build_openpi_rlt_backbone
+from rlinf.utils.pytree import register_pytree_dataclasses
 
-from .components import DirectGaussianActor, TwinQCritic, compute_td_target
+from .components import (
+    DirectGaussianActor,
+    MultiQCritic,
+    TwinQCritic,
+    compute_td_target,
+)
 from .proprio import resolve_proprio_dim, select_proprio
 from .rl_token import RLTokenModel
 from .rollout import RLTStage2RolloutRouteConfig, route_rlt_stage2_rollout
 
 
 class RLTStage2Policy(torch.nn.Module, BasePolicy):
-    ROLLOUT_SYNC_PREFIXES = ("actor.", "critic.q1.", "critic.q2.")
+    ROLLOUT_SYNC_PREFIXES = ("actor.", "critic.q1.", "critic.q2.", "critic.q_heads.")
     accepts_rollout_context = True
 
     def __init__(
@@ -103,6 +110,38 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 f"'human_override', got {self.intervention_mode!r}."
             )
 
+        self.policy_mode = str(stage2_cfg.get("policy_mode", "td3")).lower()
+        if self.policy_mode not in {"td3", "expo_ft"}:
+            raise ValueError(
+                "rlt_stage2.policy_mode must be 'td3' or 'expo_ft', got "
+                f"{self.policy_mode!r}."
+            )
+        self.num_q_heads = int(stage2_cfg.get("num_q_heads", 10))
+        self.num_base_candidates = int(stage2_cfg.get("num_base_candidates", 8))
+        self.num_edit_samples = int(
+            stage2_cfg.get("num_edit_samples", self.num_base_candidates)
+        )
+        self.num_min_qs = int(stage2_cfg.get("num_min_qs", 2))
+        if self.num_q_heads <= 0:
+            raise ValueError(
+                f"rlt_stage2.num_q_heads must be positive, got {self.num_q_heads}."
+            )
+        if self.num_base_candidates <= 0:
+            raise ValueError(
+                "rlt_stage2.num_base_candidates must be positive, got "
+                f"{self.num_base_candidates}."
+            )
+        if self.num_edit_samples < 0:
+            raise ValueError(
+                "rlt_stage2.num_edit_samples must be non-negative, got "
+                f"{self.num_edit_samples}."
+            )
+        if self.num_min_qs <= 0 or self.num_min_qs > self.num_q_heads:
+            raise ValueError(
+                "rlt_stage2.num_min_qs must be in [1, num_q_heads], got "
+                f"{self.num_min_qs} for {self.num_q_heads} heads."
+            )
+
         self.vla = None
         self.rl_token_model = None
         if self.load_feature_backbones:
@@ -136,24 +175,36 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         embedding_dim = int(stage2_cfg.get("embedding_dim", 2048))
         self.state_dim = embedding_dim + self.proprio_dim
 
+        actor_hidden_dim = int(stage2_cfg.get("mlp_hidden_dim", 256))
+        actor_num_hidden_layers = int(stage2_cfg.get("mlp_num_hidden_layers", 2))
+        ref_dropout = float(stage2_cfg.get("ref_action_dropout", 0.0))
         self.actor = DirectGaussianActor(
             state_dim=self.state_dim,
             action_chunk_dim=self.action_chunk_dim,
-            hidden_dim=int(stage2_cfg.get("mlp_hidden_dim", 256)),
-            num_hidden_layers=int(stage2_cfg.get("mlp_num_hidden_layers", 2)),
+            hidden_dim=actor_hidden_dim,
+            num_hidden_layers=actor_num_hidden_layers,
             sigma=float(stage2_cfg.get("actor_noise_sigma", 0.1)),
-            ref_dropout=float(stage2_cfg.get("ref_action_dropout", 0.0)),
+            ref_dropout=ref_dropout,
         ).to(self.device)
         self.target_actor = copy.deepcopy(self.actor)
         for param in self.target_actor.parameters():
             param.requires_grad_(False)
 
-        self.critic = TwinQCritic(
-            state_dim=self.state_dim,
-            action_chunk_dim=self.action_chunk_dim,
-            hidden_dim=int(stage2_cfg.get("mlp_hidden_dim", 256)),
-            num_hidden_layers=int(stage2_cfg.get("mlp_num_hidden_layers", 2)),
-        ).to(self.device)
+        if self.policy_mode == "expo_ft":
+            self.critic = MultiQCritic(
+                state_dim=self.state_dim,
+                action_chunk_dim=self.action_chunk_dim,
+                hidden_dim=actor_hidden_dim,
+                num_hidden_layers=actor_num_hidden_layers,
+                num_q_heads=self.num_q_heads,
+            ).to(self.device)
+        else:
+            self.critic = TwinQCritic(
+                state_dim=self.state_dim,
+                action_chunk_dim=self.action_chunk_dim,
+                hidden_dim=actor_hidden_dim,
+                num_hidden_layers=actor_num_hidden_layers,
+            ).to(self.device)
 
     @staticmethod
     def _shape_str(tensor: torch.Tensor | None) -> str:
@@ -248,13 +299,13 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self,
         env_obs: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x, a_tilde_flat = self._prepare_features(env_obs)
+        _, x, a_tilde_flat = self._prepare_features(env_obs)
         return x, a_tilde_flat
 
     def _prepare_features(
         self,
         env_obs: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[Any, torch.Tensor, torch.Tensor]:
         self._require_feature_backbones("_prepare_features")
         observation, _ = self.vla.prepare_rlt_observation(env_obs)
         embeddings, pad_mask = self.vla.extract_rlt_prefix_embeddings(
@@ -278,7 +329,93 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 f"observation.state dim={observation.state.shape[1]}."
             ) from exc
         x = torch.cat([z_rl.to(torch.float32), state], dim=-1)
-        return x, a_tilde_flat
+        return observation, x, a_tilde_flat
+
+    def _normalize_base_chunks(
+        self,
+        base_chunks: torch.Tensor,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        if base_chunks.ndim == 2:
+            base_chunks = base_chunks[:, None, :]
+        if (
+            not isinstance(base_chunks, torch.Tensor)
+            or base_chunks.ndim != 3
+            or base_chunks.shape[-1] != self.action_chunk_dim
+        ):
+            raise ValueError(
+                f"RLT Stage2 {name} shape mismatch: expected [B, N, "
+                f"{self.action_chunk_dim}], got {self._shape_str(base_chunks)}."
+            )
+        return base_chunks
+
+    @staticmethod
+    def _repeat_batch_tree(tree: Any, repeats: int, batch_size: int) -> Any:
+        register_pytree_dataclasses(tree)
+        return tree_map(
+            lambda value: (
+                value.repeat_interleave(repeats, dim=0)
+                if torch.is_tensor(value)
+                and value.ndim > 0
+                and int(value.shape[0]) == int(batch_size)
+                else value
+            ),
+            tree,
+        )
+
+    @torch.no_grad()
+    def _sample_base_chunks(self, observation: Any) -> torch.Tensor:
+        self._require_feature_backbones("_sample_base_chunks")
+        batch_size = int(observation.state.shape[0])
+        repeated_observation = self._repeat_batch_tree(
+            observation,
+            self.num_base_candidates,
+            batch_size,
+        )
+        outputs = self.vla.sample_actions(
+            repeated_observation,
+            mode="eval",
+            compute_values=False,
+        )
+        action_dict = self.vla.output_transform(
+            {"actions": outputs["actions"], "state": repeated_observation.state}
+        )
+        base_chunks = action_dict["actions"].to(
+            device=self.device,
+            dtype=torch.float32,
+        ).reshape(batch_size, self.num_base_candidates, -1)
+        return self._normalize_base_chunks(base_chunks, name="base_chunks")
+
+    def sample_q_indices(self, mode: str) -> torch.Tensor | None:
+        if self.policy_mode != "expo_ft":
+            return None
+        if self.num_min_qs >= self.num_q_heads:
+            return None
+        if mode == "eval":
+            return torch.arange(self.num_min_qs, device=self.device)
+        return torch.randperm(self.num_q_heads, device=self.device)[: self.num_min_qs]
+
+    def _flatten_candidate_actions(
+        self,
+        x: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int] | None]:
+        if actions.ndim == 2:
+            self._validate_flat_action(actions, name="critic actions")
+            return x, actions, None
+        if actions.ndim != 3 or actions.shape[-1] != self.action_chunk_dim:
+            raise ValueError(
+                "RLT Stage2 critic actions must have shape [B, A] or [B, N, A], "
+                f"got {self._shape_str(actions)}."
+            )
+        batch_size, num_candidates, _ = actions.shape
+        repeated_x = x[:, None, :].expand(-1, num_candidates, -1).reshape(
+            batch_size * num_candidates,
+            -1,
+        )
+        repeated_actions = actions.reshape(batch_size * num_candidates, -1)
+        return repeated_x, repeated_actions, (batch_size, num_candidates)
 
     def default_forward(self, **kwargs):
         raise NotImplementedError(
@@ -293,9 +430,11 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         deterministic: bool = False,
         apply_ref_dropout: bool | None = None,
         apply_action_noise: bool | None = None,
+        use_target: bool = False,
     ) -> torch.Tensor:
         self._validate_flat_action(a_tilde, name="actor input a_tilde")
-        action = self.actor(
+        actor = self.target_actor if use_target else self.actor
+        action = actor(
             x,
             a_tilde,
             deterministic=deterministic,
@@ -309,12 +448,51 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self,
         x: torch.Tensor,
         actions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+        if self.policy_mode == "expo_ft":
+            return self.critic_values_forward(x, actions, use_target=False)
         self._validate_flat_action(actions, name="critic input actions")
         return self.critic(x, actions)
 
-    def critic_min(self, x: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def critic_values_forward(
+        self,
+        x: torch.Tensor,
+        actions: torch.Tensor,
+        *,
+        use_target: bool = False,
+        q_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.policy_mode != "expo_ft":
+            raise RuntimeError("critic_values_forward is only used by EXPO-FT.")
+        x, actions, candidate_shape = self._flatten_candidate_actions(x, actions)
+        critic = self.critic.target_q_values if use_target else self.critic.forward
+        q_values = critic(x, actions)
+        if candidate_shape is not None:
+            batch_size, num_candidates = candidate_shape
+            q_values = q_values.reshape(batch_size, num_candidates, -1)
+        if q_indices is not None:
+            q_values = q_values.index_select(dim=-1, index=q_indices)
+        return q_values
+
+    def critic_min(
+        self,
+        x: torch.Tensor,
+        actions: torch.Tensor,
+        *,
+        use_target: bool = False,
+        q_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.policy_mode == "expo_ft":
+            q_values = self.critic_values_forward(
+                x,
+                actions,
+                use_target=use_target,
+                q_indices=q_indices,
+            )
+            return q_values.min(dim=-1, keepdim=True).values
         self._validate_flat_action(actions, name="critic_min input actions")
+        if use_target:
+            return self.critic.target_q_min(x, actions)
         return self.critic.q_min(x, actions)
 
     @torch.no_grad()
@@ -354,6 +532,54 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         ]
 
     @torch.no_grad()
+    def select_top_q_actions(
+        self,
+        x: torch.Tensor,
+        base_chunks: torch.Tensor,
+        *,
+        q_indices: torch.Tensor | None = None,
+        use_target: bool = False,
+        deterministic_candidates: bool = False,
+    ) -> torch.Tensor:
+        base_chunks = self._normalize_base_chunks(base_chunks, name="base_chunks")
+        batch_size, num_base_candidates, _ = base_chunks.shape
+        num_edit_candidates = min(self.num_edit_samples, num_base_candidates)
+
+        candidate_chunks = [base_chunks]
+        if num_edit_candidates > 0:
+            edit_base_chunks = base_chunks[:, :num_edit_candidates, :]
+            repeated_x = x[:, None, :].expand(-1, num_edit_candidates, -1).reshape(
+                batch_size * num_edit_candidates,
+                -1,
+            )
+            repeated_base = edit_base_chunks.reshape(
+                batch_size * num_edit_candidates,
+                -1,
+            )
+            edited_chunks = self.actor_forward(
+                repeated_x,
+                repeated_base,
+                deterministic=deterministic_candidates,
+                apply_ref_dropout=False,
+                apply_action_noise=not deterministic_candidates,
+                use_target=use_target,
+            ).reshape(batch_size, num_edit_candidates, -1)
+            candidate_chunks.append(edited_chunks)
+
+        all_candidates = torch.cat(candidate_chunks, dim=1)
+        candidate_scores = self.critic_values_forward(
+            x,
+            all_candidates,
+            use_target=use_target,
+            q_indices=q_indices,
+        ).min(dim=-1).values
+        selected_indices = candidate_scores.argmax(dim=1)
+        return all_candidates[
+            torch.arange(batch_size, device=all_candidates.device),
+            selected_indices,
+        ]
+
+    @torch.no_grad()
     def compute_td_target_batch(
         self,
         *,
@@ -361,22 +587,56 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         dones: torch.Tensor,
         next_x: torch.Tensor,
         next_a_tilde: torch.Tensor,
+        next_base_chunks: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        stage2_cfg = self.cfg.rlt_stage2
+        gamma = float(stage2_cfg.get("gamma", self.cfg.get("gamma", 0.99)))
+        if self.policy_mode != "expo_ft":
+            self._validate_flat_action(
+                next_a_tilde,
+                name="compute_td_target_batch next_a_tilde",
+            )
+            return compute_td_target(
+                rewards=rewards,
+                dones=dones,
+                next_x=next_x,
+                next_a_tilde=next_a_tilde,
+                target_actor=self.target_actor,
+                critic=self.critic,
+                gamma=gamma,
+                chunk_length=self.chunk_length,
+            )
+
         self._validate_flat_action(
             next_a_tilde,
             name="compute_td_target_batch next_a_tilde",
         )
-        stage2_cfg = self.cfg.rlt_stage2
-        return compute_td_target(
-            rewards=rewards,
-            dones=dones,
-            next_x=next_x,
-            next_a_tilde=next_a_tilde,
-            target_actor=self.target_actor,
-            critic=self.critic,
-            gamma=float(stage2_cfg.get("gamma", self.cfg.get("gamma", 0.99))),
-            chunk_length=self.chunk_length,
+        if next_base_chunks is None:
+            next_base_chunks = next_a_tilde[:, None, :]
+        next_base_chunks = self._normalize_base_chunks(
+            next_base_chunks,
+            name="compute_td_target_batch next_base_chunks",
         )
+        q_indices = self.sample_q_indices(mode="train")
+        next_actions = self.select_top_q_actions(
+            next_x,
+            next_base_chunks,
+            q_indices=q_indices,
+            use_target=True,
+            deterministic_candidates=False,
+        )
+        next_q = self.critic_min(
+            next_x,
+            next_actions,
+            use_target=True,
+            q_indices=q_indices,
+        )
+        discount_powers = gamma ** torch.arange(
+            self.chunk_length, device=rewards.device, dtype=rewards.dtype
+        )
+        chunk_return = (rewards * discount_powers).sum(dim=-1, keepdim=True)
+        bootstrap = (gamma**self.chunk_length) * (1.0 - dones) * next_q
+        return chunk_return + bootstrap
 
     @torch.no_grad()
     def update_target_networks(self, tau: float) -> None:
@@ -389,7 +649,11 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self.critic.update_targets(tau)
 
     def set_online_critic_requires_grad(self, requires_grad: bool) -> None:
-        for module in (self.critic.q1, self.critic.q2):
+        if self.policy_mode == "expo_ft":
+            critic_modules = self.critic.q_heads
+        else:
+            critic_modules = (self.critic.q1, self.critic.q2)
+        for module in critic_modules:
             for param in module.parameters():
                 param.requires_grad_(requires_grad)
 
@@ -445,7 +709,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         del kwargs
 
-        x, a_tilde = self._prepare_features(env_obs)
+        observation, x, a_tilde = self._prepare_features(env_obs)
         deterministic = mode == "eval"
         ready_for_online = self.global_step >= self.online_gate_updates
         is_maniskill_train = (
@@ -455,8 +719,18 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         )
         if deterministic or self.act_as_vla_reference:
             self.actor.eval()
+        base_chunks = None
         if self.act_as_vla_reference:
             action_flat = a_tilde
+        elif self.policy_mode == "expo_ft":
+            base_chunks = self._sample_base_chunks(observation)
+            q_indices = self.sample_q_indices(mode)
+            action_flat = self.select_top_q_actions(
+                x,
+                base_chunks,
+                q_indices=q_indices,
+                deterministic_candidates=deterministic,
+            )
         elif deterministic:
             action_flat = self.actor_forward(
                 x,
@@ -492,6 +766,8 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
                 "a_tilde": a_tilde.detach(),
             },
         }
+        if base_chunks is not None:
+            result["forward_inputs"]["base_chunks"] = base_chunks.detach()
         if not enable_rlt_route:
             return actions, result
 

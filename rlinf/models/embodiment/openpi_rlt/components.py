@@ -14,11 +14,11 @@
 
 """Core Stage 2 components for RLT.
 
-This module keeps the original Stage 2 structure lightweight:
+This module keeps Stage 2 lightweight:
 - a frozen VLA backbone provides reference actions and embeddings
 - a frozen RL token encoder compresses embeddings into z_rl
-- a direct Gaussian actor predicts action chunks conditioned on VLA references
-- a twin-Q critic scores chunk actions for TD3-style updates
+- a direct Gaussian actor / twin-Q critic for TD3-style RLT
+- a direct Gaussian actor / multi-Q critic for EXPO-FT-style RLT
 """
 
 from __future__ import annotations
@@ -180,6 +180,76 @@ class TwinQCritic(nn.Module):
             (self.q1, self.q1_target),
             (self.q2, self.q2_target),
         ):
+            for src_param, dst_param in zip(
+                online.parameters(),
+                target.parameters(),
+                strict=True,
+            ):
+                dst_param.data.lerp_(src_param.data, tau)
+
+
+class MultiQCritic(nn.Module):
+    """Ensemble critic used by EXPO-FT."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_chunk_dim: int,
+        hidden_dim: int = 256,
+        num_hidden_layers: int = 2,
+        num_q_heads: int = 10,
+    ) -> None:
+        super().__init__()
+        if num_q_heads <= 0:
+            raise ValueError(f"num_q_heads must be positive, got {num_q_heads}.")
+
+        self.num_q_heads = int(num_q_heads)
+        self.q_heads = nn.ModuleList(
+            [
+                QNetwork(state_dim, action_chunk_dim, hidden_dim, num_hidden_layers)
+                for _ in range(self.num_q_heads)
+            ]
+        )
+        self.q_heads_target = copy.deepcopy(self.q_heads)
+        for param in self.q_heads_target.parameters():
+            param.requires_grad_(False)
+
+    @staticmethod
+    def _forward_heads(
+        q_heads: nn.ModuleList,
+        x: Tensor,
+        a: Tensor,
+    ) -> Tensor:
+        return torch.cat([q_head(x, a) for q_head in q_heads], dim=-1)
+
+    def forward(self, x: Tensor, a: Tensor) -> Tensor:
+        return self._forward_heads(self.q_heads, x, a)
+
+    def q_min(self, x: Tensor, a: Tensor, q_indices: Tensor | None = None) -> Tensor:
+        q_values = self.forward(x, a)
+        if q_indices is not None:
+            q_values = q_values.index_select(dim=-1, index=q_indices)
+        return q_values.min(dim=-1, keepdim=True).values
+
+    @torch.no_grad()
+    def target_q_values(self, x: Tensor, a: Tensor) -> Tensor:
+        return self._forward_heads(self.q_heads_target, x, a)
+
+    @torch.no_grad()
+    def target_q_min(
+        self,
+        x: Tensor,
+        a: Tensor,
+        q_indices: Tensor | None = None,
+    ) -> Tensor:
+        q_values = self.target_q_values(x, a)
+        if q_indices is not None:
+            q_values = q_values.index_select(dim=-1, index=q_indices)
+        return q_values.min(dim=-1, keepdim=True).values
+
+    @torch.no_grad()
+    def update_targets(self, tau: float) -> None:
+        for online, target in zip(self.q_heads, self.q_heads_target, strict=True):
             for src_param, dst_param in zip(
                 online.parameters(),
                 target.parameters(),
