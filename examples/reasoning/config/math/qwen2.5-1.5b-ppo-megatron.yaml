@@ -9,9 +9,9 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor: 0-1
-    critic: 2-3
-    rollout: 4-7
+    actor: 0-2
+    critic: 3-5
+    rollout: 6-7
     reward: 7
 
 runner:
@@ -100,7 +100,7 @@ rollout:
   enforce_eager: False         # if False, rollout engine will capture cuda graph, which will take more time to initialize.
   distributed_executor_backend: mp   # ray or mp
   disable_log_stats: False
-  detokenize: True             # Whether to detokenize the output. During RL we actually don't need to detokenize it. Can be set to True for debugging.
+  detokenize: False             # Whether to detokenize the output. During RL we actually don't need to detokenize it. Can be set to True for debugging.
   padding: null               # will be tokenizer.pad_token_id if null. it is used to filter megatron's padding for rollout engine
   eos: null                   # will be tokenizer.eos_token_id if null.
     
@@ -111,7 +111,8 @@ rollout:
     decode_log_interval: 500000 # the interval for SGLang to log the decode time and other stats.
     use_torch_compile: False # enable torch_compile in SGLang for rollout.
     torch_compile_max_bs: 128 # the maximum batch size for torch compile. If the batch size is larger than this, torch compile will not be used.
-
+    disable_overlap_schedule: true
+    
   vllm:
     attention_backend: FLASH_ATTN #[FLASH_ATTN,XFORMERS] for more, see vllm's doc
     enable_chunked_prefill: True  # enable vllm to use chunked_prefill.
@@ -124,9 +125,9 @@ rollout:
   pipeline_parallel_size: 1
   
   validate_weight: False # whether to send all weights at first for weight comparison.
-  validate_weight_first_sync: True
+  validate_weight_first_sync: False
   validate_save_dir: null # the directory to save the weights for comparison. If validate_weight is True, this will be used to save the weights for comparison.
-  print_outputs: True         # whether to print the outputs (token ids, texts, etc.) of rollout engine.
+  print_outputs: False         # whether to print the outputs (token ids, texts, etc.) of rollout engine.
 
   max_running_requests: 64 # the maximum number of running requests in the rollout engine.
   cuda_graph_max_bs: 128 # the maximum batch size for cuda graph. If the batch size is larger than this, cuda graph will not be used.
@@ -136,7 +137,7 @@ data:
   dataset_name: boba
   max_prompt_length: 512
   filter_prompt_by_length: True
-  rollout_batch_size: 256
+  rollout_batch_size: 252
   val_rollout_batch_size: null
   num_workers: 2
   shuffle: True

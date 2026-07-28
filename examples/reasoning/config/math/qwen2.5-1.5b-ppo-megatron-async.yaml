@@ -4,9 +4,9 @@ defaults:
 
 cluster:
   component_placement:
-    actor: 0-1
-    critic: 2-3
-    rollout: 4-7
+    actor: 0-2
+    critic: 3-5
+    rollout: 6-7
     reward: 7
 
 runner:
@@ -34,12 +34,12 @@ rollout:
   return_logprobs: true
   enforce_eager: false
   sglang:
-    disable_overlap_schedule: false
+    disable_overlap_schedule: True
     weight_sync_idle_timeout_s: 300.0
     weight_sync_idle_poll_interval_s: 0.1
-  validate_weight_first_sync: true
-  detokenize: true
-  print_outputs: true
+  validate_weight_first_sync: False
+  detokenize: False
+  print_outputs: False
 
 reward:
   dump_rollouts:
