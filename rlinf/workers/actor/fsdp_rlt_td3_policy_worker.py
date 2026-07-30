@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
 import torch
 
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
+from rlinf.utils import drq
+from rlinf.utils.metric_utils import append_to_dict
+from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import (
     RLTACFSDPPolicy,
     RLTACLossMixin,
@@ -24,14 +28,6 @@ from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import (
 
 class RLTTD3LossMixin(RLTACLossMixin):
     """Ablation-style TD3 actor objective over current RLT replay fields."""
-
-    def _set_critic_requires_grad(self, requires_grad: bool) -> None:
-        if hasattr(self.model, "set_critic_requires_grad"):
-            self.model.set_critic_requires_grad(requires_grad)
-            return
-        for name, param in self.model.named_parameters():
-            if "q_head" in name:
-                param.requires_grad_(requires_grad)
 
     @staticmethod
     def _chunk_delta_loss(
@@ -146,16 +142,16 @@ class RLTTD3LossMixin(RLTACLossMixin):
             log_pi = log_pi.unsqueeze(-1)
         log_pi = log_pi.sum(dim=-1, keepdim=True)
 
-        self._set_critic_requires_grad(False)
-        try:
-            all_qf_pi = self.model(
-                forward_type=ForwardType.SAC_Q,
-                obs=curr_obs,
-                actions=pi,
-                detach_encoder=True,
-            )
-        finally:
-            self._set_critic_requires_grad(True)
+        # Keep the FSDP-wrapped model's parameter trainability stable across
+        # the actor and critic forwards. Dynamically toggling critic
+        # ``requires_grad`` here can leave FSDP post-backward hooks in an
+        # invalid state, while the actor optimizer still excludes critic params.
+        all_qf_pi = self.model(
+            forward_type=ForwardType.SAC_Q,
+            obs=curr_obs,
+            actions=pi,
+            detach_encoder=True,
+        )
 
         num_q_values = all_qf_pi.shape[-1]
         metrics = {
@@ -201,3 +197,121 @@ class RLTTD3LossMixin(RLTACLossMixin):
 
 class RLTTD3FSDPPolicy(RLTTD3LossMixin, RLTACFSDPPolicy):
     """Synchronous RLT TD3 worker using the current RLT rollout data flow."""
+
+    def update_one_epoch(self, train_actor: bool = True):
+        global_batch_size_per_rank = (
+            self.cfg.actor.global_batch_size // self._world_size
+        )
+
+        with self.worker_timer("sample"):
+            global_batch = next(self.buffer_dataloader_iter)
+
+        train_micro_batch_list = split_dict_to_chunk(
+            global_batch,
+            global_batch_size_per_rank // self.cfg.actor.micro_batch_size,
+        )
+
+        for i, batch in enumerate(train_micro_batch_list):
+            batch = put_tensor_device(batch, device=self.device)
+            if self.enable_drq:
+                drq.apply_drq(batch["curr_obs"], pad=4)
+                drq.apply_drq(batch["next_obs"], pad=4)
+            train_micro_batch_list[i] = batch
+
+        self.qf_optimizer.zero_grad()
+        gbs_critic_loss = []
+        all_critic_metrics = {}
+        for batch in train_micro_batch_list:
+            critic_loss, critic_metrics = self.forward_critic(batch)
+            critic_loss = critic_loss / self.gradient_accumulation
+            critic_loss.backward()
+            gbs_critic_loss.append(critic_loss.item() * self.gradient_accumulation)
+            append_to_dict(all_critic_metrics, critic_metrics)
+        all_critic_metrics = {
+            f"critic/{key}": np.mean(value) for key, value in all_critic_metrics.items()
+        }
+        qf_grad_norm = self.model.clip_grad_norm_(
+            max_norm=self.cfg.actor.critic_optim.clip_grad
+        )
+
+        self.qf_optimizer.step()
+        self.qf_lr_scheduler.step()
+
+        metrics_data = {
+            "sac/critic_loss": np.mean(gbs_critic_loss),
+            "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
+            "critic/grad_norm": qf_grad_norm,
+            **all_critic_metrics,
+        }
+
+        if self.update_step % self.critic_actor_ratio == 0 and train_actor:
+            self.optimizer.zero_grad()
+            self.qf_optimizer.zero_grad(set_to_none=True)
+            gbs_actor_loss = []
+            gbs_entropy = []
+            all_actor_metrics = {}
+            for batch in train_micro_batch_list:
+                actor_loss, entropy, q_metrics = self.forward_actor(batch)
+                actor_loss = actor_loss / self.gradient_accumulation
+                actor_loss.backward()
+                gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
+                gbs_entropy.append(entropy.item())
+                append_to_dict(all_actor_metrics, q_metrics)
+            all_actor_metrics = {
+                f"actor/{key}": np.mean(value)
+                for key, value in all_actor_metrics.items()
+            }
+
+            # The TD3 actor objective needs dQ/da, so the critic forward must
+            # remain differentiable w.r.t. the action. Unlike the ablation
+            # worker, we cannot toggle FSDP critic requires_grad dynamically;
+            # clear critic parameter grads instead so actor clipping/stepping
+            # only sees actor parameters.
+            self.qf_optimizer.zero_grad(set_to_none=True)
+            actor_grad_norm = self.model.clip_grad_norm_(
+                max_norm=self.cfg.actor.optim.clip_grad
+            )
+            self.optimizer.step()
+            self.lr_scheduler.step()
+
+            gbs_alpha_loss = [0]
+            alpha_grad_norm = 0
+            if self.alpha_optimizer is not None:
+                self.alpha_optimizer.zero_grad()
+                gbs_alpha_loss = []
+                for batch in train_micro_batch_list:
+                    alpha_loss = self.forward_alpha(batch) / self.gradient_accumulation
+                    alpha_loss.backward()
+                    gbs_alpha_loss.append(
+                        alpha_loss.item() * self.gradient_accumulation
+                    )
+                torch.distributed.all_reduce(
+                    self.entropy_temp.base_alpha.grad, op=torch.distributed.ReduceOp.AVG
+                )
+                alpha_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.entropy_temp.base_alpha,
+                    self.cfg.algorithm.entropy_tuning.optim.clip_grad,
+                )
+                self.alpha_optimizer.step()
+                self.alpha_lr_scheduler.step()
+
+            metrics_data.update(
+                {
+                    "sac/actor_loss": np.mean(gbs_actor_loss),
+                    "sac/alpha_loss": np.mean(gbs_alpha_loss),
+                    "sac/alpha": self.entropy_temp.alpha,
+                    "actor/lr": self.optimizer.param_groups[0]["lr"],
+                    "actor/grad_norm": actor_grad_norm,
+                    "actor/entropy": np.mean(gbs_entropy),
+                    "alpha/grad_norm": alpha_grad_norm,
+                    **all_actor_metrics,
+                }
+            )
+
+        if (
+            self.target_model_initialized
+            and self.update_step % self.cfg.algorithm.get("target_update_freq", 1) == 0
+        ):
+            self.soft_update_target_model()
+
+        return metrics_data
