@@ -238,6 +238,10 @@ class TrajectoryReplayBuffer:
         enable_cache: bool = True,
         cache_size: int = 5,
         sample_window_size: int = 100,
+        swd_enable: bool = False,
+        swd_decay_step: int = 0,
+        swd_min_weight: float = 0.1,
+        swd_preserve_expert_ratio: bool = False,
         auto_save: bool = False,
         auto_save_path: str = "",
         trajectory_format: str = "pt",
@@ -252,6 +256,12 @@ class TrajectoryReplayBuffer:
             cache_size: Maximum number of trajectories to cache in memory
             trajectory_format: Storage format ("pt", "pkl")
             sample_window_size: Number of trajectories to sample from for window cache
+            swd_enable: Whether to use Sample Weight Decay (SWD) sampling.
+            swd_decay_step: Age scale, measured in accepted replay samples.
+            swd_min_weight: Minimum SWD sampling weight for old samples.
+            swd_preserve_expert_ratio: Preserve the expert/non-expert ratio
+                observed in the candidate replay window while applying SWD
+                within each stratum.
             auto_save: Whether to automatically save trajectories to disk
         """
         self.trajectory_format = trajectory_format
@@ -259,6 +269,21 @@ class TrajectoryReplayBuffer:
         self.sample_window_size = sample_window_size
         self.auto_save = auto_save
         self.logger = get_logger()
+
+        self.swd_enable = bool(swd_enable)
+        self.swd_decay_step = int(swd_decay_step)
+        self.swd_min_weight = float(swd_min_weight)
+        self.swd_preserve_expert_ratio = bool(swd_preserve_expert_ratio)
+        if self.swd_decay_step < 0:
+            raise ValueError(
+                f"swd_decay_step must be non-negative, got {self.swd_decay_step}"
+            )
+        if not 0.0 <= self.swd_min_weight <= 1.0:
+            raise ValueError(
+                f"swd_min_weight must be in [0, 1], got {self.swd_min_weight}"
+            )
+        if self.swd_enable and self.swd_decay_step <= 0:
+            raise ValueError("swd_decay_step must be positive when swd_enable=True.")
 
         if not self.auto_save:
             self.logger.warning(
@@ -320,6 +345,11 @@ class TrajectoryReplayBuffer:
         self.size = 0  # Current number of trajectories
         self._total_samples = 0  # Total number of samples across all trajectories
 
+        # SWD logical clock. The clock advances by accepted replay samples,
+        # rather than raw simulator steps or learner updates.
+        self._swd_clock = 0
+        self._last_swd_sample_stats: dict[str, float] = {}
+
         # Random seed
         self.seed = seed
         self.random_generator: Optional[torch.Generator] = None
@@ -365,6 +395,7 @@ class TrajectoryReplayBuffer:
                 "total_samples": self._total_samples,
                 "trajectory_counter": self._trajectory_counter,
                 "seed": self.seed,
+                "swd_clock": self._swd_clock,
             }
             with open(self._get_metadata_path(save_path), "w") as f:
                 json.dump(metadata, f)
@@ -467,6 +498,10 @@ class TrajectoryReplayBuffer:
             else:
                 continue  # Skip empty trajectories
 
+            expert_sample_count = self._expert_sample_count(
+                trajectory, num_samples=num_samples
+            )
+
             # Save trajectory to disk if enabled
             if self.auto_save:
                 # Save asynchronously to reduce I/O stalls
@@ -482,12 +517,17 @@ class TrajectoryReplayBuffer:
 
             # Add to index
             with self._index_lock:
+                swd_insert_start = self._swd_clock
+                self._swd_clock += num_samples
                 trajectory_info = {
                     "num_samples": num_samples,
                     "trajectory_id": trajectory_id,
                     "max_episode_length": trajectory.max_episode_length,
                     "shape": tuple(trajectory_shape),
                     "model_weights_id": model_weights_id,
+                    "swd_insert_start": swd_insert_start,
+                    "swd_insert_end": self._swd_clock,
+                    "expert_sample_count": expert_sample_count,
                 }
                 self._trajectory_index[trajectory_id] = trajectory_info
                 self._trajectory_id_list.append(trajectory_id)
@@ -607,22 +647,19 @@ class TrajectoryReplayBuffer:
         if num_chunks > window_total_samples:
             num_chunks = window_total_samples
 
-        # Sample chunk indices directly from total samples
-        sample_ids = torch.randint(
-            low=0,
-            high=window_total_samples,
-            size=(num_chunks,),
-            generator=self.random_generator,
+        sample_ids_tensor, sampled_weights, candidate_probs = (
+            self._sample_window_indices(
+                window_ids=window_ids,
+                cumulative_ends=cumulative_ends,
+                window_total_samples=window_total_samples,
+                num_chunks=num_chunks,
+            )
         )
-
-        # Convert global sample indices to per-trajectory local indices
-        grouped_indices: dict[str, list[tuple[int, int]]] = {}
         cumulative_ends_tensor = self._window_cache_cumulative_ends_tensor
         if cumulative_ends_tensor is None or cumulative_ends_tensor.numel() == 0:
             return {}
 
-        # Vectorized bucketize to map sample_ids -> trajectory indices
-        sample_ids_tensor = sample_ids.to(dtype=torch.long)
+        # Vectorized bucketize to map sampled global indices to trajectories.
         bucket_indices = torch.bucketize(
             sample_ids_tensor, cumulative_ends_tensor, right=True
         )
@@ -631,15 +668,27 @@ class TrajectoryReplayBuffer:
         )
         local_sample_indices = sample_ids_tensor - starts[bucket_indices]
 
-        for idx_in_batch in range(sample_ids_tensor.numel()):
-            idx = int(bucket_indices[idx_in_batch])
-            if idx >= len(window_ids):
-                continue
-            trajectory_id = window_ids[idx]
-            local_sample_idx = int(local_sample_indices[idx_in_batch])
-            grouped_indices.setdefault(trajectory_id, []).append(
-                (idx_in_batch, local_sample_idx)
-            )
+        self._last_swd_sample_stats = {
+            "swd_sample_age_mean": float(
+                (self._swd_clock - sampled_weights["timestamps"])
+                .to(torch.float32)
+                .mean()
+                .item()
+            ),
+            "swd_sample_weight_mean": float(
+                sampled_weights["weights"].to(torch.float32).mean().item()
+            ),
+            "swd_sample_expert_ratio": float(
+                sampled_weights["expert"].to(torch.float32).mean().item()
+            ),
+            "swd_candidate_expert_ratio": float(
+                sampled_weights["candidate_expert_ratio"]
+            ),
+            "swd_candidate_effective_sample_size": float(
+                candidate_probs.numel()
+                / torch.sum(candidate_probs.square()).clamp_min(1e-12).item()
+            ),
+        }
 
         # Vectorized sampling: use cache buffer directly, load misses and gather once.
         batch = None
@@ -709,6 +758,145 @@ class TrajectoryReplayBuffer:
             )
 
         return batch if batch is not None else {}
+
+    @staticmethod
+    def _expert_sample_count(trajectory: Trajectory, num_samples: int) -> int:
+        """Return the number of expert-marked samples in a trajectory."""
+        flags = getattr(trajectory, "intervene_flags", None)
+        if not isinstance(flags, torch.Tensor) or flags.numel() == 0:
+            return 0
+        if flags.dim() < 2:
+            return int(flags.to(torch.bool).any().item())
+        flattened = flags.reshape(flags.shape[0] * flags.shape[1], -1)
+        if flattened.shape[0] != num_samples:
+            return int(flattened.to(torch.bool).any().item())
+        return int(flattened.to(torch.bool).any(dim=-1).sum().item())
+
+    def _swd_weight(self, timestamps: torch.Tensor) -> torch.Tensor:
+        if not self.swd_enable:
+            return torch.ones_like(timestamps, dtype=torch.float32)
+        age = (self._swd_clock - timestamps).to(torch.float32)
+        return torch.clamp(
+            1.0 - age / float(self.swd_decay_step),
+            min=self.swd_min_weight,
+        )
+
+    def _sample_window_indices(
+        self,
+        *,
+        window_ids: list[int],
+        cumulative_ends: list[int],
+        window_total_samples: int,
+        num_chunks: int,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float], torch.Tensor]:
+        """Sample flattened replay indices using uniform or SWD probabilities."""
+        timestamp_parts = []
+        expert_parts = []
+        for trajectory_id, end in zip(window_ids, cumulative_ends):
+            info = self._trajectory_index[trajectory_id]
+            insert_start = int(
+                info.get(
+                    "swd_insert_start",
+                    end - int(info["num_samples"]),
+                )
+            )
+            num_samples = int(info["num_samples"])
+            timestamp_parts.append(
+                torch.arange(
+                    insert_start,
+                    insert_start + num_samples,
+                    dtype=torch.long,
+                )
+            )
+            expert_count = int(info.get("expert_sample_count", 0))
+            # ManiSkill RLT transition replay stores one sample per trajectory.
+            # For legacy/mixed trajectories, classify the trajectory as expert
+            # when any transition carries an intervention marker.
+            expert_parts.append(
+                torch.full(
+                    (num_samples,),
+                    expert_count > 0,
+                    dtype=torch.bool,
+                )
+            )
+
+        timestamps = torch.cat(timestamp_parts)
+        expert = torch.cat(expert_parts)
+        candidate_expert_ratio = float(expert.to(torch.float32).mean().item())
+
+        if not self.swd_enable:
+            sample_ids = torch.randint(
+                low=0,
+                high=window_total_samples,
+                size=(num_chunks,),
+                generator=self.random_generator,
+            )
+            weights = torch.ones(window_total_samples, dtype=torch.float32)
+            probabilities = weights / weights.sum()
+            return (
+                sample_ids,
+                {
+                    "timestamps": timestamps.index_select(0, sample_ids),
+                    "weights": weights.index_select(0, sample_ids),
+                    "expert": expert.index_select(0, sample_ids),
+                    "candidate_expert_ratio": candidate_expert_ratio,
+                },
+                probabilities,
+            )
+
+        weights = self._swd_weight(timestamps)
+
+        def sample_from_indices(indices: torch.Tensor, count: int) -> torch.Tensor:
+            if count <= 0:
+                return torch.empty(0, dtype=torch.long)
+            if indices.numel() == 0:
+                return torch.empty(0, dtype=torch.long)
+            probabilities = weights.index_select(0, indices)
+            probabilities = probabilities / probabilities.sum().clamp_min(1e-12)
+            selected = torch.multinomial(
+                probabilities,
+                count,
+                replacement=True,
+                generator=self.random_generator,
+            )
+            return indices.index_select(0, selected)
+
+        all_indices = torch.arange(window_total_samples, dtype=torch.long)
+        if self.swd_preserve_expert_ratio and expert.any() and (~expert).any():
+            expert_indices = all_indices[expert]
+            policy_indices = all_indices[~expert]
+            expert_count = int(round(num_chunks * candidate_expert_ratio))
+            expert_count = min(max(expert_count, 0), num_chunks)
+            sample_ids = torch.cat(
+                [
+                    sample_from_indices(expert_indices, expert_count),
+                    sample_from_indices(policy_indices, num_chunks - expert_count),
+                ]
+            )
+            if sample_ids.numel() > 1:
+                permutation = torch.randperm(
+                    sample_ids.numel(), generator=self.random_generator
+                )
+                sample_ids = sample_ids.index_select(0, permutation)
+        else:
+            probabilities = weights / weights.sum().clamp_min(1e-12)
+            sample_ids = torch.multinomial(
+                probabilities,
+                num_chunks,
+                replacement=True,
+                generator=self.random_generator,
+            )
+
+        return (
+            sample_ids,
+            {
+                "timestamps": timestamps.index_select(0, sample_ids),
+                "weights": weights.index_select(0, sample_ids),
+                "expert": expert.index_select(0, sample_ids),
+                "candidate_expert_ratio": candidate_expert_ratio,
+            },
+            weights / weights.sum().clamp_min(1e-12),
+        )
 
     def _flatten_trajectory(self, trajectory: Trajectory) -> dict:
         flat: dict[str, object] = {}
@@ -912,6 +1100,8 @@ class TrajectoryReplayBuffer:
         self.size = 0
         self._total_samples = 0
         self._trajectory_counter = 0
+        self._swd_clock = 0
+        self._last_swd_sample_stats = {}
 
     def get_stats(self) -> dict[str, float]:
         """Get buffer statistics."""
@@ -921,7 +1111,13 @@ class TrajectoryReplayBuffer:
             "cache_size": len(self._flat_trajectory_cache.cache)
             if self._flat_trajectory_cache
             else 0,
+            "swd_enabled": float(self.swd_enable),
+            "swd_clock": float(self._swd_clock),
+            "swd_decay_step": float(self.swd_decay_step),
+            "swd_min_weight": self.swd_min_weight,
+            "swd_preserve_expert_ratio": float(self.swd_preserve_expert_ratio),
         }
+        stats.update(self._last_swd_sample_stats)
         return stats
 
     def save_checkpoint(self, save_path: str):
@@ -1026,6 +1222,7 @@ class TrajectoryReplayBuffer:
         if "seed" in metadata:
             self.seed = metadata["seed"]
             self._init_random_generator(self.seed)
+        self._swd_clock = int(metadata.get("swd_clock", 0))
 
         # Load trajectory index and uuid list from save_path
         index_path = os.path.join(load_path, "trajectory_index.json")
@@ -1102,6 +1299,14 @@ class TrajectoryReplayBuffer:
             self.size = metadata.get("size", 0)
             self._total_samples = metadata.get("total_samples", 0)
             self._trajectory_counter = metadata.get("trajectory_counter", 0)
+
+        if self._swd_clock <= 0 and self._trajectory_index:
+            self._swd_clock = max(
+                int(info.get("swd_insert_end", 0))
+                for info in self._trajectory_index.values()
+            )
+        if self._swd_clock <= 0:
+            self._swd_clock = self._total_samples
 
         if self._flat_trajectory_cache is not None:
             self._flat_trajectory_cache.clear()

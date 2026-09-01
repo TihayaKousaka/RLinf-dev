@@ -179,11 +179,16 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             )
         else:
             auto_save_path = os.path.join(auto_save_path, f"rank_{self._rank}")
+        swd_cfg = self.cfg.algorithm.replay_buffer.get("swd", {}) or {}
         self.replay_buffer = TrajectoryReplayBuffer(
             seed=seed,
             enable_cache=self.cfg.algorithm.replay_buffer.enable_cache,
             cache_size=self.cfg.algorithm.replay_buffer.cache_size,
             sample_window_size=self.cfg.algorithm.replay_buffer.sample_window_size,
+            swd_enable=bool(swd_cfg.get("enable", False)),
+            swd_decay_step=int(swd_cfg.get("decay_step", 0)),
+            swd_min_weight=float(swd_cfg.get("min_weight", 0.1)),
+            swd_preserve_expert_ratio=bool(swd_cfg.get("preserve_expert_ratio", False)),
             auto_save=self.cfg.algorithm.replay_buffer.get("auto_save", False),
             auto_save_path=auto_save_path,
             trajectory_format=self.cfg.algorithm.replay_buffer.get(
