@@ -93,7 +93,7 @@ class EnvWorker(Worker):
         self.stage_num = self.cfg.rollout.pipeline_stage_num
         self.enable_rlt = OmegaConf.select(
             self.cfg, "algorithm.loss_type", default=""
-        ) in {"rlt_ac", "rlt_td3"}
+        ) in {"rlt_ac", "rlt_td3", "rlt_warpsac_scalar"}
         # Optional lossless compression of image observations before they are
         # sent to the rollout workers. Disabled unless `env.obs_compression`
         # is present and `enable: true`. Compression runs inside a custom
