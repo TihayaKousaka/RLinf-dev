@@ -101,7 +101,7 @@ class DirectGaussianActor(nn.Module):
 
 
 class QNetwork(nn.Module):
-    """Single TD3 Q network: (x, action_chunk) -> scalar."""
+    """Single TD3 Q network producing a scalar or categorical logits."""
 
     def __init__(
         self,
@@ -109,11 +109,12 @@ class QNetwork(nn.Module):
         action_chunk_dim: int,
         hidden_dim: int = 256,
         num_hidden_layers: int = 2,
+        output_dim: int = 1,
     ) -> None:
         super().__init__()
         self.mlp = _make_td3_mlp(
             input_dim=int(state_dim) + int(action_chunk_dim),
-            output_dim=1,
+            output_dim=output_dim,
             hidden_dim=int(hidden_dim),
             num_hidden_layers=int(num_hidden_layers),
         )
@@ -123,7 +124,7 @@ class QNetwork(nn.Module):
 
 
 class TwinQCritic(nn.Module):
-    """Twin-Q critic matching the ablation TD3 MLP structure."""
+    """Twin-Q critic with scalar or fixed-support categorical outputs."""
 
     def __init__(
         self,
@@ -131,23 +132,60 @@ class TwinQCritic(nn.Module):
         action_chunk_dim: int,
         hidden_dim: int = 256,
         num_hidden_layers: int = 2,
+        distribution_type: str = "scalar",
+        num_bins: int = 101,
+        v_min: float = -5.0,
+        v_max: float = 5.0,
     ) -> None:
         super().__init__()
+        if distribution_type not in {"scalar", "categorical"}:
+            raise ValueError(
+                "TwinQCritic distribution_type must be 'scalar' or 'categorical', "
+                f"got {distribution_type!r}."
+            )
+        if distribution_type == "categorical" and num_bins < 2:
+            raise ValueError("Categorical TwinQCritic requires num_bins >= 2.")
+        if distribution_type == "categorical" and v_min >= v_max:
+            raise ValueError("Categorical TwinQCritic requires v_min < v_max.")
+        self.distribution_type = distribution_type
+        self.num_bins = int(num_bins) if distribution_type == "categorical" else 1
+        support = (
+            torch.linspace(float(v_min), float(v_max), self.num_bins)
+            if distribution_type == "categorical"
+            else torch.empty(0)
+        )
+        # The support is fully determined by config. Keeping it non-persistent
+        # preserves scalar Stage-2/3 checkpoint compatibility.
+        self.register_buffer("support", support, persistent=False)
         self.q1 = QNetwork(
             state_dim=state_dim,
             action_chunk_dim=action_chunk_dim,
             hidden_dim=hidden_dim,
             num_hidden_layers=num_hidden_layers,
+            output_dim=self.num_bins,
         )
         self.q2 = QNetwork(
             state_dim=state_dim,
             action_chunk_dim=action_chunk_dim,
             hidden_dim=hidden_dim,
             num_hidden_layers=num_hidden_layers,
+            output_dim=self.num_bins,
         )
 
-    def forward(self, x: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return torch.cat([self.q1(x, action), self.q2(x, action)], dim=-1)
+    def forward(
+        self,
+        x: torch.Tensor,
+        action: torch.Tensor,
+        *,
+        return_logits: bool = False,
+    ) -> torch.Tensor:
+        outputs = torch.stack([self.q1(x, action), self.q2(x, action)], dim=1)
+        if self.distribution_type == "scalar":
+            return outputs.squeeze(-1)
+        if return_logits:
+            return outputs
+        support = self.support.to(device=outputs.device, dtype=outputs.dtype)
+        return torch.sum(torch.softmax(outputs, dim=-1) * support, dim=-1)
 
 
 class RLTTD3MLPPolicy(nn.Module, BasePolicy):
@@ -171,6 +209,10 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         mlp_num_hidden_layers: int = 2,
         actor_noise_sigma: float = 0.1,
         ref_action_dropout: float = 0.0,
+        q_distribution_type: str = "scalar",
+        q_num_bins: int = 101,
+        q_v_min: float = -5.0,
+        q_v_max: float = 5.0,
     ) -> None:
         super().__init__()
         if not add_q_head:
@@ -217,6 +259,10 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
             action_chunk_dim=self.flat_action_dim,
             hidden_dim=mlp_hidden_dim,
             num_hidden_layers=mlp_num_hidden_layers,
+            distribution_type=q_distribution_type,
+            num_bins=q_num_bins,
+            v_min=q_v_min,
+            v_max=q_v_max,
         )
 
     def preprocess_env_obs(self, env_obs: dict) -> dict:
@@ -305,12 +351,17 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         actions: torch.Tensor,
         shared_feature=None,
         detach_encoder: bool = False,
+        return_logits: bool = False,
     ) -> torch.Tensor:
         del shared_feature
         state = self._state(obs)
         if detach_encoder:
             state = state.detach()
-        return self.q_head(state, self._flatten_batch(actions))
+        return self.q_head(
+            state,
+            self._flatten_batch(actions),
+            return_logits=return_logits,
+        )
 
     def crossq_q_forward(
         self,

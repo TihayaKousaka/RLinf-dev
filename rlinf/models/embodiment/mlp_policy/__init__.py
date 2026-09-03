@@ -51,6 +51,10 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             mlp_num_hidden_layers=cfg.get("mlp_num_hidden_layers", 2),
             actor_noise_sigma=cfg.get("actor_noise_sigma", 0.1),
             ref_action_dropout=cfg.get("ref_action_dropout", 0.0),
+            q_distribution_type=cfg.get("q_distribution_type", "scalar"),
+            q_num_bins=cfg.get("q_num_bins", 101),
+            q_v_min=cfg.get("q_v_min", -5.0),
+            q_v_max=cfg.get("q_v_max", 5.0),
         )
     elif iql_config is not None:
         model = IQLMLPPolicy(
