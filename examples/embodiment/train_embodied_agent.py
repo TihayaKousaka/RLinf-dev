@@ -83,6 +83,16 @@ def main(cfg) -> None:
         )
 
         actor_worker_cls = RLTWarpSACScalarFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_warpsac":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for rlt_warpsac."
+            )
+        from rlinf.workers.actor.fsdp_rlt_warpsac_scalar_policy_worker import (
+            RLTWarpSACFSDPPolicy,
+        )
+
+        actor_worker_cls = RLTWarpSACFSDPPolicy
     elif cfg.algorithm.loss_type == "rlt_warpsac_categorical":
         if use_training_pipeline:
             raise ValueError(

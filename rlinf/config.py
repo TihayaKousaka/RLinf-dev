@@ -94,6 +94,9 @@ SupportedModel.RLT_MLP_POLICY = SupportedModel.register("rlt_mlp_policy", force=
 SupportedModel.RLT_TD3_MLP_POLICY = SupportedModel.register(
     "rlt_td3_mlp_policy", force=True
 )
+SupportedModel.RLT_WARPSAC_MLP_POLICY = SupportedModel.register(
+    "rlt_warpsac_mlp_policy", force=True
+)
 SupportedModel.GR00T = SupportedModel.register("gr00t", force=True)
 SupportedModel.DEXBOTIC_PI = SupportedModel.register("dexbotic_pi", force=True)
 SupportedModel.DEXBOTIC_DM0 = SupportedModel.register("dexbotic_dm0", force=True)
@@ -135,6 +138,7 @@ EMBODIED_MODEL = set(
         SupportedModel.MLP_POLICY,
         SupportedModel.RLT_MLP_POLICY,
         SupportedModel.RLT_TD3_MLP_POLICY,
+        SupportedModel.RLT_WARPSAC_MLP_POLICY,
         SupportedModel.GR00T,
         SupportedModel.DEXBOTIC_PI,
         SupportedModel.DEXBOTIC_DM0,

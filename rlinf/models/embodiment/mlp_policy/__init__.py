@@ -21,6 +21,9 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
     from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
     from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolicy
+    from rlinf.models.embodiment.mlp_policy.rlt_warpsac_mlp_policy import (
+        RLTWarpSACMLPPolicy,
+    )
 
     iql_config = cfg.get("iql_config", None)
     if cfg.model_type == "rlt_mlp_policy":
@@ -55,6 +58,25 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             q_num_bins=cfg.get("q_num_bins", 101),
             q_v_min=cfg.get("q_v_min", -5.0),
             q_v_max=cfg.get("q_v_max", 5.0),
+        )
+    elif cfg.model_type == "rlt_warpsac_mlp_policy":
+        model = RLTWarpSACMLPPolicy(
+            z_dim=cfg.z_dim,
+            proprio_dim=cfg.proprio_dim,
+            action_dim=cfg.action_dim,
+            num_action_chunks=cfg.num_action_chunks,
+            ref_num_action_chunks=cfg.get(
+                "ref_num_action_chunks", cfg.num_action_chunks
+            ),
+            add_q_head=cfg.get("add_q_head", True),
+            q_head_type=cfg.get("q_head_type", "default"),
+            actor_hidden_dim=cfg.get("actor_hidden_dim", 128),
+            actor_num_blocks=cfg.get("actor_num_blocks", 2),
+            critic_hidden_dim=cfg.get("critic_hidden_dim", 256),
+            critic_num_blocks=cfg.get("critic_num_blocks", 2),
+            log_std_min=cfg.get("log_std_min", -10.0),
+            log_std_max=cfg.get("log_std_max", 2.0),
+            use_bias=cfg.get("use_bias", False),
         )
     elif iql_config is not None:
         model = IQLMLPPolicy(

@@ -98,6 +98,7 @@ class EnvWorker(Worker):
             "rlt_td3",
             "rlt_warpsac_scalar",
             "rlt_warpsac_categorical",
+            "rlt_warpsac",
         }
         # Optional lossless compression of image observations before they are
         # sent to the rollout workers. Disabled unless `env.obs_compression`
