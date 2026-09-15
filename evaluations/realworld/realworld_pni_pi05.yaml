@@ -35,6 +35,7 @@ cluster:
         configs:
           - robot_ip: 172.16.0.2
             node_rank: 1
+            camera_serials: ["142122070838", "141722078696"]
 
 runner:
   task_type: embodied_eval
@@ -62,7 +63,7 @@ env:
     ignore_terminations: False
     keyboard_reward_wrapper: null
     #no_gripper: True
-    use_spacemouse: False
+    teleop: none
     max_episode_steps: 720
     max_steps_per_rollout_epoch: 720
 
@@ -78,7 +79,6 @@ env:
       #target_ee_pose: [ 0.51940382 , 0.00320347 , 0.08353503 ,-3.12509237 ,-0.02129001, -0.06500843]
       target_ee_pose: [ 0.42765757 , 0.04908242 , 0.08702683 , 3.13345897, -0.00438286 ,-0.02514858]
 
-      camera_serials: ["142122070838","141722078696"]
       is_dummy: False
       use_dense_reward: False
       max_num_steps: ${env.eval.max_episode_steps}

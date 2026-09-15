@@ -14,13 +14,11 @@
 
 import torch
 
-from rlinf.models.embodiment.openpi_rlinf.openpi_action_model import (
-    OpenPiPytorchActionModel,
-)
-from rlinf.models.embodiment.openpi_rlinf.utils.rlt_utils import OpenPiPytorchRLTConfig
+from rlinf.models.embodiment.openpi_rlinf.pi0 import Pi0
+from rlinf.models.embodiment.openpi_rlinf.rlt_config import OpenPiPytorchRLTConfig
 
 
-class _PrefixPoolStub(OpenPiPytorchActionModel):
+class _PrefixPoolStub(Pi0):
     def __init__(self, rlt_cfg: OpenPiPytorchRLTConfig):
         torch.nn.Module.__init__(self)
         self.rlt_cfg = rlt_cfg

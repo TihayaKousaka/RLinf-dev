@@ -138,7 +138,9 @@ class EmbodiedRunner:
                 print(f"Logging error: {e}")
                 continue
 
-    def _should_print_metrics_table(self, displayed_step: int, start_step: int = 0) -> bool:
+    def _should_print_metrics_table(
+        self, displayed_step: int, start_step: int = 0
+    ) -> bool:
         """Whether to render the Metric Table for this Global Step.
 
         ``runner.log_interval`` defaults to 1 (every step). The first step after

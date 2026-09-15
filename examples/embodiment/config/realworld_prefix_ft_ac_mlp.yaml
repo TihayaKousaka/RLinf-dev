@@ -163,11 +163,10 @@ env:
     keyboard_reward_wrapper: rlt_policy_switch
     max_episode_steps: 240
     max_steps_per_rollout_epoch: 240
-    use_spacemouse: True
-    use_gello: False
-    use_pico: False
-    no_gripper: True
+    teleop: spacemouse
+    no_gripper: False
     override_cfg:
+      no_gripper: True
       is_dummy: False
       use_dense_reward: False
       reward_scale: 1.0
@@ -187,11 +186,10 @@ env:
     max_steps_per_rollout_epoch: 240
     use_fixed_reset_state_ids: False
     group_size: 1
-    use_spacemouse: True
-    use_gello: False
-    use_pico: False
-    no_gripper: True
+    teleop: spacemouse
+    no_gripper: False
     override_cfg:
+      no_gripper: True
       is_dummy: False
       use_dense_reward: False
       reward_scale: 1.0
@@ -246,10 +244,10 @@ rollout:
       norm_stats_path: "/home/infini/liyanghao/model/pi05_base/pi05_base/realworld_franka_pni"
     openpi:
       task: eval
-      config_name: "pi05_realworld"
-      num_images_in_input: 2
+      config_name: "pi05_franka_state"
+      num_images_in_input: 1
       action_chunk: ${actor.model.ref_num_action_chunks}
-      action_horizon: ${rollout.prefix_feature_model.num_action_chunks}
+      action_horizon: 20
       action_env_dim: ${rollout.prefix_feature_model.action_dim}
       num_steps: 4
       model_action_dim: 32

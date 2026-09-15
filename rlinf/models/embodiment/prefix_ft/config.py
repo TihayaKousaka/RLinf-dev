@@ -47,8 +47,7 @@ def resolve_prefix_pool(
         pool = str(prefix_pool)
         if pool not in PREFIX_POOL_MODES:
             raise ValueError(
-                "prefix.pool must be one of "
-                f"{PREFIX_POOL_MODES}, got {pool!r}."
+                f"prefix.pool must be one of {PREFIX_POOL_MODES}, got {pool!r}."
             )
         return pool
     if stage2_z_source == "vlm_prefix":
@@ -109,7 +108,9 @@ def build_state_history_buffer(cfg: Any) -> StateHistoryBuffer:
     hist = OmegaConf.select(cfg, "algorithm.state_history", default=None)
     enable = bool(OmegaConf.select(hist, "enable", default=False)) if hist else False
     steps = int(OmegaConf.select(hist, "steps", default=4) or 4) if hist else 4
-    pad = str(OmegaConf.select(hist, "pad", default="zero") or "zero") if hist else "zero"
+    pad = (
+        str(OmegaConf.select(hist, "pad", default="zero") or "zero") if hist else "zero"
+    )
     proprio_dim = OmegaConf.select(cfg, "actor.model.proprio_dim", default=None)
     if proprio_dim is None:
         proprio_dim = OmegaConf.select(cfg, "rollout.model.proprio_dim", default=0)

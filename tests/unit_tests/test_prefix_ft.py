@@ -16,10 +16,8 @@ import torch
 from omegaconf import OmegaConf
 
 from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
-from rlinf.models.embodiment.openpi_rlinf.openpi_action_model import (
-    OpenPiPytorchActionModel,
-)
-from rlinf.models.embodiment.openpi_rlinf.utils.rlt_utils import (
+from rlinf.models.embodiment.openpi_rlinf.pi0 import Pi0
+from rlinf.models.embodiment.openpi_rlinf.rlt_config import (
     OpenPiPytorchRLTConfig,
     build_rlt_config,
 )
@@ -40,7 +38,7 @@ from rlinf.models.embodiment.prefix_ft.protocol import (
 from rlinf.models.embodiment.prefix_ft.types import PREFIX_OBS_KEYS
 
 
-class _PrefixPoolStub(OpenPiPytorchActionModel):
+class _PrefixPoolStub(Pi0):
     def __init__(self, rlt_cfg: OpenPiPytorchRLTConfig):
         torch.nn.Module.__init__(self)
         self.rlt_cfg = rlt_cfg
@@ -87,7 +85,9 @@ def test_resolve_prefix_pool_backward_compat():
     assert resolve_prefix_pool(use_rlt=True) == "rlt_token"
     assert resolve_prefix_pool(use_rlt=False) == "masked_mean"
     assert (
-        resolve_prefix_pool(use_rlt=True, stage2_z_source="vlm_prefix", rlt_use_mask=True)
+        resolve_prefix_pool(
+            use_rlt=True, stage2_z_source="vlm_prefix", rlt_use_mask=True
+        )
         == "masked_mean"
     )
     assert resolve_prefix_pool(use_rlt=True, prefix_pool="last") == "last"
@@ -109,9 +109,7 @@ def test_feature_model_config_alias():
     legacy = OmegaConf.create(
         {"rollout": {"rlt_feature_model": {"model_type": "openpi_rlinf"}}}
     )
-    assert (
-        resolve_prefix_feature_model_config(legacy).model_type == "openpi_rlinf"
-    )
+    assert resolve_prefix_feature_model_config(legacy).model_type == "openpi_rlinf"
     modern = OmegaConf.create(
         {"rollout": {"prefix_feature_model": {"model_type": "openpi"}}}
     )
@@ -197,9 +195,7 @@ def test_history_enabled_concat_reset_and_pad():
 
     repeat = StateHistoryBuffer(enable=True, steps=4, proprio_dim=2, pad="repeat")
     fused_repeat = repeat.fuse(obs)
-    torch.testing.assert_close(
-        fused_repeat["z_rl"][0, 8:], torch.ones(8)
-    )
+    torch.testing.assert_close(fused_repeat["z_rl"][0, 8:], torch.ones(8))
 
 
 def test_history_peek_does_not_commit():

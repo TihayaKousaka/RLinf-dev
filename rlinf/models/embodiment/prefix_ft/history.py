@@ -113,7 +113,9 @@ class StateHistoryBuffer:
             "ref_chunk": obs["ref_chunk"],
         }
 
-    def _allocate(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> None:
+    def _allocate(
+        self, batch_size: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
         self._buffer = torch.zeros(
             batch_size, self.steps, self.proprio_dim, device=device, dtype=dtype
         )
