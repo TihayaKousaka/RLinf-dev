@@ -21,6 +21,12 @@ from rlinf.algorithms.rlt.route import (
     SimulatorRLTRoute,
     build_rlt_route,
 )
+from rlinf.algorithms.rlt.routing_gate import (
+    RoutingDecision,
+    RoutingGate,
+    build_routing_gate,
+    register_routing_gate,
+)
 from rlinf.algorithms.rlt.transition import (
     use_maniskill_rlt_env,
     use_simulator_transition_replay,
@@ -29,12 +35,16 @@ from rlinf.algorithms.rlt.transition import (
 __all__ = [
     "RLTRoute",
     "RLTRouteContext",
+    "RoutingDecision",
+    "RoutingGate",
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
     "build_expert_model_config",
     "build_rlt_route",
+    "build_routing_gate",
     "predict_prefix_actions",
     "predict_rlt_actions",
+    "register_routing_gate",
     "use_maniskill_rlt_env",
     "use_simulator_transition_replay",
 ]
