@@ -50,7 +50,7 @@ runner:
   val_check_interval: -1
   save_interval: -1
   resume_dir: null
-  # Weights are loaded via rollout.model.model_path (openpi_rlinf full_weights.pt).
+  # Weights are loaded via rollout.model.model_path (openpi full_weights.pt).
   ckpt_path: null
 
 env:
@@ -97,9 +97,9 @@ rollout:
   enable_cuda_graph: False
   is_lora: False
   model:
-    model_type: "openpi_rlinf"
+    model_type: "openpi"
     precision: bf16
-    # SFT openpi_rlinf full wrapper (.pt with model.* keys); loaded by get_model.
+    # SFT openpi full wrapper (.pt with model.* keys); loaded by get_model.
     model_path: /home/infini/liyanghao/model/pi05_rlinf_sft_0817.pt
     num_action_chunks: 10
     action_dim: 7

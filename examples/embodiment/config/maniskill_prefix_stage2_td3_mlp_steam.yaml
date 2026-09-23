@@ -249,7 +249,7 @@ rollout:
     lora_rank: 32
 
   prefix_feature_model:
-    model_type: "openpi_rlinf"
+    model_type: "openpi"
     model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs/20260804-16:28:10-maniskill_rlt_stage1_sft_openpi_pi05/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_1000/actor"
     precision: bf16
     num_action_chunks: 10
@@ -318,7 +318,7 @@ rollout:
 
   # The simulation expert is invoked by the learned actor-to-expert gate.
   expert_model:
-    model_type: "openpi_rlinf"
+    model_type: "openpi"
     model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs/20260804-16:28:10-maniskill_rlt_stage1_sft_openpi_pi05/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_3000/actor"
     precision: bf16
     num_action_chunks: 10

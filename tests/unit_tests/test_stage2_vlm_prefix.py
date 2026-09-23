@@ -14,8 +14,8 @@
 
 import torch
 
-from rlinf.models.embodiment.openpi_rlinf.pi0 import Pi0
-from rlinf.models.embodiment.openpi_rlinf.rlt_config import OpenPiPytorchRLTConfig
+from rlinf.models.embodiment.openpi.pi0 import Pi0
+from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
 
 
 class _PrefixPoolStub(Pi0):

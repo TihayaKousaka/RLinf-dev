@@ -226,7 +226,7 @@ rollout:
   # z_rl (masked-mean VLM prefix), proprio, ref_chunk.
   # Stage1 RL-token checkpoint is not required; point at ordinary SFT / base weights.
   prefix_feature_model:
-    model_type: "openpi_rlinf"
+    model_type: "openpi"
     precision: bf16
     is_lora: False
     num_action_chunks: 10
@@ -234,7 +234,7 @@ rollout:
     num_steps: 4
     add_value_head: False
     # Ordinary SFT or π0.5 base checkpoint. Do not require rlt_module weights.
-    model_path: "/home/infini/liyanghao/model/openpi_rlinf_pni.pt"
+    model_path: "/home/infini/liyanghao/model/openpi_pni.pt"
     prefix:
       pool: masked_mean
       image_only: false

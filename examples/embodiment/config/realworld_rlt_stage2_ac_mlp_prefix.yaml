@@ -218,7 +218,7 @@ rollout:
   # Frozen Stage1 pi0.5. Rollout converts raw env obs into Stage2 dict keys
   # z_rl (here: mean-pooled VLM prefix), proprio, ref_chunk.
   rlt_feature_model:
-    model_type: "openpi_rlinf"
+    model_type: "openpi"
     precision: bf16
     is_lora: False
     num_action_chunks: 10

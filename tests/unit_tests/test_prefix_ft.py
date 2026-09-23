@@ -16,8 +16,8 @@ import torch
 from omegaconf import OmegaConf
 
 from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
-from rlinf.models.embodiment.openpi_rlinf.pi0 import Pi0
-from rlinf.models.embodiment.openpi_rlinf.rlt_config import (
+from rlinf.models.embodiment.openpi.pi0 import Pi0
+from rlinf.models.embodiment.openpi.rlt_config import (
     OpenPiPytorchRLTConfig,
     build_rlt_config,
 )
@@ -107,9 +107,9 @@ def test_build_rlt_config_reads_parent_prefix_pool():
 
 def test_feature_model_config_alias():
     legacy = OmegaConf.create(
-        {"rollout": {"rlt_feature_model": {"model_type": "openpi_rlinf"}}}
+        {"rollout": {"rlt_feature_model": {"model_type": "openpi"}}}
     )
-    assert resolve_prefix_feature_model_config(legacy).model_type == "openpi_rlinf"
+    assert resolve_prefix_feature_model_config(legacy).model_type == "openpi"
     modern = OmegaConf.create(
         {"rollout": {"prefix_feature_model": {"model_type": "openpi"}}}
     )
@@ -124,7 +124,7 @@ def test_prefix_ac_loss_alias():
     assert not is_prefix_ac_loss("embodied_sac")
 
 
-def test_openpi_rlinf_pool_does_not_require_rlt():
+def test_openpi_pool_does_not_require_rlt():
     pooled = _PrefixPoolStub(
         OpenPiPytorchRLTConfig(use_rlt=False, prefix_pool="masked_mean")
     )
@@ -136,9 +136,7 @@ def test_openpi_rlinf_pool_does_not_require_rlt():
 
 
 def test_official_openpi_config_resolves_pool_without_use_rlt():
-    from rlinf.models.embodiment.openpi.openpi_action_model import OpenPi0Config
-
-    cfg = OpenPi0Config(use_rlt=False, prefix_pool="masked_mean")
+    cfg = OpenPiPytorchRLTConfig(use_rlt=False, prefix_pool="masked_mean")
     assert (
         resolve_prefix_pool(use_rlt=cfg.use_rlt, prefix_pool=cfg.prefix_pool)
         == "masked_mean"
