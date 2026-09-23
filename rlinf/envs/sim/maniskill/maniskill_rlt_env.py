@@ -1021,6 +1021,7 @@ class ManiskillRLTEnv(ManiskillEnv):
         self._reset_rlt_switch(options.get("env_idx"))
         self._show_goal_site_visual()
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
+        self._attach_rlt_switch_info(infos)
         return extracted_obs, infos
 
     def step(

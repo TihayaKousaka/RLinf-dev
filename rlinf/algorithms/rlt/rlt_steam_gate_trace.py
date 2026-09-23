@@ -33,6 +33,14 @@ RLT_GATE_TRACE_KEYS = (
     "success_current",
 )
 
+_REQUIRED_RLT_GATE_TRACE_KEYS = (
+    "rlt_gate_score_ready",
+    "rlt_gate_score_min",
+    "rlt_gate_actor_active",
+    "rlt_oracle_expert_active",
+    "geometry_critical_active",
+)
+
 
 class RLTGateTraceWriter:
     """Write scalar gate diagnostics without changing replay-buffer storage."""
@@ -102,6 +110,16 @@ class RLTGateTraceWriter:
             "num_steps": steps,
             "batch_size": batch,
         }
+        missing_keys = [
+            key
+            for key in _REQUIRED_RLT_GATE_TRACE_KEYS
+            if not isinstance(forward_inputs.get(key), torch.Tensor)
+        ]
+        if missing_keys:
+            raise ValueError(
+                "Gate trace is missing required tensors "
+                f"{missing_keys}; verify reset and step diagnostics are aligned."
+            )
         for key in RLT_GATE_TRACE_KEYS:
             value = forward_inputs.get(key)
             if isinstance(value, torch.Tensor):

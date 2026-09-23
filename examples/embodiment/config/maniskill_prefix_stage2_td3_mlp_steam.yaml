@@ -93,7 +93,7 @@ algorithm:
 
   # Save the STEAM decisions and geometry-only labels used by both calibrators.
   rlt_gate_calibration:
-    enable: True
+    enable: False
     save_path: ${runner.logger.log_path}/${runner.logger.experiment_name}/gate_calibration
     chunk_size: 10
     max_trace_files: 0
@@ -250,7 +250,7 @@ rollout:
 
   prefix_feature_model:
     model_type: "openpi_rlinf"
-    model_path: "/path/to/ordinary_sft_or_base_checkpoint"
+    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs/20260804-16:28:10-maniskill_rlt_stage1_sft_openpi_pi05/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_1000/actor"
     precision: bf16
     num_action_chunks: 10
     action_dim: ${actor.model.action_dim}
@@ -264,7 +264,7 @@ rollout:
     openpi_data:
       repo_id: "maniskill_peginsertionside_joint"
       default_prompt: "insert the peg in the hole"
-      norm_stats_path: "/path/to/maniskill_peginsertionside_joint/norm_stats.json"
+      norm_stats_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/maniskill_peginsertionside_joint/norm_stats.json"
     openpi:
       task: eval
       config_name: "pi05_rlt_maniskill_joint"
@@ -291,10 +291,11 @@ rollout:
     actor_switch:
       enable: True
       mode: active
-      phase_head_path: "/path/to/steam_phase_head.pt"
-      # Keep frozen STEAM features in calibration traces so the phase head can
-      # be recalibrated without changing the active routing path.
-      collect_phase_features: True
+      phase_head_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs/20260918-10:02:32-maniskill_prefix_stage2_td3_mlp_steam/maniskill_prefix_stage2_td3_mlp_steam/steam_phase_head.pt"
+      enter_threshold: 0.941209
+      patience_chunks: 1
+      # Enable only while collecting traces for phase-head calibration.
+      collect_phase_features: False
       # By default the gate reads the calibrated threshold and patience from
       # this checkpoint. Set these fields explicitly only for an ablation.
     chunk_size: 10
@@ -306,19 +307,19 @@ rollout:
       enable: True
       # Balanced profile calibrated from actor-only shadow traces.
       mode: active
-      warmup_chunks: 8
-      patience_chunks: 3
-      enter_threshold: -0.236502
+      warmup_chunks: 4
+      patience_chunks: 6
+      enter_threshold: -0.611351
       latch_until_done: True
     model:
       model_type: "steam_value_model"
-      model_path: "/path/to/steam_value_model/checkpoints/global_step_<step>/actor"
+      model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs/steam_sft/rlt_steam_value_model_sft-20260917-08:54:50/rlt_steam_value_model_sft/checkpoints/global_step_5000/actor"
       precision: bf16
 
   # The simulation expert is invoked by the learned actor-to-expert gate.
   expert_model:
     model_type: "openpi_rlinf"
-    model_path: "/path/to/expert_model/checkpoints/global_step_<step>/actor"
+    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/tests/RLinf-dev/logs/20260804-16:28:10-maniskill_rlt_stage1_sft_openpi_pi05/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_3000/actor"
     precision: bf16
     num_action_chunks: 10
     action_dim: 8
