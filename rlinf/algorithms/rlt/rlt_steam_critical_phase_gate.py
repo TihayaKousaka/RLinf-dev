@@ -23,21 +23,12 @@ import torch
 
 from rlinf.algorithms.rlt.rlt_steam_phase_head import SteamPhaseHead
 from rlinf.algorithms.rlt.routing_gate import (
+    RLT_GATE_INFO_KEYS,
     RoutingDecision,
     register_routing_gate,
 )
 from rlinf.data.datasets.steam import BinaryPairDataCollator
 from rlinf.data.datasets.steam.pair_dataset import _to_uint8_hwc
-
-RLT_GATE_INFO_KEYS = (
-    "rlt_gate_entered",
-    "rlt_gate_entry_step",
-    "rlt_gate_score_ready",
-    "rlt_gate_score_min",
-    "rlt_gate_actor_active",
-    "rlt_route_expert_entered",
-    "rlt_route_expert_entry_step",
-)
 
 
 @dataclass

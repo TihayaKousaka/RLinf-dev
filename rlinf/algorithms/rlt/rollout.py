@@ -30,7 +30,10 @@ def _dones_mask(dones: Any) -> torch.Tensor | None:
         return None
     if not torch.is_tensor(dones):
         dones = torch.as_tensor(dones)
-    return dones.to(dtype=torch.bool).reshape(-1)
+    dones = dones.to(dtype=torch.bool)
+    if dones.ndim <= 1:
+        return dones.reshape(-1)
+    return dones.reshape(dones.shape[0], -1).any(dim=-1)
 
 
 def _append_rlt_transition_obs(

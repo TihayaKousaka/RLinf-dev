@@ -57,9 +57,6 @@ transformer，而是用池化后的 VLM prefix 作为 ``z_rl``。
    * - 阶段
      - 配置
      - 作用
-   * - Franka Prefix-FT
-     - ``examples/embodiment/config/realworld_prefix_ft_ac_mlp.yaml``
-     - 真机默认路径：冻结 π₀.₅，对 VLM prefix 做 masked-mean 池化，训练 AC MLP。不需要 Stage 1 token 检查点。
    * - Franka Stage 1（可选）
      - ``examples/sft/config/realworld_rlt_stage1_sft_openpi_pi05.yaml``
      - 在 Franka 示范数据上联合 SFT π₀.₅ 和 RLT token transformer。

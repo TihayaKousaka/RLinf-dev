@@ -20,7 +20,6 @@ from rlinf.envs.real.registry import register_tasks
 
 from .base import FrankaEnv, FrankaEnvConfig, FrankaRobotState
 from .bin_relocation import FrankaBinRelocationEnv
-from .block_peg_insertion import BlockPegInsertionEnv
 from .bottle import BottleEnv
 from .dex_pnp import DexpnpEnv
 from .dual_base import DualFrankaEnv, DualFrankaEnvConfig
@@ -34,7 +33,6 @@ TASKS: dict[str, type] = {
     "PegInsertionEnv-v1": PegInsertionEnv,
     "FrankaBinRelocationEnv-v1": FrankaBinRelocationEnv,
     "BottleEnv-v1": BottleEnv,
-    "BlockPegInsertionEnv-v1": BlockPegInsertionEnv,
     "DexpnpEnv-v1": DexpnpEnv,
     "DualFrankaJointEnv-v1": DualFrankaJointEnv,
     "DualFrankaTCPEnv-v1": DualFrankaTCPEnv,
@@ -45,7 +43,6 @@ _ENTRY_POINTS = register_tasks(__name__, globals(), TASKS)
 __all__ = [
     "TASKS",
     "BottleEnv",
-    "BlockPegInsertionEnv",
     "DexpnpEnv",
     "DualFrankaEnv",
     "DualFrankaJointEnv",

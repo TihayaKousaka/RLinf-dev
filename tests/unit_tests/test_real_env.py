@@ -1153,7 +1153,6 @@ _ROBOTS = ("franka", "dosw1", "gim_arm", "xsquare")
 EXPECTED_IDS = {
     "FrankaEnv-v1",
     "PegInsertionEnv-v1",
-    "BlockPegInsertionEnv-v1",
     "FrankaBinRelocationEnv-v1",
     "BottleEnv-v1",
     "DexpnpEnv-v1",
@@ -1222,7 +1221,6 @@ def test_pose_math_is_not_filed_under_a_robot():
 def test_task_configs_state_only_their_compliance_deltas():
     from rlinf.envs.real.franka.base import COMPLIANCE_DEFAULTS
     from rlinf.envs.real.franka.bin_relocation import BinEnvConfig
-    from rlinf.envs.real.franka.block_peg_insertion import BlockPegInsertionConfig
     from rlinf.envs.real.franka.bottle import BottleConfig
     from rlinf.envs.real.franka.dex_pnp import DexpnpConfig
     from rlinf.envs.real.franka.peg_insertion import PegInsertionConfig
@@ -1233,27 +1231,14 @@ def test_task_configs_state_only_their_compliance_deltas():
             for key, value in cls().compliance_param.items()
             if COMPLIANCE_DEFAULTS[key] != value
         }
-        for cls in (
-            PegInsertionConfig,
-            BlockPegInsertionConfig,
-            BottleConfig,
-            BinEnvConfig,
-            DexpnpConfig,
-        )
+        for cls in (PegInsertionConfig, BottleConfig, BinEnvConfig, DexpnpConfig)
     }
 
     # Every task receives the complete gain set after defaults are applied.
-    for cls in (
-        PegInsertionConfig,
-        BlockPegInsertionConfig,
-        BottleConfig,
-        BinEnvConfig,
-        DexpnpConfig,
-    ):
+    for cls in (PegInsertionConfig, BottleConfig, BinEnvConfig, DexpnpConfig):
         assert set(cls().compliance_param) == set(COMPLIANCE_DEFAULTS)
     assert {name: len(keys) for name, keys in deltas.items()} == {
         "PegInsertionConfig": 1,
-        "BlockPegInsertionConfig": 1,
         "BottleConfig": 8,
         "BinEnvConfig": 11,
         "DexpnpConfig": 6,
@@ -1630,12 +1615,7 @@ def test_every_registered_task_builds_through_its_entry_point():
         "use_relative_frame": False,
     }
     built = []
-    for env_id in (
-        "FrankaEnv-v1",
-        "PegInsertionEnv-v1",
-        "BlockPegInsertionEnv-v1",
-        "BottleEnv-v1",
-    ):
+    for env_id in ("FrankaEnv-v1", "PegInsertionEnv-v1", "BottleEnv-v1"):
         env = gym.make(
             env_id,
             override_cfg={
@@ -1652,12 +1632,7 @@ def test_every_registered_task_builds_through_its_entry_point():
         env.close()
         built.append(env_id)
 
-    assert built == [
-        "FrankaEnv-v1",
-        "PegInsertionEnv-v1",
-        "BlockPegInsertionEnv-v1",
-        "BottleEnv-v1",
-    ]
+    assert built == ["FrankaEnv-v1", "PegInsertionEnv-v1", "BottleEnv-v1"]
 
 
 def test_converted_pose_stays_inside_the_observation_space():

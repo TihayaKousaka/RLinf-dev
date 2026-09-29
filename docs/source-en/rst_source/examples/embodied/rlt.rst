@@ -65,9 +65,6 @@ Provided Configuration Files
    * - Stage
      - Config
      - Purpose
-   * - Franka Prefix-FT
-     - ``examples/embodiment/config/realworld_prefix_ft_ac_mlp.yaml``
-     - Default real-robot path: freeze π₀.₅, masked-mean pool the VLM prefix, train the AC MLP. No Stage 1 token checkpoint.
    * - Franka Stage 1 (optional)
      - ``examples/sft/config/realworld_rlt_stage1_sft_openpi_pi05.yaml``
      - SFT π₀.₅ together with the RLT token transformer on Franka demonstrations.

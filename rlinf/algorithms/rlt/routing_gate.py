@@ -19,6 +19,16 @@ from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
 import torch
 
+RLT_GATE_INFO_KEYS = (
+    "rlt_gate_entered",
+    "rlt_gate_entry_step",
+    "rlt_gate_score_ready",
+    "rlt_gate_score_min",
+    "rlt_gate_actor_active",
+    "rlt_route_expert_entered",
+    "rlt_route_expert_entry_step",
+)
+
 
 @dataclass
 class RoutingDecision:
@@ -138,6 +148,7 @@ def build_routing_gate(
 
 
 __all__ = [
+    "RLT_GATE_INFO_KEYS",
     "RoutingDecision",
     "RoutingGate",
     "build_routing_gate",

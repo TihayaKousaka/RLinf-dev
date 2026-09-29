@@ -99,10 +99,6 @@ class RealWorldEnv(gym.Env):
             if isinstance(allocated, RobotInfo):
                 robot_info = allocated
         override_cfg = copy.deepcopy(self.override_cfg)
-        # Propagate top-level teleop flag into the task config so go_to_rest
-        # can skip gripper open/close when no_gripper=True.
-        if "no_gripper" not in override_cfg:
-            override_cfg["no_gripper"] = bool(self.cfg.get("no_gripper", False))
         # A worker that was handed this class by value never ran the package
         # import that registers the task ids.
         from rlinf.envs.real import load_tasks
