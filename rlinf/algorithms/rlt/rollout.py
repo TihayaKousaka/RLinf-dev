@@ -21,8 +21,8 @@ from rlinf.algorithms.rlt.rlt_steam_phase_head import RLT_PHASE_FEATURE_KEY
 from rlinf.algorithms.rlt.route import RLTRoute, RLTRouteContext
 from rlinf.algorithms.rlt.routing_gate import RoutingGate
 from rlinf.algorithms.rlt.transition import RLT_OBS_KEYS, RLT_TRANSITION_PREFIX
-from rlinf.models.embodiment.prefix_ft.history import StateHistoryBuffer
-from rlinf.models.embodiment.prefix_ft.protocol import extract_prefix_obs
+from rlinf.models.embodiment.prefix.contracts import extract_prefix_obs
+from rlinf.models.embodiment.prefix.history import StateHistoryBuffer
 
 
 def _dones_mask(dones: Any) -> torch.Tensor | None:
@@ -52,7 +52,7 @@ def _append_rlt_transition_obs(
         result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = transition_obs[key]
 
 
-def predict_rlt_actions(
+def predict_prefix_actions(
     *,
     policy_model: Any,
     feature_model: Any,
@@ -152,6 +152,3 @@ def predict_rlt_actions(
         )
 
     return actions, result
-
-
-predict_prefix_actions = predict_rlt_actions

@@ -12,20 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TypedDict
-
-import torch
-
-PREFIX_OBS_KEYS = ("z_rl", "proprio", "ref_chunk")
+from dataclasses import dataclass
+from typing import Literal
 
 
-class PrefixObs(TypedDict):
-    """Frozen-VLA observation consumed by Prefix-FT / RLT heads.
+@dataclass(frozen=True)
+class PrefixAlgorithmRequirements:
+    """Head capabilities required by an off-policy algorithm component."""
 
-    ``z_rl`` is the pooled prefix (or fused prefix || state history). Replay
-    keeps this key name for backward compatibility with ``rlt_ac``.
-    """
-
-    z_rl: torch.Tensor
-    proprio: torch.Tensor
-    ref_chunk: torch.Tensor
+    actor_distribution: Literal["stochastic", "deterministic"]
+    min_q_heads: int = 2
+    requires_action_noise: bool = False
+    uses_target_actor: bool = False

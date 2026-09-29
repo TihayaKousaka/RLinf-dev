@@ -16,17 +16,11 @@ from typing import Literal
 
 import torch
 
-from rlinf.models.embodiment.prefix_ft.types import PrefixObs
+from rlinf.models.embodiment.prefix.types import PrefixObs
 
 
 class StateHistoryBuffer:
-    """Per-env ring buffer of proprio at PrefixObs / decision rate.
-
-    Disabled by default: ``fuse`` is identity and ``extra_z_dim`` is 0.
-    When enabled:
-
-        fused_z = cat(z_rl, s_{t-K+1}, ..., s_t)   # last slot is current
-    """
+    """Maintain per-environment proprio history at the policy decision rate."""
 
     def __init__(
         self,
@@ -35,7 +29,7 @@ class StateHistoryBuffer:
         steps: int = 4,
         proprio_dim: int = 0,
         pad: Literal["zero", "repeat"] = "zero",
-    ):
+    ) -> None:
         if steps < 1:
             raise ValueError(f"state_history.steps must be >= 1, got {steps}.")
         if pad not in ("zero", "repeat"):
@@ -51,7 +45,8 @@ class StateHistoryBuffer:
 
     @property
     def extra_z_dim(self) -> int:
-        return 0 if not self.enabled else self.steps * self.proprio_dim
+        """Return the feature width appended to ``z_rl``."""
+        return self.steps * self.proprio_dim if self.enabled else 0
 
     def reset(
         self,
@@ -60,11 +55,11 @@ class StateHistoryBuffer:
         dtype: torch.dtype | None = None,
         mask: torch.Tensor | None = None,
     ) -> None:
-        """Clear the ring (full batch or the done subset)."""
+        """Clear all history or only environments selected by ``mask``."""
         if not self.enabled:
             return
         if mask is not None:
-            if self._buffer is None:
+            if self._buffer is None or self._seen is None:
                 return
             done = mask.to(device=self._buffer.device, dtype=torch.bool).reshape(-1)
             if done.numel() != self._buffer.shape[0]:
@@ -83,15 +78,7 @@ class StateHistoryBuffer:
         self._allocate(batch_size, device, dtype)
 
     def fuse(self, obs: PrefixObs, *, commit: bool = True) -> PrefixObs:
-        """If disabled, return ``obs`` unchanged.
-
-        If enabled, append ``obs['proprio']`` and replace ``z_rl`` with the
-        fused vector. ``proprio`` and ``ref_chunk`` are unchanged.
-
-        ``commit=False`` peeks the fused vector without mutating the ring
-        (used for ``final_obs`` / next_obs so the next decision does not
-        double-push the same proprio).
-        """
+        """Append state history to ``z_rl`` and optionally advance the buffer."""
         if not self.enabled:
             return obs
 
@@ -105,8 +92,8 @@ class StateHistoryBuffer:
 
         batch_size = proprio.shape[0]
         self._ensure_buffer(batch_size, proprio.device, proprio.dtype)
-        hist = self._next_history(proprio, commit=commit)
-        fused = torch.cat([z_rl, hist.reshape(batch_size, -1)], dim=-1)
+        history = self._next_history(proprio, commit=commit)
+        fused = torch.cat([z_rl, history.reshape(batch_size, -1)], dim=-1)
         return {
             "z_rl": fused,
             "proprio": obs["proprio"],
@@ -114,18 +101,29 @@ class StateHistoryBuffer:
         }
 
     def _allocate(
-        self, batch_size: int, device: torch.device, dtype: torch.dtype
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> None:
         self._buffer = torch.zeros(
-            batch_size, self.steps, self.proprio_dim, device=device, dtype=dtype
+            batch_size,
+            self.steps,
+            self.proprio_dim,
+            device=device,
+            dtype=dtype,
         )
         self._seen = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     def _ensure_buffer(
-        self, batch_size: int, device: torch.device, dtype: torch.dtype
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> None:
         if (
             self._buffer is None
+            or self._seen is None
             or self._buffer.shape[0] != batch_size
             or self._buffer.shape[-1] != self.proprio_dim
         ):
@@ -136,6 +134,8 @@ class StateHistoryBuffer:
             self._seen = self._seen.to(device=device)
 
     def _next_history(self, proprio: torch.Tensor, *, commit: bool) -> torch.Tensor:
+        if self._buffer is None or self._seen is None:
+            raise RuntimeError("State history must be allocated before it is updated.")
         first = ~self._seen
         rolled = torch.roll(self._buffer, shifts=-1, dims=1)
         rolled[:, -1] = proprio

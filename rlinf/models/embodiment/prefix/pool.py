@@ -27,11 +27,7 @@ def pool_prefix(
     *,
     mode: PrefixPoolMode = "masked_mean",
 ) -> torch.Tensor:
-    """Pool prefix hidden states ``[B, T, D]`` to a flat feature ``[B, D]``.
-
-    ``mode="rlt_token"`` is not handled here; adapters call the RLT encoder
-    instead.
-    """
+    """Pool prefix hidden states ``[B, T, D]`` into features ``[B, D]``."""
     if hidden.ndim != 3:
         raise ValueError(
             f"pool_prefix expects hidden of shape [B, T, D], got {tuple(hidden.shape)}."

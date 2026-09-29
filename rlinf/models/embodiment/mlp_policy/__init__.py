@@ -19,50 +19,9 @@ from omegaconf import DictConfig
 def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     from rlinf.models.embodiment.mlp_policy.iql_mlp_policy import IQLMLPPolicy
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
-    from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
-    from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolicy
 
     iql_config = cfg.get("iql_config", None)
-    if cfg.model_type == "rlt_mlp_policy":
-        from rlinf.models.embodiment.prefix_ft.config import extra_z_dim_from_cfg
-
-        z_dim = int(cfg.z_dim)
-        if not cfg.get("_prefix_z_dim_expanded", False):
-            z_dim += extra_z_dim_from_cfg(cfg)
-        model = RLTMLPPolicy(
-            z_dim=z_dim,
-            proprio_dim=cfg.proprio_dim,
-            action_dim=cfg.action_dim,
-            num_action_chunks=cfg.num_action_chunks,
-            ref_num_action_chunks=cfg.get(
-                "ref_num_action_chunks", cfg.num_action_chunks
-            ),
-            add_q_head=cfg.get("add_q_head", True),
-            q_head_type=cfg.get("q_head_type", "default"),
-            fixed_std=cfg.get("fixed_std", 0.002),
-        )
-    elif cfg.model_type == "rlt_td3_mlp_policy":
-        from rlinf.models.embodiment.prefix_ft.config import extra_z_dim_from_cfg
-
-        z_dim = int(cfg.z_dim)
-        if not cfg.get("_prefix_z_dim_expanded", False):
-            z_dim += extra_z_dim_from_cfg(cfg)
-        model = RLTTD3MLPPolicy(
-            z_dim=z_dim,
-            proprio_dim=cfg.proprio_dim,
-            action_dim=cfg.action_dim,
-            num_action_chunks=cfg.num_action_chunks,
-            ref_num_action_chunks=cfg.get(
-                "ref_num_action_chunks", cfg.num_action_chunks
-            ),
-            add_q_head=cfg.get("add_q_head", True),
-            q_head_type=cfg.get("q_head_type", "default"),
-            mlp_hidden_dim=cfg.get("mlp_hidden_dim", 256),
-            mlp_num_hidden_layers=cfg.get("mlp_num_hidden_layers", 2),
-            actor_noise_sigma=cfg.get("actor_noise_sigma", 0.1),
-            ref_action_dropout=cfg.get("ref_action_dropout", 0.0),
-        )
-    elif iql_config is not None:
+    if iql_config is not None:
         model = IQLMLPPolicy(
             cfg.obs_dim,
             cfg.action_dim,

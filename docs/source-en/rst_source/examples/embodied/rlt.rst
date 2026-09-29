@@ -8,9 +8,10 @@ training is optional and only required when ``prefix.pool: rlt_token``.
 
 **RL Token: Bootstrapping Online RL with Vision-Language-Action Models** is the
 paper recipe that trains a compact token transformer before the same actor-critic.
-In RLinf configs and code that workflow is abbreviated as **RLT**. ``loss_type:
-prefix_ac`` is an alias of ``rlt_ac``; the critic/actor losses, keyboard ``b``
-switch, and replay path are unchanged.
+In RLinf configs and code that workflow is abbreviated as **RLT**. Stage 2 uses
+one prefix off-policy engine: ``algorithm.loss_type: prefix_off_policy`` selects
+the shared worker, while ``algorithm.name`` selects AC or TD3 independently of
+the actor and critic heads.
 
 The checked-in examples target Franka peg insertion and the ManiSkill
 ``PegInsertionSideWideClearance-v1`` joint-control simulation. The pipeline is
@@ -37,7 +38,7 @@ skips the token transformer and uses a pooled VLM prefix as ``z_rl``.
    .. grid-item-card:: Compact head
       :text-align: center
 
-      Off-policy actor-critic MLP
+      Registered actor and critic heads
 
    .. grid-item-card:: State
       :text-align: center
@@ -82,6 +83,9 @@ Provided Configuration Files
    * - ManiSkill Stage 2 (TD3)
      - ``examples/embodiment/config/maniskill_rlt_stage2_td3_mlp.yaml``
      - Run the simulated TD3-MLP variant with the same frozen Stage 1 feature model and replay route.
+   * - ManiSkill Stage 2 (STEAM + TD3)
+     - ``examples/embodiment/config/maniskill_prefix_stage2_td3_mlp_steam.yaml``
+     - Combine the TD3 algorithm and pluggable MLP heads with STEAM rollout routing.
 
 Installation
 ------------
@@ -210,14 +214,49 @@ Stage 2 feature-model config. ``openpi_data`` belongs under ``actor.model``.
 Stage 2: Train the Actor-Critic Policy
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The compact head is the same for Prefix-FT and RL token: freeze the VLA feature
-model and train only the MLP actor and critic. Prefix-FT takes
-``rollout.prefix_feature_model`` (or the ``rlt_feature_model`` alias) and pools
-the VLM prefix; the token path still uses a Stage 1 ``rlt_module`` checkpoint.
+The compact policy is the same for Prefix-FT and RL token: freeze the VLA
+feature model and train only the actor and critic heads. Both paths configure
+the frozen model through ``rollout.prefix_feature_model`` and produce the same
+``{z_rl, proprio, ref_chunk}`` input contract. Prefix-FT pools the VLM prefix
+from a base or SFT checkpoint; the token path loads a Stage 1 ``rlt_module``
+checkpoint and emits the learned token feature.
 
 .. note::
 
    The current Stage 2 implementation is not standard maximum-entropy SAC.
+
+Compose the Algorithm and Heads
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Stage 2 composes the update rule and network heads as separate registered
+components. Set ``algorithm.name`` to ``ac`` or ``td3``. Then select the actor
+and critic implementations through ``actor.model.actor_head.name`` and
+``actor.model.critic_head.name``. The shared ``prefix_policy`` model and
+``prefix_off_policy`` worker do not branch on a specific AC or TD3 model type.
+
+The built-in AC configuration combines ``fixed_std_mlp`` with
+``multi_q_mlp``. The TD3 configuration combines ``deterministic_mlp`` with
+``twin_q_mlp``. New algorithms register through
+``register_prefix_off_policy_algorithm``; new heads register through
+``register_prefix_actor`` or ``register_prefix_critic``. This keeps a new
+update rule independent from the MLP architecture it consumes.
+
+Each registered head also declares the behavior that algorithms depend on.
+AC requires a stochastic actor and at least two Q estimates; TD3 requires a
+deterministic actor with action-noise support and at least two Q estimates.
+Configuration validation rejects an incompatible combination before workers
+are launched. CrossQ support and FSDP wrapping come from head metadata instead
+of head-name checks or YAML references to concrete Python classes.
+
+The model implementation lives under ``rlinf.models.embodiment.prefix``. The
+algorithm registry remains under ``rlinf.algorithms.prefix_off_policy``, while
+RLT replay conversion and update scheduling stay in ``rlinf.algorithms.rlt``.
+The shared worker connects these components to the existing SAC/FSDP runtime;
+it does not own their model, replay, or scheduling rules.
+
+STEAM is a rollout routing component configured under ``rollout.routing_gate``.
+It decides whether the base VLA, Stage 2 actor, or expert supplies an action,
+but it does not select the learning algorithm or construct either MLP head.
 
 During rollout:
 
@@ -266,7 +305,8 @@ Important Stage 2 fields:
 
    # examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml
    algorithm:
-     loss_type: rlt_ac
+     loss_type: prefix_off_policy
+     name: ac
      q_weight: 0.1
      bc_weight: 5
      reference_dropout_prob: 0.5
@@ -283,7 +323,7 @@ Important Stage 2 fields:
        action_dim: ${actor.model.action_dim}
        num_action_chunks: ${actor.model.num_action_chunks}
        ref_num_action_chunks: ${actor.model.ref_num_action_chunks}
-     rlt_feature_model:
+     prefix_feature_model:
        model_type: "openpi"
        precision: bf16
        is_lora: False
@@ -304,8 +344,8 @@ Important Stage 2 fields:
          # / num_action_chunks, which is the env-executed (RLT) window.
          action_horizon: 20
          action_chunk: ${actor.model.ref_num_action_chunks}
-         action_env_dim: ${rollout.rlt_feature_model.action_dim}
-         num_steps: ${rollout.rlt_feature_model.num_steps}
+         action_env_dim: ${rollout.prefix_feature_model.action_dim}
+         num_steps: ${rollout.prefix_feature_model.num_steps}
          model_action_dim: 32
          paligemma_variant: "gemma_2b"
          action_expert_variant: "gemma_300m"
@@ -319,12 +359,17 @@ Important Stage 2 fields:
 
    actor:
      model:
-       model_type: "rlt_mlp_policy"
+       model_type: "prefix_policy"
        precision: fp32
-       add_value_head: False
-       add_q_head: True
-       q_head_type: "default"
-       fixed_std: 0.002
+       actor_head:
+         name: fixed_std_mlp
+         hidden_dims: [256, 256, 256]
+         activation: tanh
+         fixed_std: 0.002
+       critic_head:
+         name: multi_q_mlp
+         hidden_dims: [256, 256, 256]
+         num_q_heads: 2
        is_lora: False
        z_dim: 2048
        proprio_dim: 19
@@ -375,7 +420,7 @@ Then launch collection:
 After collection, place the LeRobot dataset on the training node and compute
 normalization statistics for the RLT OpenPI dataconfig. ``repo_id`` should
 match ``actor.openpi_data.repo_id`` and
-``rollout.rlt_feature_model.openpi_data.repo_id`` in the Stage 1 / Stage 2
+``rollout.prefix_feature_model.openpi_data.repo_id`` in the Stage 1 / Stage 2
 configs:
 
 .. code:: bash
@@ -419,7 +464,7 @@ The saved checkpoint directory should look like:
 
    logs/<run-name>/checkpoints/global_step_<step>/actor
 
-Use this ``actor`` directory as ``rollout.rlt_feature_model.model_path`` in Stage 2.
+Use this ``actor`` directory as ``rollout.prefix_feature_model.model_path`` in Stage 2.
 Do not put the Stage 1 checkpoint under ``rollout.model.model_path`` or
 ``actor.model.model_path``; those fields do not load the Stage 1 feature model.
 
@@ -433,7 +478,7 @@ Edit the Stage 2 config:
    rollout:
      model:
        model_path: null
-     rlt_feature_model:
+     prefix_feature_model:
        model_path: /path/to/stage1/checkpoint/actor
        openpi_data:
          repo_id: "realworld_peg_insertion_rlt_stage1"
@@ -551,7 +596,7 @@ When you compute normalization statistics, keep ``--config-name`` and
 
 .. warning::
 
-   The Stage 1 checkpoint, Stage 2 ``rollout.rlt_feature_model``, and OpenPI
+   The Stage 1 checkpoint, Stage 2 ``rollout.prefix_feature_model``, and OpenPI
    assets must use the same ``norm_stats.json``. If the SFT base policy and
    Stage 2 load stats from different ``repo_id`` directories, the scale of VLA
    reference actions shifts. Set ``openpi_data.norm_stats_path`` to that ``norm_stats.json`` when you need an explicit path.
@@ -592,7 +637,7 @@ The saved FSDP checkpoint usually looks like:
    logs/<run-name>/checkpoints/global_step_<step>/actor
 
 Point this ``actor`` directory directly at
-``rollout.rlt_feature_model.model_path`` in Stage 2, for example
+``rollout.prefix_feature_model.model_path`` in Stage 2, for example
 ``/path/to/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor``.
 
 Stage 2: Run ManiSkill RLT Actor-Critic
@@ -618,7 +663,7 @@ Edit the Stage 1 checkpoint in
          trigger_mode: auto
 
    rollout:
-     rlt_feature_model:
+     prefix_feature_model:
        model_path: /path/to/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor
        openpi_data:
          repo_id: maniskill_peginsertionside_joint
@@ -648,8 +693,21 @@ This variant is currently configured only for ManiSkill simulation. It keeps
 the frozen Stage 1 features and transition replay path, while replacing the
 Stage 2 policy and update objective with a direct TD3 actor and twin-Q critic.
 
+To combine the same TD3 components with STEAM, set the feature, phase-head,
+value-model, and expert checkpoint paths in
+``maniskill_prefix_stage2_td3_mlp_steam.yaml``, then launch:
+
+.. code:: bash
+
+   bash examples/embodiment/run_embodiment.sh maniskill_prefix_stage2_td3_mlp_steam
+
+This configuration keeps ``algorithm.name: td3``, ``deterministic_mlp``, and
+``twin_q_mlp`` unchanged. ``rollout.routing_gate.type: steam`` adds base-to-actor
+and actor-to-expert routing around that learner without introducing a separate
+TD3 worker or policy class.
+
 This config starts actor, rollout, and ManiSkill env workers. The rollout side
-freezes ``rollout.rlt_feature_model`` and only synchronizes the Stage 2 MLP
+freezes ``rollout.prefix_feature_model`` and only synchronizes the Stage 2 MLP
 actor. Before ``ready_for_online``, the ManiSkill route executes the VLA
 ``ref_chunk``. After ``algorithm.rlt_schedule.warmup_post_collect_updates``,
 the actor can take over in the automatic critical phase.
@@ -739,9 +797,9 @@ rollout; eval rollout runs without expert takeover and measures the learned acto
 Replay Buffer Behavior
 ----------------------
 
-For ``loss_type: rlt_ac``, the replay buffer does not store raw image
-observations as the RL state. The rollout worker returns RLT features, and the
-learner side stores those features as transitions:
+For ``loss_type: prefix_off_policy``, the replay buffer does not store raw image
+observations as the RL state. The rollout worker returns prefix features, and
+the learner side stores those features as transitions:
 
 .. code:: text
 
@@ -823,21 +881,24 @@ Practical Notes
   ``config_name``, ``action_dim``, ``proprio_dim``, ``ref_num_action_chunks``,
   and ``z_dim`` must agree. To keep the full raw state, use
   ``state_indices: []``.
-- ``rollout.prefix_feature_model`` (alias: ``rollout.rlt_feature_model``) is the
-  frozen VLA. For Prefix-FT point it at an ordinary SFT or π₀.₅ base checkpoint
-  with ``openpi.use_rlt: false`` and ``prefix.pool: masked_mean``. For the RL-token
-  path, point it at the Stage 1 FSDP ``actor`` directory and keep ``use_rlt: True``.
-- ``actor.model`` is the compact MLP updated by the actor-critic worker.
+- ``rollout.prefix_feature_model`` is the frozen VLA for both feature paths.
+  For Prefix-FT, point it at an ordinary SFT or π₀.₅ base checkpoint with
+  ``openpi.use_rlt: false`` and ``prefix.pool: masked_mean``. For RL token,
+  point it at the Stage 1 FSDP ``actor`` directory with ``use_rlt: True``.
+- ``actor.model`` is the compact ``prefix_policy`` updated by the shared
+  prefix off-policy worker.
   ``actor.model.z_dim`` is the VLA prefix width (2048 for paligemma). Set
-  ``algorithm.state_history.enable: true`` only if you want K-step proprio
+  ``actor.model.state_history.enable: true`` only if you want K-step proprio
   concatenated onto ``z_rl``; the MLP input width expands automatically.
-- ``loss_type: prefix_ac`` is an alias of ``rlt_ac``.
+- ``algorithm.loss_type: prefix_off_policy`` selects the common runtime.
+  ``algorithm.name`` selects AC or TD3; ``actor_head.name`` and
+  ``critic_head.name`` select the MLP components independently.
 - ``rollout.model`` is the synced Stage 2 MLP copy on rollout workers. Keep
   ``rollout.model.model_path: null`` for scratch Stage 2 training; use
   ``runner.resume_dir`` to resume a Stage 2 run or ``runner.ckpt_path`` to load
   a single Stage 2 weight file.
 - Do not configure ``actor.model.model_path`` for Stage 1. ``actor.model`` only
-  describes the Stage 2 MLP input/output shape and Q-head settings.
+  describes the Stage 2 input/output shape and registered head settings.
 - Stage 2 MLP settings are defined inline under ``actor.model`` in each Stage 2
   YAML, not in a separate model defaults file.
 - ``keyboard_reward_wrapper: rlt_policy_switch`` is only needed for
@@ -848,7 +909,12 @@ Practical Notes
   When you add a new simulator dataconfig, check the dataset ``state``, OpenPI
   transform, and Stage 2 ``proprio_dim`` together.
 - Stage 1, Stage 2, and checkpoint assets must load ``norm_stats.json`` from the same data semantics and ``repo_id``. Prefer setting ``openpi_data.norm_stats_path`` explicitly so Stage 1 runs still work when the checkpoint does not embed norm stats.
-- ``rollout.rlt_feature_model.model_path`` should point to the Stage 1 FSDP ``actor`` directory, for example ``.../checkpoints/global_step_<step>/actor``. Do not convert the RLT Stage 1 checkpoint to a bare ``model.safetensors`` for Stage 2, because the RLT token module is stored in the full wrapper checkpoint.
+- ``rollout.prefix_feature_model.model_path`` should point to the Stage 1 FSDP ``actor`` directory, for example ``.../checkpoints/global_step_<step>/actor``. Do not convert the RLT Stage 1 checkpoint to a bare ``model.safetensors`` for Stage 2, because the RLT token module is stored in the full wrapper checkpoint.
+- To add an algorithm, register a ``PrefixOffPolicyAlgorithm`` implementation
+  and select it with ``algorithm.name``. To add an MLP implementation, register
+  a ``PrefixActorHead`` or ``PrefixCriticHead`` and select its name under
+  ``actor.model``; neither extension requires a new worker.
 - To add a simulator example, create a simulator environment config, keep
-  ``loss_type: rlt_ac`` and ``rollout.rlt_feature_model``, and replace the
-  real-robot phase-switching logic with simulator-appropriate behavior.
+  ``loss_type: prefix_off_policy`` and the appropriate frozen feature-model
+  block, then replace the real-robot phase-switching logic with
+  simulator-appropriate routing.

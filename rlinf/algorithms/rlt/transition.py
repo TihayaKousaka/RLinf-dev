@@ -65,7 +65,7 @@ def extract_rlt_obs_from_forward_inputs(
     if missing:
         raise ValueError(
             f"Missing RLT forward_inputs keys: {missing}. Ensure "
-            "rollout.rlt_feature_model is configured and the rollout worker "
+            "rollout.prefix_feature_model is configured and the rollout worker "
             "populates RLT features."
         )
     return copy_dict_tensor(

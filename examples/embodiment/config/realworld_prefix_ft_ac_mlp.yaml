@@ -71,10 +71,10 @@ algorithm:
   agg_q: min
   actor_agg_q: q1
   enable_drq: False
-  q_head_type: ${actor.model.q_head_type}
 
   adv_type: embodied_sac
-  loss_type: prefix_ac
+  loss_type: prefix_off_policy
+  name: ac
   loss_agg_func: "token-mean"
 
   # Realworld critical phase ≈ 20–30 transitions / press-'b' segment.
@@ -125,14 +125,6 @@ algorithm:
       lr: 3.0e-4
       lr_scheduler: torch_constant
       clip_grad: 10.0
-
-  # Optional decision-step proprio history concatenated onto z_rl.
-  # Default off: same single-frame prefix path already validated on the robot.
-  state_history:
-    enable: false
-    steps: 4
-    pad: zero
-    source: proprio
 
   replay_buffer:
     enable_cache: True
@@ -279,14 +271,19 @@ actor:
   # Do not add actor.model.model_path for Stage1; this block only defines the
   # Stage2 head. Stage2 resume/load is controlled by runner.resume_dir/ckpt_path.
   model:
-    model_type: "rlt_mlp_policy"
+    model_type: "prefix_policy"
 
     # RLT AC defaults to fp32 for Q-learning and target-update stability.
     precision: fp32
-    add_value_head: False
-    add_q_head: True
-    q_head_type: "default"
-    fixed_std: 0.002
+    actor_head:
+      name: fixed_std_mlp
+      hidden_dims: [256, 256, 256]
+      activation: tanh
+      fixed_std: 0.002
+    critic_head:
+      name: multi_q_mlp
+      hidden_dims: [256, 256, 256]
+      num_q_heads: 2
     is_lora: False
 
     # z_rl slot = masked-mean pi0.5 VLM prefix (paligemma width 2048).
@@ -294,6 +291,10 @@ actor:
     # input automatically; do not add K * proprio_dim here.
     z_dim: 2048
     proprio_dim: 19
+    state_history:
+      enable: false
+      steps: 4
+      pad: zero
     action_dim: 7
     num_action_chunks: 10
     ref_num_action_chunks: 10

@@ -161,10 +161,6 @@ class Pi0Eval(EnvIO, Pi0):
             "ref_chunk": ref_chunk.to(device=z_rl.device, dtype=torch.float32),
         }
 
-    def extract_rlt_obs(self, env_obs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Backward-compatible alias for :meth:`extract_prefix_obs`."""
-        return self.extract_prefix_obs(env_obs)
-
     def _sample_actions_from_prefix_cache(
         self,
         observation,

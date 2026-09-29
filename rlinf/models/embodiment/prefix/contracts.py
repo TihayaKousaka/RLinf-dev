@@ -16,38 +16,24 @@ from typing import Any, Protocol, runtime_checkable
 
 import torch
 
-from rlinf.models.embodiment.prefix_ft.types import PrefixObs
+from rlinf.models.embodiment.prefix.types import PrefixObs
 
 
 @runtime_checkable
 class PrefixFeatureModel(Protocol):
-    """Frozen VLA that exposes a pooled prefix plus reference actions."""
+    """Frozen model that extracts prefix features and reference actions."""
 
     @property
     def z_dim(self) -> int: ...
 
     def extract_prefix_obs(self, env_obs: dict[str, Any]) -> PrefixObs:
-        """One forward: prefix hidden -> pool -> z; sample ref_chunk; slice proprio."""
+        """Extract the compact observation consumed by the trainable policy."""
         ...
 
 
-def extract_prefix_obs(feature_model: Any, env_obs: dict[str, Any]) -> PrefixObs:
-    """Call ``extract_prefix_obs`` if present, else the ``extract_rlt_obs`` alias."""
-    extractor = getattr(feature_model, "extract_prefix_obs", None)
-    if callable(extractor):
-        return extractor(env_obs)
-    extractor = getattr(feature_model, "extract_rlt_obs", None)
-    if callable(extractor):
-        return extractor(env_obs)
-    raise TypeError(
-        f"{type(feature_model).__name__} does not implement extract_prefix_obs "
-        "or extract_rlt_obs."
-    )
-
-
 @runtime_checkable
-class PrefixPolicy(Protocol):
-    """Trainable head that consumes PrefixObs, not raw images."""
+class TrainablePrefixPolicy(Protocol):
+    """Trainable policy that consumes a compact prefix observation."""
 
     def predict_action_batch(
         self,
@@ -55,3 +41,16 @@ class PrefixPolicy(Protocol):
         mode: str = "train",
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any]]: ...
+
+
+def extract_prefix_obs(
+    feature_model: PrefixFeatureModel,
+    env_obs: dict[str, Any],
+) -> PrefixObs:
+    """Extract a prefix observation through the canonical feature-model API."""
+    extractor = getattr(feature_model, "extract_prefix_obs", None)
+    if not callable(extractor):
+        raise TypeError(
+            f"{type(feature_model).__name__} must implement extract_prefix_obs()."
+        )
+    return extractor(env_obs)

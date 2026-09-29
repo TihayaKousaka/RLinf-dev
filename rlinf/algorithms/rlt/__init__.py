@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from rlinf.algorithms.expert import build_expert_model_config
-from rlinf.algorithms.rlt.rollout import predict_prefix_actions, predict_rlt_actions
+from rlinf.algorithms.rlt.rollout import predict_prefix_actions
 from rlinf.algorithms.rlt.route import (
     RealworldRLTRoute,
     RLTRoute,
@@ -43,7 +43,6 @@ __all__ = [
     "build_rlt_route",
     "build_routing_gate",
     "predict_prefix_actions",
-    "predict_rlt_actions",
     "register_routing_gate",
     "use_maniskill_rlt_env",
     "use_simulator_transition_replay",

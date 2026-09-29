@@ -47,7 +47,7 @@ def build_rlt_config(
     """Build RLT and Prefix-FT settings from an OpenPI model config."""
     from omegaconf import OmegaConf
 
-    from rlinf.models.embodiment.prefix_ft.config import resolve_prefix_pool
+    from rlinf.models.embodiment.prefix.config import resolve_prefix_pool
 
     parent = parent_cfg if parent_cfg is not None else model_cfg
     use_rlt = bool(OmegaConf.select(model_cfg, "use_rlt", default=False))

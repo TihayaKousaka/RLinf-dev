@@ -27,17 +27,16 @@ from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt import (
     build_rlt_route,
     build_routing_gate,
-    predict_rlt_actions,
+    predict_prefix_actions,
 )
 from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import PolicyOutput
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.models.embodiment.prefix_ft.config import (
-    apply_prefix_head_z_dim,
+from rlinf.models.embodiment.prefix.config import (
     build_state_history_buffer,
-    resolve_prefix_feature_model_config,
+    get_prefix_feature_model_config,
 )
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.obs_compression import decompress_obs, infer_obs_batch_size
@@ -84,7 +83,7 @@ class MultiStepRolloutWorker(Worker):
         self.enable_dagger = self.algorithm_cfg.get("loss_type") == "embodied_dagger"
         self.enable_opd = self.algorithm_cfg.get("adv_type") == "opd"
         self.expert_model = None
-        self.rlt_feature_model = None
+        self.prefix_feature_model = None
         self.prefix_history = None
         self.rlt_route = None
         self.routing_gate = None
@@ -151,25 +150,25 @@ class MultiStepRolloutWorker(Worker):
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
-        apply_prefix_head_z_dim(rollout_model_config, self.cfg)
-
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             self.hf_model.load_state_dict(model_dict)
 
-        rlt_feature_model_config = resolve_prefix_feature_model_config(self.cfg)
-        if rlt_feature_model_config is not None:
-            self.rlt_feature_model = get_model(copy.deepcopy(rlt_feature_model_config))
-            self.rlt_feature_model.eval()
-            self.rlt_feature_model.requires_grad_(False)
+        prefix_feature_model_config = get_prefix_feature_model_config(self.cfg)
+        if prefix_feature_model_config is not None:
+            self.prefix_feature_model = get_model(
+                copy.deepcopy(prefix_feature_model_config)
+            )
+            self.prefix_feature_model.eval()
+            self.prefix_feature_model.requires_grad_(False)
             self.rlt_route = build_rlt_route(self.cfg)
-        self.prefix_history = build_state_history_buffer(self.cfg)
+        self.prefix_history = build_state_history_buffer(self.model_cfg)
 
         gate_cfg = OmegaConf.select(self.cfg, "rollout.routing_gate", default=None)
         if gate_cfg is not None and bool(gate_cfg.get("enable", False)):
-            if self.rlt_feature_model is None:
+            if self.prefix_feature_model is None:
                 raise ValueError(
                     "rollout.routing_gate requires rollout.prefix_feature_model."
                 )
@@ -184,7 +183,7 @@ class MultiStepRolloutWorker(Worker):
             expert_model_config = build_expert_model_config(
                 self.cfg,
                 self.model_cfg,
-                rlt_feature_model_config=rlt_feature_model_config,
+                prefix_feature_model_config=prefix_feature_model_config,
             )
             self.expert_model = get_model(expert_model_config)
 
@@ -195,8 +194,8 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model.eval()
         if self.expert_model is not None:
             self.expert_model.eval()
-        if self.rlt_feature_model is not None:
-            self.rlt_feature_model.eval()
+        if self.prefix_feature_model is not None:
+            self.prefix_feature_model.eval()
 
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
@@ -587,10 +586,10 @@ class MultiStepRolloutWorker(Worker):
         reset_mask: torch.Tensor | None = None,
         update_gate: bool = True,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        if self.rlt_feature_model is not None:
-            return predict_rlt_actions(
+        if self.prefix_feature_model is not None:
+            return predict_prefix_actions(
                 policy_model=self.hf_model,
-                feature_model=self.rlt_feature_model,
+                feature_model=self.prefix_feature_model,
                 rlt_route=self.rlt_route,
                 env_obs=env_obs,
                 final_obs=final_obs,
@@ -814,7 +813,7 @@ class MultiStepRolloutWorker(Worker):
                     ),
                     forward_inputs=(
                         result["forward_inputs"]
-                        if self.rlt_feature_model is not None
+                        if self.prefix_feature_model is not None
                         else {}
                     ),
                 )
@@ -947,8 +946,8 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_cuda_graph:
             self.hf_model.release_cuda_graph()
         self.hf_model.to("cpu")
-        if self.rlt_feature_model is not None:
-            self.rlt_feature_model.to("cpu")
+        if self.prefix_feature_model is not None:
+            self.prefix_feature_model.to("cpu")
         if self.routing_gate is not None:
             self.routing_gate.to("cpu")
         if self.expert_model is not None:
@@ -957,8 +956,8 @@ class MultiStepRolloutWorker(Worker):
 
     def reload_model(self):
         self.hf_model.to(self.device)
-        if self.rlt_feature_model is not None:
-            self.rlt_feature_model.to(self.device)
+        if self.prefix_feature_model is not None:
+            self.prefix_feature_model.to(self.device)
         if self.routing_gate is not None:
             self.routing_gate.to(self.device)
         if self.expert_model is not None:
