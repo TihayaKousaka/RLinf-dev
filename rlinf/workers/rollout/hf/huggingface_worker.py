@@ -164,8 +164,13 @@ class MultiStepRolloutWorker(Worker):
 
     def init_worker(self):
         # Train uses actor.model as the architecture source; overlay rollout.model
-        # (path, precision, and nested inference knobs). Eval-only is a no-op merge.
-        rollout_model_config = OmegaConf.merge(self.model_cfg, self.cfg.rollout.model)
+        # (path, precision, and nested inference knobs). Resolve both while they
+        # still belong to the root config, then merge ordinary mappings so
+        # rollout-only fields do not leak into actor.model.
+        rollout_model_config = OmegaConf.merge(
+            OmegaConf.to_container(self.model_cfg, resolve=True),
+            OmegaConf.to_container(self.cfg.rollout.model, resolve=True),
+        )
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
