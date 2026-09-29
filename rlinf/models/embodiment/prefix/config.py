@@ -73,9 +73,14 @@ def get_prefix_feature_model_config(cfg: Any) -> Any | None:
 def get_state_history_config(model_cfg: Any) -> StateHistoryConfig:
     """Parse state-history settings without mutating the Hydra config."""
     history_cfg = OmegaConf.select(model_cfg, "state_history", default=None)
-    enabled = bool(OmegaConf.select(history_cfg, "enable", default=False))
-    steps = int(OmegaConf.select(history_cfg, "steps", default=4) or 4)
-    pad = str(OmegaConf.select(history_cfg, "pad", default="zero") or "zero")
+    if history_cfg is None:
+        enabled = False
+        steps = 4
+        pad = "zero"
+    else:
+        enabled = bool(OmegaConf.select(history_cfg, "enable", default=False))
+        steps = int(OmegaConf.select(history_cfg, "steps", default=4) or 4)
+        pad = str(OmegaConf.select(history_cfg, "pad", default="zero") or "zero")
     proprio_dim = int(OmegaConf.select(model_cfg, "proprio_dim", default=0) or 0)
     if steps < 1:
         raise ValueError(f"state_history.steps must be >= 1, got {steps}.")
