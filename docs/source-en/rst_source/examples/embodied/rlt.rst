@@ -1,59 +1,39 @@
-Prefix Fine-Tune and RL Token
-=============================
+RL Token: Online Reinforcement Learning with a Compressed VLA Representation
+=============================================================================
 
-The default real-robot path is **Prefix Fine-Tune (Prefix-FT)**: freeze a VLA
-(ordinary SFT or base checkpoint), pool its prefix hidden states, and train a
-lightweight actor-critic on ``{z_rl, proprio, ref_chunk}``. Stage 1 RL-token
-training is optional and only required when ``prefix.pool: rlt_token``.
+This page explains RL Token (RLT) Stage 1 representation learning, Stage 2 online training, real-robot execution, and ManiSkill routing. Read :doc:`../../extending/prefix` for the shared feature contract, ``prefix_policy``, MLP heads, and algorithm extensions.
 
-**RL Token: Bootstrapping Online RL with Vision-Language-Action Models** is the
-paper recipe that trains a compact token transformer before the same actor-critic.
-In RLinf configs and code that workflow is abbreviated as **RLT**. Stage 2 uses
-one prefix off-policy engine: ``algorithm.loss_type: prefix_off_policy`` selects
-the shared worker, while ``algorithm.name`` selects AC or TD3 independently of
-the actor and critic heads.
+**RL Token: Bootstrapping Online RL with Vision-Language-Action Models** trains a compact token transformer before the lightweight actor-critic. Stage 2 selects the shared worker with ``algorithm.loss_type: prefix_off_policy`` and selects AC or TD3 with ``algorithm.name``. Official project page: `Precise Manipulation with Efficient Online RL <https://www.pi.website/research/rlt>`_.
 
-The checked-in examples target Franka peg insertion and the ManiSkill
-``PegInsertionSideWideClearance-v1`` joint-control simulation. The pipeline is
-not tied to either task. Reuse the same frozen-VLA + compact-head structure when
-the demonstrations, environment config, action shape, state semantics, and OpenPI
-dataconfig stay aligned.
-
-Official project page: `Precise Manipulation with Efficient Online RL <https://www.pi.website/research/rlt>`_.
+The checked-in configs cover Franka peg insertion and the ManiSkill ``PegInsertionSideWideClearance-v1`` joint-control simulation. Align demonstration fields, environment actions, state semantics, and the OpenPI data config when moving the recipe to another task.
 
 Overview
 --------
 
-Prefix-FT and RLT both separate representation from online RL control. Prefix-FT
-skips the token transformer and uses a pooled VLM prefix as ``z_rl``.
+The two RLT training stages meet at the complete Stage 1 ``actor`` checkpoint. Stage 1 learns the token representation, Stage 2 freezes it while updating the actor-critic online, and the rollout route selects the executed action chunk.
 
 .. grid:: 2 4 4 4
    :gutter: 2
 
-   .. grid-item-card:: Frozen VLA
+   .. grid-item-card:: Stage 1
       :text-align: center
 
-      Prefix pool (default) or optional RLT token
+      Joint VLA and RLT token training
 
-   .. grid-item-card:: Compact head
+   .. grid-item-card:: Stage 2
       :text-align: center
 
-      Registered actor and critic heads
+      Frozen token feature model
 
-   .. grid-item-card:: State
+   .. grid-item-card:: Action source
       :text-align: center
 
-      ``z_rl`` + proprio + reference chunk
+      VLA, actor, or expert
 
-   .. grid-item-card:: Deployment
+   .. grid-item-card:: Runtime
       :text-align: center
 
-      Franka real robot / ManiSkill simulation
-
-| **You'll do:** prepare demonstrations -> (optional Stage 1 token) -> point
-  Prefix-FT at an SFT/base VLA checkpoint -> launch actor-critic training ->
-  monitor replay-buffer and task success metrics.
-| **Prerequisites:** `OpenPI π₀.₅ base weights <https://huggingface.co/lerobot/pi05_base>`__, plus the environment for your example—either :doc:`Franka real-world <../embodied/franka>` or :doc:`ManiSkill simulation <../embodied/maniskill>`.
+      Franka real robot and ManiSkill simulation
 
 Provided Configuration Files
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -208,59 +188,19 @@ Stage 2 feature-model config. ``openpi_data`` belongs under ``actor.model``.
    the processed OpenPI ``observation.state`` as ``proprio``. Stage 1, Stage 2,
    and OpenPI normalization therefore see the same state semantics.
 
-Stage 2: Train the Actor-Critic Policy
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Stage 2: Train the RLT Actor-Critic
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The compact policy is the same for Prefix-FT and RL token: freeze the VLA
-feature model and train only the actor and critic heads. Both paths configure
-the frozen model through ``rollout.prefix_feature_model`` and produce the same
-``{z_rl, proprio, ref_chunk}`` input contract. Prefix-FT pools the VLM prefix
-from a base or SFT checkpoint; the token path loads a Stage 1 ``rlt_module``
-checkpoint and emits the learned token feature.
+Stage 2 loads the Stage 1 actor checkpoint containing ``rlt_module``. The frozen feature model emits ``{z_rl, proprio, ref_chunk}``, while Prefix policy updates only its actor and critic heads. See :doc:`../../extending/prefix` for the Prefix runtime's head, algorithm, and state contracts.
 
-.. note::
-
-   The current Stage 2 implementation is not standard maximum-entropy SAC.
-
-Compose the Algorithm and Heads
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Stage 2 composes the update rule and network heads as separate registered
-components. Set ``algorithm.name`` to ``ac`` or ``td3``. Then select the actor
-and critic implementations through ``actor.model.actor_head.name`` and
-``actor.model.critic_head.name``. The shared ``prefix_policy`` model and
-``prefix_off_policy`` worker do not branch on a specific AC or TD3 model type.
-
-The built-in AC configuration combines ``fixed_std_mlp`` with
-``multi_q_mlp``. The TD3 configuration combines ``deterministic_mlp`` with
-``twin_q_mlp``. New algorithms register through
-``register_prefix_off_policy_algorithm``; new heads register through
-``register_prefix_actor`` or ``register_prefix_critic``. This keeps a new
-update rule independent from the MLP architecture it consumes.
-
-Each registered head also declares the behavior that algorithms depend on.
-AC requires a stochastic actor and at least two Q estimates; TD3 requires a
-deterministic actor with action-noise support and at least two Q estimates.
-Configuration validation rejects an incompatible combination before workers
-are launched. CrossQ support and FSDP wrapping come from head metadata instead
-of head-name checks or YAML references to concrete Python classes.
-
-The model implementation lives under ``rlinf.models.embodiment.prefix``. The
-algorithm registry remains under ``rlinf.algorithms.prefix_off_policy``, while
-RLT replay conversion and update scheduling stay in ``rlinf.algorithms.rlt``.
-The shared worker connects these components to the existing SAC/FSDP runtime;
-it does not own their model, replay, or scheduling rules.
-
-STEAM is a rollout routing component configured under ``rollout.routing_gate``.
-It decides whether the base VLA, Stage 2 actor, or expert supplies an action,
-but it does not select the learning algorithm or construct either MLP head.
+The RLT Stage 2 implementation uses chunk-reward TD targets and a ``-Q + BC`` actor objective. ``rlt_policy_switch``, STEAM, and expert takeover select the source of each executed action chunk.
 
 During rollout:
 
 1. The environment returns raw observations and task metadata.
 2. The frozen feature model converts the raw observation into:
 
-   - ``z_rl``: pooled VLM prefix (Prefix-FT) or the compact RLT token.
+   - ``z_rl``: compact representation emitted by the Stage 1 RLT token transformer.
    - ``proprio``: the selected robot or simulator state.
    - ``ref_chunk``: the VLA reference action chunk.
 
@@ -878,26 +818,6 @@ Practical Notes
   ``config_name``, ``action_dim``, ``proprio_dim``, ``ref_num_action_chunks``,
   and ``z_dim`` must agree. To keep the full raw state, use
   ``state_indices: []``.
-- ``rollout.prefix_feature_model`` is the frozen VLA for both feature paths.
-  For Prefix-FT, point it at an ordinary SFT or π₀.₅ base checkpoint with
-  ``openpi.use_rlt: false`` and ``prefix.pool: masked_mean``. For RL token,
-  point it at the Stage 1 FSDP ``actor`` directory with ``use_rlt: True``.
-- ``actor.model`` is the compact ``prefix_policy`` updated by the shared
-  prefix off-policy worker.
-  ``actor.model.z_dim`` is the VLA prefix width (2048 for paligemma). Set
-  ``actor.model.state_history.enable: true`` only if you want K-step proprio
-  concatenated onto ``z_rl``; the MLP input width expands automatically.
-- ``algorithm.loss_type: prefix_off_policy`` selects the common runtime.
-  ``algorithm.name`` selects AC or TD3; ``actor_head.name`` and
-  ``critic_head.name`` select the MLP components independently.
-- ``rollout.model`` is the synced Stage 2 MLP copy on rollout workers. Keep
-  ``rollout.model.model_path: null`` for scratch Stage 2 training; use
-  ``runner.resume_dir`` to resume a Stage 2 run or ``runner.ckpt_path`` to load
-  a single Stage 2 weight file.
-- Do not configure ``actor.model.model_path`` for Stage 1. ``actor.model`` only
-  describes the Stage 2 input/output shape and registered head settings.
-- Stage 2 MLP settings are defined inline under ``actor.model`` in each Stage 2
-  YAML, not in a separate model defaults file.
 - ``keyboard_reward_wrapper: rlt_policy_switch`` is only needed for
   operator-controlled critical-phase switching.
 - The ManiSkill joint example uses ``env.*.rlt_policy_switch``. Do not use the
@@ -907,11 +827,8 @@ Practical Notes
   transform, and Stage 2 ``proprio_dim`` together.
 - Stage 1, Stage 2, and checkpoint assets must load ``norm_stats.json`` from the same data semantics and ``repo_id``. Prefer setting ``openpi_data.norm_stats_path`` explicitly so Stage 1 runs still work when the checkpoint does not embed norm stats.
 - ``rollout.prefix_feature_model.model_path`` should point to the Stage 1 FSDP ``actor`` directory, for example ``.../checkpoints/global_step_<step>/actor``. Do not convert the RLT Stage 1 checkpoint to a bare ``model.safetensors`` for Stage 2, because the RLT token module is stored in the full wrapper checkpoint.
-- To add an algorithm, register a ``PrefixOffPolicyAlgorithm`` implementation
-  and select it with ``algorithm.name``. To add an MLP implementation, register
-  a ``PrefixActorHead`` or ``PrefixCriticHead`` and select its name under
-  ``actor.model``; neither extension requires a new worker.
 - To add a simulator example, create a simulator environment config, keep
   ``loss_type: prefix_off_policy`` and the appropriate frozen feature-model
   block, then replace the real-robot phase-switching logic with
   simulator-appropriate routing.
+- Read :doc:`../../extending/prefix` for Prefix pooling, feature-model, MLP-head, and algorithm extensions.

@@ -1,51 +1,39 @@
-Prefix 在线微调与 RL Token
-=============================
+RL Token 在线强化学习
+======================
 
-真机默认路径是 **Prefix Fine-Tune（Prefix-FT）**：冻结 VLA（普通 SFT 或基座
-checkpoint），池化 prefix hidden，再在 ``{z_rl, proprio, ref_chunk}`` 上训练
-轻量 actor-critic。Stage 1 RL token 训练是可选项，仅在 ``prefix.pool: rlt_token``
-时需要。
+本页介绍 RL Token（RLT）的 Stage 1 表示学习、Stage 2 在线训练、真实机器人流程和 ManiSkill 路由。Prefix Fine-Tune 的通用 feature contract、``prefix_policy``、MLP head 和 algorithm 扩展请阅读 :doc:`../../extending/prefix`。
 
-**RL Token: Bootstrapping Online RL with Vision-Language-Action Models** 是论文中的 token 配方：先训练压缩 token transformer，再运行同一套 actor-critic。RLinf 中这套流程简称 **RLT**。Stage 2 统一使用 prefix off-policy engine：``algorithm.loss_type: prefix_off_policy`` 选择共享 worker，``algorithm.name`` 独立选择 AC 或 TD3，不再与 actor、critic head 绑定。
+**RL Token: Bootstrapping Online RL with Vision-Language-Action Models** 先训练压缩 token transformer，再使用压缩后的 ``z_rl`` 训练轻量 actor-critic。Stage 2 通过 ``algorithm.loss_type: prefix_off_policy`` 选择共享 worker，``algorithm.name`` 选择 AC 或 TD3。官方项目页：`Precise Manipulation with Efficient Online RL <https://www.pi.website/research/rlt>`_。
 
-当前仓库中的示例配置面向 Franka peg insertion 和 ManiSkill
-``PegInsertionSideWideClearance-v1`` joint-control 仿真。pipeline 本身不绑定
-具体任务；只要示范数据、环境配置、动作维度、状态语义和 OpenPI dataconfig 对齐，
-就可以复用「冻 VLA + 小头」结构。
-
-官方项目页：`Precise Manipulation with Efficient Online RL <https://www.pi.website/research/rlt>`_。
+当前配置覆盖 Franka peg insertion 和 ManiSkill ``PegInsertionSideWideClearance-v1`` joint-control 仿真。示范数据、环境 action、状态语义和 OpenPI dataconfig 对齐后，可以将同一流程迁移到其他任务。
 
 概览
 ----
 
-Prefix-FT 和 RLT 都把表示学习和在线 RL 控制拆开。Prefix-FT 不再训 token
-transformer，而是用池化后的 VLM prefix 作为 ``z_rl``。
+RLT 的两个训练阶段通过完整的 Stage 1 ``actor`` checkpoint 衔接。Stage 1 学习 token 表示，Stage 2 冻结该表示并在线更新 actor-critic；rollout route 决定实际执行的 action chunk。
 
 .. grid:: 2 4 4 4
    :gutter: 2
 
-   .. grid-item-card:: 冻结 VLA
+   .. grid-item-card:: Stage 1
       :text-align: center
 
-      Prefix 池化（默认）或可选 RLT token
+      VLA 与 RLT token 联合训练
 
-   .. grid-item-card:: 轻量头
+   .. grid-item-card:: Stage 2
       :text-align: center
 
-      可注册的 actor 与 critic head
+      冻结 token feature model
 
-   .. grid-item-card:: 状态
+   .. grid-item-card:: 动作来源
       :text-align: center
 
-      ``z_rl`` + proprio + reference chunk
+      VLA、actor 或 expert
 
-   .. grid-item-card:: 部署
+   .. grid-item-card:: 运行环境
       :text-align: center
 
-      Franka 真机 / ManiSkill 仿真
-
-| **你将完成：** 准备示范数据 ->（可选 Stage 1 token）-> 在 Prefix-FT 中加载 SFT/基座 VLA -> 启动 actor-critic 训练 -> 观察 replay buffer 与任务成功率指标。
-| **前置条件：** 准备好 `OpenPI π₀.₅ <https://huggingface.co/lerobot/pi05_base>`__ 基座模型，并按所选示例配置 :doc:`Franka 真机环境 <../embodied/franka>` 或 :doc:`ManiSkill 仿真环境 <../embodied/maniskill>` （二选一）。
+      Franka 真机与 ManiSkill 仿真
 
 提供的配置文件
 ~~~~~~~~~~~~~~
@@ -194,34 +182,19 @@ Stage 1 中比较关键的字段：
    Stage 2 rollout 也使用 OpenPI 处理后的 ``observation.state`` 作为 ``proprio``。
    这样 Stage 1、Stage 2 和 OpenPI normalization 看到的是同一种状态语义。
 
-Stage 2：训练 Actor-Critic 策略
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Stage 2：训练 RLT Actor-Critic
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Prefix-FT 和 RL token 共用同一套轻量 policy：冻结 VLA 特征模型，只训练 actor 与 critic head。两条路径都通过 ``rollout.prefix_feature_model`` 配置冻结模型，并生成相同的 ``{z_rl, proprio, ref_chunk}`` 输入。Prefix-FT 从基座或 SFT checkpoint 池化 VLM prefix；RL token 路径加载包含 Stage 1 ``rlt_module`` 的 checkpoint，输出训练得到的 token 特征。
+Stage 2 加载包含 ``rlt_module`` 的 Stage 1 actor checkpoint。冻结 feature model 输出 ``{z_rl, proprio, ref_chunk}``，Prefix policy 只更新 actor 与 critic head。Prefix runtime 的 head、algorithm 和 state contract 见 :doc:`../../extending/prefix`。
 
-.. note::
-
-   当前 Stage 2 实现不是标准 maximum-entropy SAC。
-
-组合算法与网络 Head
-^^^^^^^^^^^^^^^^^^^^
-
-Stage 2 将更新规则和网络 head 作为独立注册组件组合。``algorithm.name`` 选择 ``ac`` 或 ``td3``，``actor.model.actor_head.name`` 与 ``actor.model.critic_head.name`` 分别选择 actor 和 critic 实现。共享的 ``prefix_policy`` model 与 ``prefix_off_policy`` worker 不再按 AC、TD3 增加专用 model type 或 worker 分支。
-
-内置 AC 配置使用 ``fixed_std_mlp`` 与 ``multi_q_mlp``，TD3 配置使用 ``deterministic_mlp`` 与 ``twin_q_mlp``。新增算法通过 ``register_prefix_off_policy_algorithm`` 注册，新增 head 通过 ``register_prefix_actor`` 或 ``register_prefix_critic`` 注册，因此更新规则不依赖具体 MLP 结构。
-
-每个已注册 head 还会声明算法依赖的能力。AC 要求 stochastic actor 和至少两个 Q 估计，TD3 要求支持 action noise 的 deterministic actor 和至少两个 Q 估计。配置校验会在 worker 启动前拒绝不合法的组合。CrossQ 支持与 FSDP wrapping 也来自 head metadata，不再依赖 head 名称判断或 YAML 中的具体 Python 类名。
-
-模型实现统一放在 ``rlinf.models.embodiment.prefix``，算法 registry 位于 ``rlinf.algorithms.prefix_off_policy``，RLT replay 转换与更新调度仍属于 ``rlinf.algorithms.rlt``。共享 worker 只把这些组件接入已有 SAC/FSDP runtime，不再持有模型、replay 和调度规则的具体实现。
-
-STEAM 是 ``rollout.routing_gate`` 下的 rollout routing 组件，负责在基座 VLA、Stage 2 actor 和 expert 之间选择动作。它不选择训练算法，也不创建 actor 或 critic head。
+RLT Stage 2 当前实现使用 chunk reward TD target 和 ``-Q + BC`` actor objective。它通过 ``rlt_policy_switch``、STEAM 或 expert takeover 决定每个 action chunk 的执行来源。
 
 rollout 时：
 
 1. 环境返回原始观测和任务元信息。
 2. 冻结的特征模型将原始观测转换为：
 
-   - ``z_rl``：池化后的 VLM prefix（Prefix-FT）或紧凑 RLT token。
+   - ``z_rl``：Stage 1 RLT token transformer 输出的紧凑表示。
    - ``proprio``：选中的机器人或仿真状态。
    - ``ref_chunk``：VLA reference action chunk。
 
@@ -800,16 +773,10 @@ Replay Buffer 逻辑
 --------
 
 - Stage 1 和 Stage 2 的数据配置必须保持一致：``repo_id``、``config_name``、``action_dim``、``proprio_dim``、``ref_num_action_chunks`` 和 ``z_dim`` 都要对齐；如果保留完整 raw state，可使用 ``state_indices: []``。
-- ``rollout.prefix_feature_model`` 是两条特征路径共用的冻结 VLA。Prefix-FT 应指向普通 SFT 或 π₀.₅ 基座，并设置 ``openpi.use_rlt: false``、``prefix.pool: masked_mean``；RL token 应指向 Stage 1 FSDP ``actor`` 目录，并保持 ``use_rlt: True``。
-- ``actor.model`` 是共享 prefix off-policy worker 更新的轻量 ``prefix_policy``。``z_dim`` 写 VLA prefix 宽度（paligemma 为 2048）。只有打开 ``actor.model.state_history.enable`` 时才会把 K 步 proprio 拼到 ``z_rl`` 后，MLP 输入宽度会自动扩展。
-- ``algorithm.loss_type: prefix_off_policy`` 选择共享 runtime；``algorithm.name`` 独立选择 AC 或 TD3，``actor_head.name`` 与 ``critic_head.name`` 独立选择 MLP 组件。
-- ``rollout.model`` 是 Stage 2 MLP 在 rollout worker 上的同步副本。Stage 2 从头训练时保持 ``rollout.model.model_path: null``；恢复 Stage 2 训练使用 ``runner.resume_dir``，加载单个 Stage 2 权重文件使用 ``runner.ckpt_path``。
-- 不要配置 ``actor.model.model_path`` 来加载 Stage 1；``actor.model`` 只描述 Stage 2 的输入输出维度和已注册 head 设置。
-- Stage 2 MLP 配置直接内联在各个 Stage 2 YAML 的 ``actor.model`` 下，不再使用单独的 model defaults 文件。
 - ``keyboard_reward_wrapper: rlt_policy_switch`` 只在需要人工控制关键阶段切换时使用。
 - ManiSkill joint 示例使用 ``env.*.rlt_policy_switch``，不要再使用真机的 keyboard wrapper。
 - ManiSkill 的 ``proprio`` 来自 OpenPI processed ``observation.state``。如果新建仿真 dataconfig，需要同时检查数据集 ``state``、OpenPI transform 和 Stage 2 ``proprio_dim``。
 - Stage 1、Stage 2 和 checkpoint assets 中的 ``norm_stats.json`` 必须来自同一套数据语义和同一个 ``repo_id``。推荐通过 ``openpi_data.norm_stats_path`` 显式指定，避免 Stage 1 checkpoint 未写入 norm stats 时加载失败。
 - ``rollout.prefix_feature_model.model_path`` 应指向 Stage 1 FSDP 检查点下的 ``actor`` 目录，例如 ``.../checkpoints/global_step_<step>/actor``。不要把 RLT Stage 1 checkpoint 转成裸 ``model.safetensors`` 再给 Stage 2 使用，因为 RLT token module 保存在完整 wrapper checkpoint 中。
-- 新增算法时，实现并注册 ``PrefixOffPolicyAlgorithm``，再通过 ``algorithm.name`` 选择；新增 MLP 时，实现并注册 ``PrefixActorHead`` 或 ``PrefixCriticHead``，再在 ``actor.model`` 下选择名称。两类扩展都不需要新增 worker。
 - 添加仿真示例时，新建仿真环境配置，保留 ``loss_type: prefix_off_policy`` 和对应的冻结 feature-model 配置，再把真机阶段切换逻辑替换成适合仿真的 routing。
+- Prefix pooling、feature model、MLP head 和 algorithm 的扩展方法见 :doc:`../../extending/prefix`。
