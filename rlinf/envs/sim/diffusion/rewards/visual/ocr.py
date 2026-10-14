@@ -14,10 +14,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from filelock import FileLock
 from PIL import Image
 
 from rlinf.envs.sim.diffusion.rewards import ImageRewardBackendBase
@@ -27,7 +29,15 @@ from rlinf.envs.sim.diffusion.utils import cfg_get, extract_quoted_text
 class OCRScorer:
     """OCR text matching scorer shared by image and video OCR rewards."""
 
-    def __init__(self, use_gpu: bool = False, lang: str = "en"):
+    def __init__(
+        self,
+        use_gpu: bool = False,
+        lang: str = "en",
+        *,
+        det_model_dir: str | None = None,
+        rec_model_dir: str | None = None,
+        cls_model_dir: str | None = None,
+    ):
         try:
             from Levenshtein import distance
             from paddleocr import PaddleOCR
@@ -39,18 +49,28 @@ class OCRScorer:
             ) from exc
 
         self.distance = distance
-        self.ocr = PaddleOCR(
-            use_angle_cls=False,
-            lang=str(lang),
-            use_gpu=bool(use_gpu),
-            show_log=False,
-        )
+        cache_dir = Path.home() / ".paddleocr"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Ray workers do not share Paddle's distributed rank or download barrier.
+        with FileLock(str(cache_dir / ".rlinf-init.lock")):
+            self.ocr = PaddleOCR(
+                use_angle_cls=False,
+                lang=str(lang),
+                use_gpu=bool(use_gpu),
+                show_log=False,
+                det_model_dir=det_model_dir,
+                rec_model_dir=rec_model_dir,
+                cls_model_dir=cls_model_dir,
+            )
 
     @classmethod
     def from_config(cls, cfg: Any) -> "OCRScorer":
         return cls(
             use_gpu=bool(cfg_get(cfg, "use_gpu", False)),
             lang=str(cfg_get(cfg, "lang", "en")),
+            det_model_dir=cfg_get(cfg, "det_model_dir", None),
+            rec_model_dir=cfg_get(cfg, "rec_model_dir", None),
+            cls_model_dir=cfg_get(cfg, "cls_model_dir", None),
         )
 
     def score_image(

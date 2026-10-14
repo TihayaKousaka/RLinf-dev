@@ -1,0 +1,8 @@
+# Native Cosmos3 keeps its own Transformers/Diffusers stack.
+transformers==4.57.6
+diffusers==0.39.0
+peft==0.20.0
+numpy==1.26.4
+paddlepaddle==2.6.2
+paddleocr==2.9.1
+Levenshtein==0.27.3

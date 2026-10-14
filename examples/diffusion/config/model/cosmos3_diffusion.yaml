@@ -1,0 +1,25 @@
+model_type: cosmos3_diffusion
+model_path: /path/to/Cosmos3-Nano-DCP
+precision: bf16
+load_to_device: true
+num_action_chunks: 2
+action_dim: 1
+is_lora: false
+lora_rank: 16
+cosmos3_diffusion:
+  auxiliary_model_path: /path/to/Cosmos3-Nano
+  local_files_only: true
+  resolution:
+  - 256
+  - 256
+  num_frames: 5
+  fps: 24.0
+  num_steps: 10
+  eval_num_steps: 20
+  max_sequence_length: 512
+  guidance_scale: 1.0
+  eval_guidance_scale: 1.0
+  timestep_fraction: 1.0
+  use_lora: true
+  lora_rank: 16
+  lora_alpha: 32

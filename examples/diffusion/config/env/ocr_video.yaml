@@ -26,4 +26,8 @@ reward:
   key: "avg"
   use_gpu: False
   lang: "en"
+  # Set these to extracted PaddleOCR model directories to use local weights.
+  det_model_dir: null
+  rec_model_dir: null
+  cls_model_dir: null
   frame_interval: 4

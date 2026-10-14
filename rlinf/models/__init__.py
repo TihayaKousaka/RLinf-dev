@@ -184,6 +184,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_cosmos3_diffusion(cfg: DictConfig, torch_dtype):
+        from rlinf.models.diffusion.cosmos3 import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_wan22_ti2v_5b(cfg: DictConfig, torch_dtype):
         from rlinf.models.diffusion.wan import get_model
 
@@ -327,6 +332,13 @@ def _register_builtin_models():
         category="diffusion",
         force=True,
     )
+    register_model(
+        SupportedModel.COSMOS3_DIFFUSION.value,
+        _build_cosmos3_diffusion,
+        category="diffusion",
+        force=True,
+    )
+
     register_model(
         SupportedModel.WAN22_TI2V_5B.value,
         _build_wan22_ti2v_5b,

@@ -20,7 +20,7 @@ detect_pkg_manager() {
 
 PKG_MANAGER=$(detect_pkg_manager)
 
-# Hardware platform. Passed by install.sh; defaults to nvidia
+# Hardware platform (nvidia | amd). Passed by install.sh; defaults to nvidia
 # when this script is invoked directly for backward compatibility.
 PLATFORM="${1:-nvidia}"
 
@@ -105,7 +105,6 @@ install_deps_apt() {
         libibverbs-dev \
         ncurses-term \
         mesa-utils \
-        libosmesa6 \
         libosmesa6-dev \
         freeglut3-dev \
         libglew-dev \
@@ -390,13 +389,13 @@ case "$PLATFORM" in
         echo "Installing rendering runtime config for AMD/Radeon"
         install_render_config_amd
         ;;
-    nvidia)
-        echo "Installing rendering runtime config for NVIDIA"
-        install_render_config_nvidia
-        ;;
-    *)
+    ascend|musa|kunlun|biren)
         # Server-side, with no display GPU. Skip the EGL/Vulkan ICD config;
         # software rendering still gets mesa drivers from the step above.
         echo "Skipping rendering runtime config on ${PLATFORM} platform"
+        ;;
+    nvidia|*)
+        echo "Installing rendering runtime config for NVIDIA"
+        install_render_config_nvidia
         ;;
 esac

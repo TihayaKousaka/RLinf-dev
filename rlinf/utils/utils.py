@@ -25,9 +25,9 @@ from typing import Any, Callable, Iterable, Literal, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
-from rlinf.hybrid_engines.fsdp import DTensor
 from rlinf.scheduler import Worker
 from rlinf.utils.metric_utils import compute_loss_mask
 
@@ -139,7 +139,15 @@ def collect_param_names_need_sync(module: torch.nn.Module) -> list[str]:
             )
             persistent_buffer_names.append(full_name)
 
-    return trainable_param_names + persistent_buffer_names
+    # Torch activation checkpoint wrappers strip this segment from state_dict.
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        _CHECKPOINT_PREFIX,
+    )
+
+    return [
+        name.replace(_CHECKPOINT_PREFIX, "")
+        for name in trainable_param_names + persistent_buffer_names
+    ]
 
 
 def tensors_record_stream(

@@ -2,7 +2,7 @@
 
 export DIFFUSION_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$DIFFUSION_PATH"))
-export SRC_FILE="${REPO_PATH}/examples/embodiment/eval_embodied_agent.py"
+export SRC_FILE="${DIFFUSION_PATH}/eval_diffusion.py"
 export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export HYDRA_FULL_ERROR=1

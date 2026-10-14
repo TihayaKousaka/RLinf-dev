@@ -24,7 +24,6 @@ from .ascend_npu import AscendNPUManager
 from .biren_supa import BirenSUPAManager
 from .intel_gpu import IntelGPUManager
 from .kunlun_xpu import KunlunXPUManager
-from .metax_gpu import METAXGPUManager
 from .musa_gpu import MUSAGPUManager
 from .nvidia_gpu import NsightConfig, NvidiaGPUManager
 
@@ -43,5 +42,4 @@ __all__ = [
     "NsightConfig",
     "MUSAGPUManager",
     "KunlunXPUManager",
-    "METAXGPUManager",
 ]
