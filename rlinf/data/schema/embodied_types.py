@@ -1696,13 +1696,16 @@ class EnvOutput:
             else None
         )
 
-        return {
+        prepared = {
             "main_images": image_tensor,  # [N_ENV, H, W, C]
             "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
         }
+        if "art_sim_state_error" in obs:
+            prepared["art_sim_state_error"] = obs["art_sim_state_error"]
+        return prepared
 
     def to_dict(self) -> dict[str, Any]:
         return {

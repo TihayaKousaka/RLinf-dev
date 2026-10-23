@@ -949,6 +949,34 @@ def test_env_output_composes_one_transition_object():
     }
 
 
+@pytest.mark.parametrize("with_diagnostics", [False, True])
+def test_env_output_preserves_optional_art_diagnostics_through_policy_transport(
+    with_diagnostics,
+):
+    obs = {"states": torch.zeros(4, 3)}
+    if with_diagnostics:
+        obs["art_sim_state_error"] = torch.tensor([0.0, 0.0, 0.01, 0.01])
+    output = EnvOutput(obs=obs, final_obs=obs)
+    env_worker = object.__new__(EnvWorker)
+    policy_input = env_worker._build_policy_input(output)
+    restored = []
+    for shard in policy_input.split([2, 2]):
+        skeleton, tensors = pack_dataclass_tensors(shard)
+        restored.append(unpack_dataclass_tensors(skeleton, tensors))
+    merged = MultiStepRolloutWorker._merge_policy_inputs(restored)
+
+    for prepared in (
+        output.to_dict()["obs"],
+        output.to_dict()["final_obs"],
+        merged.obs,
+    ):
+        assert ("art_sim_state_error" in prepared) == with_diagnostics
+        if with_diagnostics:
+            torch.testing.assert_close(
+                prepared["art_sim_state_error"], obs["art_sim_state_error"]
+            )
+
+
 def test_removed_duplicate_types_are_not_schema_api():
     import rlinf.data.schema as schema
 
