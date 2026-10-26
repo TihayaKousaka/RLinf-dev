@@ -35,6 +35,11 @@ from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 
 _ART_LOSS_SPACES = ("velocity_linear_sigma", "velocity_uniform")
 _ART_MASK_METRICS = ("sde_kl", "fixed_mse")
+_ART_OUTPUT_GRADIENT_STATS = (
+    "output_guidance_grad_sq",
+    "output_restoration_grad_sq",
+    "output_grad_inner",
+)
 
 
 class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
@@ -212,6 +217,10 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
                     if action_trajectories:
                         step_metrics["actor/art_loss"] *= loss_scale
                         step_metrics["actor/total_loss"] *= loss_scale
+                        for key in _ART_OUTPUT_GRADIENT_STATS:
+                            step_metrics[f"actor/art_{key}"] *= (
+                                loss_scale / self.gradient_accumulation
+                            ) ** 2
                     with backward_ctx:
                         self.grad_scaler.scale(scaled_loss).backward()
                     append_to_dict(metrics, step_metrics)
@@ -231,7 +240,19 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
         self.optimizer.zero_grad()
         clear_memory()
         mean_metrics = {key: np.mean(value) for key, value in metrics.items()}
-        return all_reduce_dict(mean_metrics, op=torch.distributed.ReduceOp.AVG)
+        mean_metrics = all_reduce_dict(mean_metrics, op=torch.distributed.ReduceOp.AVG)
+        if action_trajectories:
+            guidance_sq, restoration_sq, inner = (
+                mean_metrics.pop(f"actor/art_{key}")
+                for key in _ART_OUTPUT_GRADIENT_STATS
+            )
+            mean_metrics["actor/art_output_restore_ratio"] = math.sqrt(
+                restoration_sq / max(guidance_sq, 1e-30)
+            )
+            mean_metrics["actor/art_output_restore_cosine"] = inner / math.sqrt(
+                max(guidance_sq * restoration_sq, 1e-30)
+            )
+        return mean_metrics
 
     def _art_covariance_options(self) -> dict:
         defaults = {
@@ -640,6 +661,13 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
             "actor/old_deviate": terms["movement_energy"].mean().item(),
             "actor/movement_score": terms["movement_score"].mean().item(),
         }
+        if coordinate_mask is not None:
+            metrics.update(
+                {
+                    f"actor/art_{key}": terms[key].item()
+                    for key in _ART_OUTPUT_GRADIENT_STATS
+                }
+            )
         return loss, metrics
 
     @classmethod
@@ -821,7 +849,7 @@ def _art_loss(
     ).detach()
     keep = (active & ~masked).detach()
     loss = torch.where(keep, unmasked, torch.zeros_like(unmasked))
-    return {
+    terms = {
         "per_item_loss": loss,
         "per_item_unmasked_loss": unmasked,
         "target": target,
@@ -832,6 +860,21 @@ def _art_loss(
         "movement_score": movement_score.detach(),
         "outward_alignment": outward_alignment.detach(),
     }
+    if coordinate_mask is not None:
+        # These are gradients of the mean loss with respect to velocity outputs.
+        with torch.no_grad():
+            coordinate_count = coordinate_mask.flatten(1).sum(1).clamp_min(1)
+            scale = _expand_art_vector(
+                2 * weight * keep / (velocity.shape[0] * coordinate_count), velocity
+            )
+            guidance_gradient = scale * displacement
+            restoration_gradient = scale * movement
+            terms.update(
+                output_guidance_grad_sq=guidance_gradient.square().sum(),
+                output_restoration_grad_sq=restoration_gradient.square().sum(),
+                output_grad_inner=(guidance_gradient * restoration_gradient).sum(),
+            )
+    return terms
 
 
 def _art_coordinate_mean(
