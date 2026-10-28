@@ -1078,3 +1078,98 @@ individual round costs. Seconds per 1000 trajectories and trajectories per
 minute account for differences in sampling amounts. The
 :ref:`Training Results <diffusion-art-results>` reports a comparison over the same
 cumulative sampling interval.
+
+Diagnose LIBERO Updates and State Sampling
+------------------------------------------
+
+Use ``libero_10_0_art_diagnostics_openpi`` for Long task 0 or
+``libero_object_0_art_diagnostics_openpi`` for Object task 0. Both select 128
+training environments, K=8, all four denoising steps, actor-side reference
+velocities, FP32 master AdamW, and five rounds. The existing recipes retain
+rollout-side reference velocities and leader-only state collection.
+
+First separate rollout replay error from parameter updates. Set
+``algorithm.art_reference_source=actor`` to recompute the frozen reference once
+before both ART updates. With ``algorithm.art_replay_diagnostics=True``, compare
+``actor/replay_mse`` (actor versus rollout before updating),
+``actor/reference_pre_mse`` (actor versus the selected reference), and
+``actor/update_u1_exec_rms`` / ``actor/update_u2_exec_rms`` (actor-reference
+update displacement). ``actor/drift_u1_*`` and ``actor/drift_u2_*`` continue to
+use the rollout reference. The ``update_u*`` metrics require actor references.
+
+Enable ``algorithm.art_parameter_diagnostics=True`` for a short FSDP1 NO_SHARD
+check. ``actor/param_u1_bf16_changed_frac`` and
+``actor/param_u2_bf16_update_rms`` measure actual model-weight changes;
+``actor/param_u2_master_update_rms`` measures FP32 master accumulation. These
+probes keep CPU copies of trainable parameters and measure cumulative change
+from before the first update. Set ``algorithm.art_replay_batch_sizes=[1,2,8]``
+to compare a fixed subset under different actor inference batch sizes.
+
+Read ``actor/mask_frac_global`` and ``actor/outward_frac_global`` for
+active-item-count-weighted ratios. The ``actor/u1/`` and ``actor/u2/`` versions
+separate the two updates; ``movement_score_active`` uses the same active-item
+denominator. The existing ``mask_frac`` and ``outward_frac`` remain available
+with their microbatch-average definition for old-log comparisons.
+
+Next freeze the SFT policy with ``algorithm.art_probe_only=True``. This skips
+backward, optimizer, scheduler, and post-initial weight synchronization. Select
+one of these state pools with ``algorithm.art_state_sampler``:
+
+.. list-table:: State Sampling Ablations
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Value
+     - Collection and selection
+   * - ``legacy``
+     - Keep all live leader states and sample task-matched temporal strata.
+   * - ``uniform``
+     - Keep a bounded reservoir from every trajectory and sample temporal strata.
+   * - ``success_mixture``
+     - Use the bounded pool; request approximately ``art_success_state_fraction``
+       successful-source states (default 0.7), falling back to the available
+       outcome pool when necessary.
+   * - ``early_failure``
+     - Use the bounded pool; retain all successful-source states and only failed
+       source states before ``art_failure_max_step_fraction`` of the horizon
+       (default 0.5).
+
+``algorithm.art_states_per_trajectory`` defaults to 4 for bounded pools.
+Reservoir admission happens before snapshot capture. Source outcomes are labeled
+when collection ends; restoration preserves the original remaining budget.
+Probe JSONL files under ``<log_path>/art_probe/`` record each group's returns,
+source outcome, source trajectory/reset identity, sampled time, and remaining
+steps. These probes compare sampling distributions without changing rewards.
+
+Run the experiment matrix from an activated OpenPi/LIBERO environment:
+
+.. code-block:: bash
+
+   python examples/embodiment/run_art_ablation.py diagnose \
+     --checkpoint /path/to/model/RLinf-Pi0-LIBERO-Long-SFT --gpus 0,1,2,3
+   python examples/embodiment/run_art_ablation.py probe \
+     --checkpoint /path/to/model/RLinf-Pi0-LIBERO-Long-SFT --gpus 0,1,2,3
+   python examples/embodiment/run_art_ablation.py summary
+
+``diagnose`` runs four five-round arms: rollout/actor references crossed with
+FP32 master disabled/enabled. ``probe`` runs each of the four samplers for ten
+frozen-policy rounds. ``summary`` reports signal yield separately for screening
+and held-out initial reset IDs. Inspect source composition and all-fail/all-success
+rates as well as active fractions; the summary does not select a winner.
+
+After selecting a sampler, run ``train --sampler uniform`` (replace ``uniform``
+with your selection) for two 30-round arms: the corrected numerical baseline
+with ``legacy`` sampling and the same baseline with the selected sampler.
+``confirm --sampler uniform`` repeats both arms for 50 rounds with seeds 42
+and 43. ``object --checkpoint /path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT``
+runs a 25-round Object task 0 baseline. Every phase writes timestamp-first run
+names, console logs, and an exact command manifest. Add ``--dry-run`` to inspect
+commands before execution; pass ``--override key=value`` for a Hydra override.
+
+Training phases evaluate at step 0 and every 10 rounds (every 5 for ``object``).
+``runner.eval_repeats`` repeats the full available reset set, while
+``runner.eval_seed`` pairs policy-noise seeds across arms without advancing the
+training RNG. Three repeats give 150 episodes when the task has 50 reset states;
+these are repeated initial states, not 150 distinct scenes. Confirmation uses
+five repeats. ``eval`` performs four repeats at step 0 with zero training rounds;
+read ``num_trajectories`` to verify the completed evaluation budget.

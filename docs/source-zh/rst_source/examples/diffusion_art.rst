@@ -782,3 +782,87 @@ runner 的整轮计时与互不重叠的阶段计时反映端到端性能，内�
      - actor 与 rollout 两侧的权重传输计时，可能重叠。
 
 表头 Global Step 统计采集与训练轮次，一轮 ART 可以包含两次 optimizer update。Elapsed 是累计墙钟时间，ETA 是预估剩余时间，表头 Step Time 是累计墙钟时间除以已完成轮数得到的平均每轮耗时。Time 区的 ``step`` 记录单轮成本，每千条轨迹耗时与每分钟轨迹数反映不同采样量下的执行成本。相同累计采样区间的对比见 :ref:`训练结果 <diffusion-art-results>`。
+
+排查 LIBERO 更新与状态采样
+--------------------------
+
+Long task 0 使用 ``libero_10_0_art_diagnostics_openpi``，Object task 0 使用
+``libero_object_0_art_diagnostics_openpi``。两者均选择 128 个训练环境、K=8、
+全部 4 步去噪、actor 端参考速度、FP32 master AdamW，并默认运行 5 轮。
+原有配方仍使用 rollout 参考速度和仅组长轨迹的状态采集。
+
+先区分回放误差与参数更新。设置 ``algorithm.art_reference_source=actor``，
+在两次 ART 更新前只重算一次冻结参考。开启
+``algorithm.art_replay_diagnostics=True`` 后，对比
+``actor/replay_mse`` （更新前 actor 与 rollout 的差异）、
+``actor/reference_pre_mse`` （actor 与所选参考的差异），以及
+``actor/update_u1_exec_rms`` / ``actor/update_u2_exec_rms`` （相对于 actor
+参考的更新位移）。``actor/drift_u1_*`` 和 ``actor/drift_u2_*`` 继续使用
+rollout 参考；``update_u*`` 指标只在选择 actor 参考时输出。
+
+短程 FSDP1 NO_SHARD 排查时开启 ``algorithm.art_parameter_diagnostics=True``。
+``actor/param_u1_bf16_changed_frac`` 和 ``actor/param_u2_bf16_update_rms``
+记录实际模型权重变化，``actor/param_u2_master_update_rms`` 记录 FP32 主权重
+的累积更新。诊断在 CPU 保留可训练参数副本，位移均相对于第一次更新前计算。
+设置 ``algorithm.art_replay_batch_sizes=[1,2,8]``，可在固定数据子集上比较
+不同 actor 推理 batch 大小的回放差异。
+
+使用 ``actor/mask_frac_global`` 和 ``actor/outward_frac_global`` 查看按
+active 样本计数加权的比例。``actor/u1/`` 和 ``actor/u2/`` 下的同名指标
+区分两次更新；``movement_score_active`` 使用相同的 active 样本分母。
+原有 ``mask_frac`` 和 ``outward_frac`` 保留 microbatch 平均口径，用于对照旧日志。
+
+随后设置 ``algorithm.art_probe_only=True`` 冻结 SFT 策略。此模式跳过反向传播、
+optimizer、scheduler，以及首次之后的权重同步。通过
+``algorithm.art_state_sampler`` 选择以下状态池：
+
+.. list-table:: 状态采样消融
+   :header-rows: 1
+   :widths: 25 75
+
+   * - 取值
+     - 采集与选取方式
+   * - ``legacy``
+     - 保存所有仍有效的组长状态，按任务匹配并进行时间分层采样。
+   * - ``uniform``
+     - 从所有轨迹建立有容量上限的 reservoir，再进行时间分层采样。
+   * - ``success_mixture``
+     - 使用有界状态池，成功来源状态约占 ``art_success_state_fraction``
+       （默认 0.7）；某类来源为空时使用可用的另一类来源。
+   * - ``early_failure``
+     - 使用有界状态池，保留成功来源的全部状态，仅保留失败来源在
+       ``art_failure_max_step_fraction`` 时间比例之前的状态（默认 0.5）。
+
+有界状态池的 ``algorithm.art_states_per_trajectory`` 默认为 4。
+先进行 reservoir 接纳决策，再捕获 snapshot。采集结束后标注来源轨迹结局，
+恢复时保留原始剩余预算。``<log_path>/art_probe/`` 下的 JSONL 按组记录回报、
+来源结局、来源轨迹和 reset 标识、采样时间及剩余步数。探针比较采样分布，保持奖励不变。
+
+激活 OpenPi/LIBERO 环境后运行实验矩阵：
+
+.. code-block:: bash
+
+   python examples/embodiment/run_art_ablation.py diagnose \
+     --checkpoint /path/to/model/RLinf-Pi0-LIBERO-Long-SFT --gpus 0,1,2,3
+   python examples/embodiment/run_art_ablation.py probe \
+     --checkpoint /path/to/model/RLinf-Pi0-LIBERO-Long-SFT --gpus 0,1,2,3
+   python examples/embodiment/run_art_ablation.py summary
+
+``diagnose`` 运行 4 组各 5 轮的实验：rollout/actor 参考与关闭/开启 FP32 master
+交叉对比。``probe`` 为 4 种采样方式各运行 10 轮冻结策略采集。
+``summary`` 按初始 reset ID 划分筛选集与留出集，分别报告信号产出率。
+同时查看来源构成、全失败和全成功比例，不要只按 active 比例选方案；汇总不会自动选择赢家。
+
+选定采样方式后，运行 ``train --sampler uniform`` （将 ``uniform`` 换成选定方案），
+比较两组各 30 轮训练：采用 ``legacy`` 采样的数值修正基线，以及相同基线加选定采样。
+``confirm --sampler uniform`` 使用 seed 42 和 43，将这两组各重跑 50 轮。
+``object --checkpoint /path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT``
+运行 25 轮 Object task 0 基线。每个阶段的运行名、控制台日志和完整命令清单均以时间戳开头。
+添加 ``--dry-run`` 可先检查命令，``--override key=value`` 可追加 Hydra 覆盖项。
+
+训练阶段在 step 0 及每 10 轮评估一次（``object`` 为每 5 轮）。
+``runner.eval_repeats`` 重复完整的可用 reset 集合，``runner.eval_seed``
+为各实验配对策略采样噪声，同时保持训练 RNG 不变。当任务包含 50 个 reset 状态时，
+重复 3 次得到 150 条轨迹；这是重复初始状态，不是 150 个不同场景。确认阶段重复 5 次。
+``eval`` 在 step 0 重复评估 4 次，训练轮数为 0；使用 ``num_trajectories``
+核对实际完成的评估预算。
