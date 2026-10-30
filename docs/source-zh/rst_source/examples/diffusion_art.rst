@@ -787,7 +787,8 @@ runner 的整轮计时与互不重叠的阶段计时反映端到端性能，内�
 --------------------------
 
 Long task 0 使用 ``libero_10_0_art_diagnostics_openpi``，Object task 0 使用
-``libero_object_0_art_diagnostics_openpi``。两者均选择 128 个训练环境、K=8、
+``libero_object_0_art_diagnostics_openpi``，Spatial task 0 使用
+``libero_spatial_0_art_diagnostics_openpi``。三者均选择 128 个训练环境、K=8、
 全部 4 步去噪、actor 端参考速度、FP32 master AdamW，并默认运行 5 轮。
 原有配方仍使用 rollout 参考速度和仅组长轨迹的状态采集。
 
@@ -866,3 +867,72 @@ optimizer、scheduler，以及首次之后的权重同步。通过
 重复 3 次得到 150 条轨迹；这是重复初始状态，不是 150 个不同场景。确认阶段重复 5 次。
 ``eval`` 在 step 0 重复评估 4 次，训练轮数为 0；使用 ``num_trajectories``
 核对实际完成的评估预算。
+
+
+运行 Spatial Task 0
+-------------------
+
+Spatial task 0 复用相同的 ART 分组和更新路径，以及共用的
+``RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT`` checkpoint。
+Spatial 的单 episode 预算为 240 步，评估 rollout 预算为 480 步；
+Long 仍保留 520/1040 步预算。根据需要训练的决策状态选择 Spatial 配方：
+
+.. list-table:: Spatial Task 0 配方
+   :header-rows: 1
+   :widths: 45 55
+
+   * - 配置
+     - 采样方式与默认参数
+   * - ``libero_spatial_0_art_openpi``
+     - 固定 branch8：共享前 8 个五动作 chunk，再比较第 9 个决策。
+       使用 64 个训练环境、global batch 32。
+   * - ``libero_spatial_0_art_states_openpi``
+     - 恢复采样的决策状态，不共享固定长度前缀。
+       同样使用 64 个训练环境、global batch 32。
+   * - ``libero_spatial_0_art_diagnostics_openpi``
+     - 使用 states 采样、128 个环境、global batch 64、全部 4 步去噪、
+       actor 参考及 FP32 master 参数。
+
+两个非诊断配方保留 rollout 参考，默认训练 4 个去噪步中的 1 个。
+三种配置均使用学习率 ``5e-7``、task ID 0 和 ``init_params.ignore_done=True``，
+由 RLinf 管理 episode 上限。激活 OpenPi/LIBERO 环境后，用下面的命令运行 branch8；
+将配置名换成 ``libero_spatial_0_art_states_openpi``，即可按相同默认参数运行 states 采样：
+
+.. code-block:: bash
+
+   set -o pipefail
+   export CUDA_VISIBLE_DEVICES=0,1,2,3
+   export ROBOT_PLATFORM=LIBERO LIBERO_TYPE=standard
+   export EMBODIED_PATH="$PWD/examples/embodiment"
+   export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+   export SPATIAL_MODEL=/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+   export ART_RUN="$(date +%Y%m%d_%H%M%S)_spatial0_branch8"
+   export ART_LOG_DIR="$PWD/logs/$ART_RUN"
+   mkdir -p "$ART_LOG_DIR"
+
+   python -u examples/embodiment/train_embodied_agent.py \
+     --config-path "$EMBODIED_PATH/config" \
+     --config-name libero_spatial_0_art_openpi \
+     actor.model.model_path="$SPATIAL_MODEL" \
+     rollout.model.model_path="$SPATIAL_MODEL" \
+     runner.logger.log_path="$ART_LOG_DIR" \
+     runner.logger.experiment_name="$ART_RUN" \
+     2>&1 | tee "$ART_LOG_DIR/$ART_RUN.log"
+
+运行前面的诊断和状态采样实验时，为 ``diagnose``、``probe``、``train``、
+``confirm`` 或 ``eval`` 添加 ``--suite spatial``。
+默认 suite 仍为 Long；原有 ``object`` 阶段不受 ``--suite`` 影响，始终选择 Object。
+下面的命令先将 SFT 基线重复评估 3 次，再将 legacy 对照与 ``success_mixture`` 各训练 50 轮：
+
+.. code-block:: bash
+
+   python -u examples/embodiment/run_art_ablation.py eval \
+     --suite spatial --checkpoint "$SPATIAL_MODEL" --gpus 0,1,2,3 \
+     --steps 0 --eval-repeats 3 --log-root "$ART_LOG_DIR"
+   python -u examples/embodiment/run_art_ablation.py train \
+     --suite spatial --checkpoint "$SPATIAL_MODEL" --gpus 0,1,2,3 \
+     --sampler success_mixture --lr 5e-7 --steps 50 --eval-repeats 3 \
+     --log-root "$ART_LOG_DIR"
+
+实验矩阵沿用 Object、Long 的配对评估种子，以及时间戳在前的日志命名。
+通过 ``num_trajectories`` 核对实际评估预算；Spatial 成功率仍需 GPU 和仿真器验证。

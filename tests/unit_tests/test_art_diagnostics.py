@@ -307,6 +307,43 @@ def test_experiment_matrices_preserve_controls_and_matched_seeds():
         experiment_matrix("train", None, 42, [])
 
 
+@pytest.mark.parametrize(
+    ("phase", "arm_count"),
+    [("diagnose", 4), ("probe", 4), ("train", 2), ("confirm", 4), ("eval", 1)],
+)
+def test_spatial_ablation_cli_preserves_suite_and_log_names(
+    monkeypatch, capsys, tmp_path, phase, arm_count
+):
+    from examples.embodiment.run_art_ablation import main
+
+    log_root = tmp_path / "runs"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_art_ablation.py",
+            phase,
+            "--suite",
+            "spatial",
+            "--checkpoint",
+            str(tmp_path / "checkpoint"),
+            "--sampler",
+            "success_mixture",
+            "--log-root",
+            str(log_root),
+            "--dry-run",
+        ],
+    )
+    main()
+    commands = capsys.readouterr().out.splitlines()
+    assert len(commands) == arm_count
+    for command in commands:
+        assert "--config-name libero_spatial_0_art_diagnostics_openpi" in command
+        assert "env.eval.max_steps_per_rollout_epoch=480" in command
+        assert "_spatial0_states_T4_" in command
+        assert "_long0_" not in command and "_object0_" not in command
+    assert not log_root.exists()
+
+
 def test_paired_eval_seeds_restore_training_rng():
     worker = object.__new__(MultiStepRolloutWorker)
     worker._rank, worker.device, worker.torch_device_type = (

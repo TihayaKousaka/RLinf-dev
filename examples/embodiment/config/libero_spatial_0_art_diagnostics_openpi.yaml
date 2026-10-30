@@ -1,0 +1,27 @@
+defaults:
+  - libero_spatial_0_art_states_openpi
+  - _self_
+
+algorithm:
+  art_timestep_fraction: 1.0
+  art_reference_source: actor
+  art_replay_diagnostics: True
+
+actor:
+  global_batch_size: 64
+  optim:
+    use_fp32_master_params: True
+
+env:
+  train:
+    total_num_envs: 128
+
+runner:
+  eval_at_start: False
+  eval_repeats: 1
+  eval_seed: 12345
+  max_steps: 5
+  max_epochs: 5
+  val_check_interval: -1
+  logger:
+    experiment_name: libero_spatial_0_art_diagnostics_openpi

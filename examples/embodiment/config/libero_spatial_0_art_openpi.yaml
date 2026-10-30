@@ -1,0 +1,29 @@
+defaults:
+  - libero_object_0_art_openpi
+  - _self_
+
+algorithm:
+  art_branch_chunk_index: 8
+
+env:
+  train:
+    task_suite_name: libero_spatial
+    init_params:
+      ignore_done: True
+  eval:
+    task_suite_name: libero_spatial
+    init_params:
+      ignore_done: True
+
+actor:
+  global_batch_size: 32
+  optim:
+    lr: 5.0e-7
+
+runner:
+  max_steps: 100
+  max_epochs: 100
+  val_check_interval: 5
+  save_interval: -1
+  logger:
+    experiment_name: libero_spatial_0_art_openpi

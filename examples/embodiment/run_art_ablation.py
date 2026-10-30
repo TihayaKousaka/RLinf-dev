@@ -25,6 +25,11 @@ from datetime import datetime
 from pathlib import Path
 
 SAMPLERS = ("legacy", "uniform", "success_mixture", "early_failure")
+SUITE_CONFIG_NAMES = {
+    "long": "libero_10_0_art_diagnostics_openpi",
+    "object": "libero_object_0_art_diagnostics_openpi",
+    "spatial": "libero_spatial_0_art_diagnostics_openpi",
+}
 
 
 def experiment_matrix(
@@ -73,10 +78,8 @@ def build_command(
     """Build the full Hydra command without relying on shell word splitting."""
     repo = Path(__file__).resolve().parents[2]
     suite = "object" if args.phase == "object" else args.suite
-    horizon = 240 if suite == "object" else 520
-    config = (
-        f"libero_{'object' if suite == 'object' else '10'}_0_art_diagnostics_openpi"
-    )
+    horizon = 520 if suite == "long" else 240
+    config = SUITE_CONFIG_NAMES[suite]
     defaults = {
         "diagnose": 5,
         "probe": 10,
@@ -184,7 +187,7 @@ def main() -> None:
         "phase",
         choices=("diagnose", "probe", "train", "object", "confirm", "eval", "summary"),
     )
-    parser.add_argument("--suite", choices=("long", "object"), default="long")
+    parser.add_argument("--suite", choices=tuple(SUITE_CONFIG_NAMES), default="long")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--log-root", type=Path, default=Path("logs/art_ablation"))
     parser.add_argument("--gpus", default="0,1,2,3")

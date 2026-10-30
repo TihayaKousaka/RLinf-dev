@@ -618,12 +618,23 @@ def test_art_covariance_groups_by_snapshot_identity():
     assert guidance["directions"].flatten().tolist() == [1.0, -1.0, 1.0, -1.0]
 
 
-def test_art_state_sampling_recipe_composes(monkeypatch, art_config_cluster):
+@pytest.mark.parametrize(
+    ("config_name", "task_suite"),
+    [
+        ("libero_object_0_art_states_openpi", "libero_object"),
+        ("libero_spatial_0_art_states_openpi", "libero_spatial"),
+    ],
+)
+def test_art_state_sampling_recipe_composes(
+    monkeypatch, art_config_cluster, config_name, task_suite
+):
     config_dir = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
     monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
     with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
-        cfg = compose(config_name="libero_object_0_art_states_openpi")
+        cfg = compose(config_name=config_name)
     cfg = validate_cfg(cfg)
+    assert cfg.env.train.task_suite_name == cfg.env.eval.task_suite_name == task_suite
+    assert cfg.algorithm.art_branch_chunk_index is None
     assert cfg.env.train.art_state_sampling
     assert cfg.env.train.total_num_envs == 64 and cfg.env.eval.total_num_envs == 48
     assert cfg.actor.global_batch_size == 32 and cfg.actor.micro_batch_size == 2
@@ -639,6 +650,7 @@ def test_art_state_sampling_recipe_composes(monkeypatch, art_config_cluster):
     [
         ("libero_object_0_art_openpi", "libero_object"),
         ("libero_10_0_art_openpi", "libero_10"),
+        ("libero_spatial_0_art_openpi", "libero_spatial"),
     ],
 )
 @pytest.mark.parametrize("branch_index", [0, 8])
@@ -997,8 +1009,16 @@ def test_openpi_art_rollout_replay_and_two_frozen_target_updates():
 @pytest.mark.parametrize(
     "phase", ["diagnose", "probe", "train", "confirm", "object", "eval"]
 )
+@pytest.mark.parametrize(
+    ("suite", "task_suite", "horizon"),
+    [
+        ("long", "libero_10", 520),
+        ("object", "libero_object", 240),
+        ("spatial", "libero_spatial", 240),
+    ],
+)
 def test_art_ablation_commands_validate(
-    monkeypatch, art_config_cluster, tmp_path, phase
+    monkeypatch, art_config_cluster, tmp_path, phase, suite, task_suite, horizon
 ):
     from examples.embodiment.run_art_ablation import build_command, experiment_matrix
 
@@ -1006,7 +1026,7 @@ def test_art_ablation_commands_validate(
     monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
     args = SimpleNamespace(
         phase=phase,
-        suite="long",
+        suite=suite,
         checkpoint=tmp_path,
         steps=None,
         eval_repeats=None,
@@ -1023,9 +1043,64 @@ def test_art_ablation_commands_validate(
                 overrides=command[command.index("--config-name") + 2 :],
             )
         cfg = validate_cfg(cfg)
+        expected_suite = "libero_object" if phase == "object" else task_suite
+        expected_horizon = 240 if phase == "object" else horizon
+        assert cfg.env.train.task_suite_name == expected_suite
+        assert cfg.env.eval.task_suite_name == expected_suite
+        assert cfg.env.train.max_episode_steps == expected_horizon
+        assert cfg.env.eval.max_steps_per_rollout_epoch == 2 * expected_horizon
+        assert cfg.env.train.init_params.ignore_done
+        assert cfg.env.eval.init_params.ignore_done
         assert cfg.actor.global_batch_size == 64
         assert cfg.env.train.task_id_filter == [0]
         assert cfg.env.train.art_state_sampler == arm["sampler"]
         assert cfg.actor.optim.use_fp32_master_params == arm["master"]
         if phase == "eval":
             assert cfg.runner.max_steps == 0 and cfg.runner.eval_at_start
+
+
+@pytest.mark.parametrize(
+    ("config_name", "state_sampling", "diagnostics"),
+    [
+        ("libero_spatial_0_art_openpi", False, False),
+        ("libero_spatial_0_art_states_openpi", True, False),
+        ("libero_spatial_0_art_diagnostics_openpi", True, True),
+    ],
+)
+def test_art_spatial_recipe_defaults(
+    monkeypatch, art_config_cluster, config_name, state_sampling, diagnostics
+):
+    config_dir = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
+    monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
+    with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
+        cfg = compose(config_name=config_name)
+    cfg = validate_cfg(cfg)
+    assert (
+        cfg.env.train.task_suite_name
+        == cfg.env.eval.task_suite_name
+        == "libero_spatial"
+    )
+    assert cfg.env.train.task_id_filter == cfg.env.eval.task_id_filter == [0]
+    assert (
+        cfg.env.train.max_episode_steps
+        == cfg.env.train.max_steps_per_rollout_epoch
+        == 240
+    )
+    assert cfg.env.eval.max_episode_steps == 240
+    assert cfg.env.eval.max_steps_per_rollout_epoch == 480
+    assert (
+        cfg.env.train.init_params.ignore_done and cfg.env.eval.init_params.ignore_done
+    )
+    assert cfg.env.train.art_state_sampling == state_sampling
+    assert cfg.algorithm.art_branch_chunk_index == (None if state_sampling else 8)
+    assert cfg.actor.global_batch_size == (64 if diagnostics else 32)
+    assert cfg.env.train.total_num_envs == (128 if diagnostics else 64)
+    assert cfg.actor.optim.lr == 5e-7
+    assert cfg.algorithm.art_timestep_fraction == (1.0 if diagnostics else 0.25)
+    assert cfg.algorithm.art_reference_source == ("actor" if diagnostics else "rollout")
+    assert cfg.actor.optim.get("use_fp32_master_params", False) == diagnostics
+    assert cfg.actor.model.model_path == cfg.rollout.model.model_path
+    assert (
+        cfg.actor.model.model_path
+        == "/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
+    )

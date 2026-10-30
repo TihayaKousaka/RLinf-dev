@@ -1082,9 +1082,10 @@ cumulative sampling interval.
 Diagnose LIBERO Updates and State Sampling
 ------------------------------------------
 
-Use ``libero_10_0_art_diagnostics_openpi`` for Long task 0 or
-``libero_object_0_art_diagnostics_openpi`` for Object task 0. Both select 128
-training environments, K=8, all four denoising steps, actor-side reference
+Use ``libero_10_0_art_diagnostics_openpi`` for Long task 0,
+``libero_object_0_art_diagnostics_openpi`` for Object task 0, or
+``libero_spatial_0_art_diagnostics_openpi`` for Spatial task 0. All three select
+128 training environments, K=8, all four denoising steps, actor-side reference
 velocities, FP32 master AdamW, and five rounds. The existing recipes retain
 rollout-side reference velocities and leader-only state collection.
 
@@ -1173,3 +1174,77 @@ training RNG. Three repeats give 150 episodes when the task has 50 reset states;
 these are repeated initial states, not 150 distinct scenes. Confirmation uses
 five repeats. ``eval`` performs four repeats at step 0 with zero training rounds;
 read ``num_trajectories`` to verify the completed evaluation budget.
+
+
+Run Spatial Task 0
+------------------
+
+Use the same ART grouping and update paths for Spatial task 0, with the shared
+``RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT`` checkpoint. Spatial uses a 240-step
+episode budget and a 480-step evaluation rollout budget; Long keeps its
+520/1040-step budgets. Choose the Spatial recipe for the decision states you
+want to train:
+
+.. list-table:: Spatial Task 0 Recipes
+   :header-rows: 1
+   :widths: 45 55
+
+   * - Configuration
+     - Sampling and defaults
+   * - ``libero_spatial_0_art_openpi``
+     - Fixed branch8: share eight five-action chunks, then compare the ninth
+       decision. Use 64 training environments and a global batch of 32.
+   * - ``libero_spatial_0_art_states_openpi``
+     - Restore sampled decision states instead of sharing a fixed prefix.
+       Use the same 64-environment and global-batch-32 budget.
+   * - ``libero_spatial_0_art_diagnostics_openpi``
+     - Use states sampling, 128 environments, global batch 64, all four
+       denoising steps, actor references, and FP32 master parameters.
+
+Both non-diagnostic recipes retain the rollout reference and train one of four
+denoising steps by default. All three use learning rate ``5e-7``, task ID 0,
+and ``init_params.ignore_done=True`` so RLinf owns the episode limit.
+The following command runs branch8 from an activated OpenPi/LIBERO environment.
+Replace the configuration name with ``libero_spatial_0_art_states_openpi`` to
+run states sampling with the same defaults:
+
+.. code-block:: bash
+
+   set -o pipefail
+   export CUDA_VISIBLE_DEVICES=0,1,2,3
+   export ROBOT_PLATFORM=LIBERO LIBERO_TYPE=standard
+   export EMBODIED_PATH="$PWD/examples/embodiment"
+   export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+   export SPATIAL_MODEL=/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+   export ART_RUN="$(date +%Y%m%d_%H%M%S)_spatial0_branch8"
+   export ART_LOG_DIR="$PWD/logs/$ART_RUN"
+   mkdir -p "$ART_LOG_DIR"
+
+   python -u examples/embodiment/train_embodied_agent.py \
+     --config-path "$EMBODIED_PATH/config" \
+     --config-name libero_spatial_0_art_openpi \
+     actor.model.model_path="$SPATIAL_MODEL" \
+     rollout.model.model_path="$SPATIAL_MODEL" \
+     runner.logger.log_path="$ART_LOG_DIR" \
+     runner.logger.experiment_name="$ART_RUN" \
+     2>&1 | tee "$ART_LOG_DIR/$ART_RUN.log"
+
+For the diagnostic and state-sampling experiments above, pass ``--suite spatial``
+to ``diagnose``, ``probe``, ``train``, ``confirm``, or ``eval``. The default suite
+remains Long; the existing ``object`` phase still selects Object regardless of
+``--suite``. These commands evaluate the SFT baseline with three repeats, then
+train the legacy control and ``success_mixture`` for 50 rounds each:
+
+.. code-block:: bash
+
+   python -u examples/embodiment/run_art_ablation.py eval \
+     --suite spatial --checkpoint "$SPATIAL_MODEL" --gpus 0,1,2,3 \
+     --steps 0 --eval-repeats 3 --log-root "$ART_LOG_DIR"
+   python -u examples/embodiment/run_art_ablation.py train \
+     --suite spatial --checkpoint "$SPATIAL_MODEL" --gpus 0,1,2,3 \
+     --sampler success_mixture --lr 5e-7 --steps 50 --eval-repeats 3 \
+     --log-root "$ART_LOG_DIR"
+
+The matrix uses the same paired evaluation seeds and timestamp-first log names
+as Object and Long. Read ``num_trajectories`` to check the completed evaluation
+budget. Spatial success rates still require GPU and simulator validation.
