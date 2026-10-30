@@ -746,6 +746,13 @@ class MultiStepRolloutWorker(Worker):
         if chunk_index < self.art_branch_chunk_index:
             actions = _repeat_art_group_leaders(actions, group_size)
             result = _repeat_art_group_leaders(result, group_size)
+        elif chunk_index == self.art_branch_chunk_index and self.algorithm_cfg.get(
+            "art_repeat_candidates", False
+        ):
+            # A diagnostic group has K/2 distinct candidates, each executed
+            # twice. Subsequent chunks retain independent sampling noise.
+            actions = _repeat_art_group_leaders(actions, 2)
+            result = _repeat_art_group_leaders(result, 2)
         result["forward_inputs"].update(
             art_branch_valid=self._art_prefix_valid.clone(),
             art_branch_state_error=self._art_branch_state_error.clone(),

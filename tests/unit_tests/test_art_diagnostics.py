@@ -392,3 +392,208 @@ def test_repeated_evaluation_counts_episodes_and_pairs_noise_seeds():
     assert [call["seed"] for call in runner.rollout.calls] == [123, 124, 125]
     assert metrics["success_once"] == 0.5
     assert metrics["num_trajectories"] == 6
+
+
+def test_parameter_probe_handles_lazy_master_initialization():
+    model = torch.nn.Linear(2, 1, bias=False, dtype=torch.bfloat16)
+    optimizer = FP32MasterAdamW(model.parameters(), lr=5e-7, weight_decay=0)
+    assert not optimizer.state
+    probe = ARTParameterProbe(model, optimizer)
+    model.weight.grad = torch.ones_like(model.weight)
+    optimizer.step()
+    metrics = probe.metrics("param", torch.device("cpu"))
+    assert metrics["param_master_update_rms"] > 0
+    assert metrics["param_master_changed_frac"] == 1
+
+
+class _ModeVelocityPolicy(_VelocityPolicy):
+    def forward(self, *args, **kwargs):
+        output = super().forward(*args, **kwargs)
+        bias = 0.02 * self.training + 0.03 * (self.training and torch.is_grad_enabled())
+        return {"v_theta": output["v_theta"] + bias}
+
+
+def test_zero_update_probe_uses_real_training_forward_before_step(
+    tmp_path, cpu_art_backend
+):
+    actor = _cpu_actor(tmp_path, cpu_art_backend)
+    actor.cfg.algorithm.art_zero_update_diagnostics = True
+    actor.cfg.algorithm.art_mask_metric = "fixed_mse"
+    actor.model = _ModeVelocityPolicy()
+    actor.optimizer = torch.optim.AdamW(actor.model.parameters(), lr=0.01)
+    metrics = inspect.unwrap(EmbodiedARTFSDPPolicy.run_training)(actor)
+    prefix = "actor/zero_update/"
+    assert metrics[prefix + "batch_rms"] == 0
+    assert metrics[prefix + "train_eval_rms"] == pytest.approx(0.02, abs=1e-6)
+    assert metrics[prefix + "train_repeat_rms"] == 0
+    assert metrics[prefix + "grad_nograd_rms"] == pytest.approx(0.03, abs=1e-6)
+    assert metrics[prefix + "trainref_score_active"] == pytest.approx(0.03**2, abs=1e-7)
+    assert metrics[prefix + "active_count"] > 0
+    assert actor.model.training
+    assert actor._art_zero_update_probe is None
+    rows = [
+        json.loads(line)
+        for line in next(tmp_path.glob("*_art_diagnostics.jsonl"))
+        .read_text()
+        .splitlines()
+    ]
+    assert rows[0][prefix + "grad_nograd_rms"] == metrics[prefix + "grad_nograd_rms"]
+
+
+@pytest.mark.parametrize("disagree", [False, True])
+def test_repeat_candidates_measure_continuation_noise_not_action_noise(disagree):
+    from rlinf.workers.actor.art_diagnostics import art_repeat_candidate_metrics
+
+    endpoints = torch.arange(4.0).repeat_interleave(2).reshape(8, 1, 1)
+    rewards = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1.0])
+    if disagree:
+        rewards[1::2] = 1 - rewards[1::2]
+    metrics = art_repeat_candidate_metrics(
+        endpoints, rewards, torch.ones(8, 1, dtype=torch.bool), torch.tensor([True]), 8
+    )
+    assert metrics["actor/repeat/matched_pairs"] == 4
+    assert metrics["actor/repeat/endpoint_max_abs"] == 0
+    assert metrics["actor/repeat/reward_disagreement_frac"] == float(disagree)
+    assert metrics["actor/repeat/covariance_cosine"] == pytest.approx(
+        -1 if disagree else 1
+    )
+    assert metrics["actor/repeat/opposite_direction_frac"] == float(disagree)
+    assert metrics["actor/repeat/both_signal_groups"] == 1
+
+
+def test_repeat_probe_excludes_mismatched_endpoints_and_no_signal_groups():
+    from rlinf.workers.actor.art_diagnostics import art_repeat_candidate_metrics
+
+    endpoints = torch.zeros(8, 1, 1)
+    endpoints[1] = 1
+    metrics = art_repeat_candidate_metrics(
+        endpoints,
+        torch.zeros(8),
+        torch.ones(8, 1, dtype=torch.bool),
+        torch.tensor([True]),
+        8,
+    )
+    assert metrics["actor/repeat/matched_pairs"] == 3
+    assert metrics["actor/repeat/endpoint_max_abs"] == 1
+    assert metrics["actor/repeat/both_signal_groups"] == 0
+
+
+def test_rollout_duplicates_only_the_trained_candidate():
+    worker = object.__new__(MultiStepRolloutWorker)
+    worker.art_state_sampling = False
+    worker.art_branch_chunk_index = 0
+    worker.algorithm_cfg = OmegaConf.create(
+        {"group_size": 8, "art_repeat_candidates": True}
+    )
+    actions = torch.arange(8.0).reshape(8, 1, 1).expand(8, 5, 7)
+    worker.predict = lambda obs, mode: (
+        actions,
+        {"forward_inputs": {"art_endpoint": actions}},
+    )
+    obs = {
+        "states": torch.zeros(8, 7),
+        "main_images": torch.zeros(8, 2, 2, 3),
+        "wrist_images": torch.zeros(8, 2, 2, 3),
+        "task_descriptions": ["pick"] * 8,
+        "art_sim_state_error": torch.zeros(8),
+    }
+    first, result = worker._predict_art_branch_actions(obs, 0)
+    torch.testing.assert_close(first[::2], first[1::2])
+    torch.testing.assert_close(result["forward_inputs"]["art_endpoint"], first)
+    assert first[:, 0, 0].tolist() == [0, 0, 2, 2, 4, 4, 6, 6]
+    later, _ = worker._predict_art_branch_actions(obs, 1)
+    torch.testing.assert_close(later, actions)
+    assert not torch.equal(later[::2], later[1::2])
+
+
+def test_quickcheck_is_one_short_arm_with_all_three_checks(
+    monkeypatch, capsys, tmp_path
+):
+    from examples.embodiment.run_art_ablation import main
+
+    assert len(experiment_matrix("quickcheck", None, 42, [])) == 1
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_art_ablation.py",
+            "quickcheck",
+            "--suite",
+            "long",
+            "--checkpoint",
+            str(tmp_path),
+            "--dry-run",
+        ],
+    )
+    main()
+    command = capsys.readouterr().out
+    for override in (
+        "runner.max_steps=2",
+        "runner.eval_at_start=false",
+        "runner.val_check_interval=-1",
+        "algorithm.art_state_sampler=success_mixture",
+        "actor.optim.use_fp32_master_params=true",
+        "algorithm.art_reference_source=actor",
+        "algorithm.art_zero_update_diagnostics=true",
+        "algorithm.art_parameter_diagnostics=true",
+        "algorithm.art_repeat_candidates=true",
+        "algorithm.art_replay_diagnostics=false",
+        "algorithm.art_replay_batch_sizes=[]",
+    ):
+        assert override in command
+
+
+def test_zero_update_diagnostics_do_not_change_training_targets(
+    tmp_path, cpu_art_backend
+):
+    control = _cpu_actor(tmp_path / "control", cpu_art_backend)
+    diagnostic = _cpu_actor(tmp_path / "diagnostic", cpu_art_backend)
+    diagnostic.cfg.algorithm.art_zero_update_diagnostics = True
+    run = inspect.unwrap(EmbodiedARTFSDPPolicy.run_training)
+    control_metrics, metrics = run(control), run(diagnostic)
+    torch.testing.assert_close(
+        control.model.offset, diagnostic.model.offset, rtol=0, atol=0
+    )
+    assert (
+        metrics["actor/u1/mask_frac_global"]
+        == control_metrics["actor/u1/mask_frac_global"]
+    )
+    for key in (
+        "batch_rms",
+        "train_eval_rms",
+        "train_repeat_rms",
+        "grad_nograd_rms",
+        "trainref_mask_frac",
+    ):
+        assert metrics["actor/zero_update/" + key] == 0
+
+
+def test_quickcheck_summary_retains_precision_and_diagnostic_names(tmp_path, capsys):
+    from examples.embodiment.run_art_ablation import summarize_quickchecks
+
+    row = {
+        "round": 1,
+        "actor/zero_update/grad_nograd_rms": 1.23456789e-4,
+        "actor/param_u1_master_update_rms": 5e-7,
+        "actor/repeat/matched_pairs": 64,
+        "actor/art_loss": 1,
+    }
+    (tmp_path / "20261030_art_diagnostics.jsonl").write_text(json.dumps(row) + "\n")
+    summarize_quickchecks(tmp_path)
+    out = capsys.readouterr().out
+    assert "0.000123456789" in out
+    assert "actor/param_u1_master_update_rms" in out
+    assert "actor/repeat/matched_pairs" in out
+    assert "actor/art_loss" not in out
+
+
+def test_zero_signal_quickcheck_saves_diagnostic_outcome(tmp_path, cpu_art_backend):
+    actor = _cpu_actor(tmp_path, cpu_art_backend)
+    actor.cfg.algorithm.art_zero_update_diagnostics = True
+    actor.cfg.algorithm.art_replay_diagnostics = False
+    actor.rollout_batch["rewards"].zero_()
+    metrics = inspect.unwrap(EmbodiedARTFSDPPolicy.run_training)(actor)
+    assert metrics["actor/skipped_zero_guidance"] == 1
+    assert not actor.optimizer.state
+    assert actor.lr_scheduler.last_epoch == 0
+    row = json.loads(next(tmp_path.glob("*_art_diagnostics.jsonl")).read_text())
+    assert row["actor/skipped_zero_guidance"] == 1

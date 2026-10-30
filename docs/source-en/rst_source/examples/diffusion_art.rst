@@ -1248,3 +1248,56 @@ train the legacy control and ``success_mixture`` for 50 rounds each:
 The matrix uses the same paired evaluation seeds and timestamp-first log names
 as Object and Long. Read ``num_trajectories`` to check the completed evaluation
 budget. Spatial success rates still require GPU and simulator validation.
+
+LIBERO Quick Numerical Check
+----------------------------
+
+Use ``quickcheck`` to check pre-update reference errors, real parameter changes,
+and continuation-return noise in one two-round job. It retains the Long task 0
+520-step budget, 128 environments, four denoising steps, actor references, and
+FP32 master parameters. It skips evaluation, checkpoints, and the four-arm
+``diagnose`` matrix. Run it from an activated OpenPi/LIBERO environment:
+
+.. code-block:: bash
+
+   set -o pipefail
+   export LONG_MODEL=/path/to/model/RLinf-Pi0-LIBERO-Long-SFT
+   export ART_LOG_ROOT="$PWD/logs/$(date +%Y%m%d_%H%M%S)_long0_quickcheck"
+   mkdir -p "$ART_LOG_ROOT"
+   python -u examples/embodiment/run_art_ablation.py quickcheck \
+     --suite long --checkpoint "$LONG_MODEL" --gpus 0,1,2,3 \
+     --sampler success_mixture --seed 42 --lr 5e-7 --steps 2 \
+     --log-root "$ART_LOG_ROOT" \
+     2>&1 | tee "$ART_LOG_ROOT/$(date +%Y%m%d_%H%M%S)_quickcheck.log"
+
+Before the first optimizer step of each round,
+``algorithm.art_zero_update_diagnostics=true`` compares references on every
+actual first-window training microbatch. ``actor/zero_update/batch_rms``
+compares the cached actor reference with an eval-mode recomputation in the
+training batch arrangement. ``train_eval_rms`` isolates the train/eval
+mode difference without autograd; ``train_repeat_rms`` measures repeatability
+in training mode. ``grad_nograd_rms`` compares the real training output with
+its same-batch, same-mode no-grad reference. ``trainref_score_active`` and
+``trainref_mask_frac`` recompute the movement score and mask using that
+reference without replacing the training target. These probes do not update
+parameters; the job subsequently performs normal optimizer steps so
+``actor/param_u1_*`` and ``actor/param_u2_*`` can measure changes to model and
+master parameters.
+
+``algorithm.art_repeat_candidates=true`` copies each candidate's executed
+chunk and cached diffusion trajectory to its adjacent row, only at the trained
+branch. Later chunks keep independent sampling noise. Each group therefore
+contains four distinct candidates with two continuations each, not eight
+independent candidates. Check ``actor/repeat/endpoint_max_abs`` and
+``matched_pairs`` before reading ``reward_disagreement_frac``.
+``covariance_cosine`` compares covariance estimates from the two sets of four
+continuations; its denominator is ``both_signal_groups``. A zero denominator
+means the displayed zero cosine is unavailable, not evidence of orthogonal
+directions. Disagreement measures continuation variability, including any
+simulator nondeterminism; it does not establish that common random numbers
+would reduce variance. Do not use this diagnostic run as a training baseline.
+
+Both new switches default to false. Existing ablation arms are unchanged.
+Exact metrics are saved in timestamp-first ``*_art_diagnostics.jsonl`` files
+and summarized at job completion. With all groups lacking guidance, no update
+or zero-update probe runs; inspect the group-success metrics instead.

@@ -1322,6 +1322,8 @@ def validate_embodied_cfg(cfg):
             "art_replay_diagnostics",
             "art_reference_source",
             "art_parameter_diagnostics",
+            "art_zero_update_diagnostics",
+            "art_repeat_candidates",
             "art_replay_batch_sizes",
             "art_probe_only",
             "art_state_sampler",
@@ -1556,12 +1558,21 @@ def validate_openpi_art_cfg(cfg: DictConfig) -> None:
         "art_first_chunk_only",
         "art_replay_diagnostics",
         "art_parameter_diagnostics",
+        "art_zero_update_diagnostics",
+        "art_repeat_candidates",
         "art_probe_only",
     ):
         value = cfg.algorithm.get(key, False)
         assert type(value) is bool, f"algorithm.{key} must be boolean, got {value!r}."
     branch_index = cfg.algorithm.get("art_branch_chunk_index", None)
     state_sampling = cfg.algorithm.get("art_state_sampling", False)
+    if cfg.algorithm.get("art_repeat_candidates", False):
+        assert state_sampling or branch_index is not None, (
+            "art_repeat_candidates requires state sampling or a fixed branch."
+        )
+        assert cfg.algorithm.group_size >= 4 and cfg.algorithm.group_size % 2 == 0, (
+            "art_repeat_candidates requires an even group_size >= 4."
+        )
     assert cfg.algorithm.get("art_reference_source", "rollout") in {
         "rollout",
         "actor",

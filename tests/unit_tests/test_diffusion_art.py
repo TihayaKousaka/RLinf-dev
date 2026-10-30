@@ -1104,3 +1104,29 @@ def test_art_spatial_recipe_defaults(
         cfg.actor.model.model_path
         == "/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
     )
+
+
+def test_quickcheck_options_validate_and_reject_invalid_pair_groups(
+    monkeypatch, art_config_cluster
+):
+    config_dir = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
+    monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
+    with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="libero_10_0_art_diagnostics_openpi",
+            overrides=[
+                "algorithm.art_zero_update_diagnostics=true",
+                "algorithm.art_repeat_candidates=true",
+                "algorithm.art_parameter_diagnostics=true",
+                "algorithm.art_state_sampler=success_mixture",
+                "runner.max_steps=2",
+                "runner.max_epochs=2",
+            ],
+        )
+    cfg = validate_cfg(cfg)
+    assert cfg.algorithm.art_zero_update_diagnostics
+    assert cfg.algorithm.art_repeat_candidates
+    for invalid_group_size in (2, 3, 7):
+        cfg.algorithm.group_size = invalid_group_size
+        with pytest.raises(AssertionError, match="even group_size >= 4"):
+            validate_openpi_art_cfg(cfg)

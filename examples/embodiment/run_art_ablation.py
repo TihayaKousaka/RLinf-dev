@@ -47,6 +47,15 @@ def experiment_matrix(
             for reference in ("rollout", "actor")
             for master in (False, True)
         ]
+    if phase == "quickcheck":
+        return [
+            {
+                "sampler": sampler or "success_mixture",
+                "master": True,
+                "reference": "actor",
+                "seed": seed,
+            }
+        ]
     if phase == "probe":
         return [
             {"sampler": name, "master": False, "reference": "rollout", "seed": seed}
@@ -82,6 +91,7 @@ def build_command(
     config = SUITE_CONFIG_NAMES[suite]
     defaults = {
         "diagnose": 5,
+        "quickcheck": 2,
         "probe": 10,
         "train": 30,
         "confirm": 50,
@@ -115,7 +125,7 @@ def build_command(
         "algorithm.art_failure_max_step_fraction": 0.5,
         "algorithm.art_reference_source": arm["reference"],
         "algorithm.art_replay_diagnostics": args.phase == "diagnose",
-        "algorithm.art_parameter_diagnostics": args.phase == "diagnose",
+        "algorithm.art_parameter_diagnostics": args.phase in {"diagnose", "quickcheck"},
         "algorithm.art_replay_batch_sizes": "[1,2,8]"
         if args.phase == "diagnose"
         else "[]",
@@ -134,6 +144,13 @@ def build_command(
         "runner.logger.log_path": str(run_dir),
         "runner.logger.experiment_name": name,
     }
+    if args.phase == "quickcheck":
+        overrides.update(
+            {
+                "algorithm.art_zero_update_diagnostics": True,
+                "algorithm.art_repeat_candidates": True,
+            }
+        )
     command = [
         sys.executable,
         str(repo / "examples/embodiment/train_embodied_agent.py"),
@@ -180,12 +197,46 @@ def summarize_probes(log_root: Path) -> None:
         raise ValueError(f"No ART probe JSONL files found under {log_root}.")
 
 
+def summarize_quickchecks(log_root: Path) -> None:
+    """Print exact diagnostic values without the training table's rounding."""
+    paths = sorted(log_root.rglob("*_art_diagnostics.jsonl"))
+    if not paths:
+        raise ValueError(f"No ART diagnostic JSONL files found under {log_root}.")
+    for path in paths:
+        for line in path.read_text().splitlines():
+            row = json.loads(line)
+            selected = {
+                key: value
+                for key, value in row.items()
+                if key == "round"
+                or key in {"actor/active_group_frac", "actor/skipped_zero_guidance"}
+                or key.startswith(
+                    (
+                        "actor/zero_update/",
+                        "actor/repeat/",
+                        "actor/param_u",
+                        "actor/u1/",
+                    )
+                )
+            }
+            print(path.name + " " + json.dumps(selected, sort_keys=True), flush=True)
+
+
 def main() -> None:
     """Run one phase sequentially on the selected GPUs and stop on any failure."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "phase",
-        choices=("diagnose", "probe", "train", "object", "confirm", "eval", "summary"),
+        choices=(
+            "diagnose",
+            "quickcheck",
+            "probe",
+            "train",
+            "object",
+            "confirm",
+            "eval",
+            "summary",
+        ),
     )
     parser.add_argument("--suite", choices=tuple(SUITE_CONFIG_NAMES), default="long")
     parser.add_argument("--checkpoint", type=Path)
@@ -270,6 +321,8 @@ def main() -> None:
                 raise
         if code:
             raise subprocess.CalledProcessError(code, command)
+    if args.phase == "quickcheck" and not args.dry_run:
+        summarize_quickchecks(args.log_root)
 
 
 if __name__ == "__main__":

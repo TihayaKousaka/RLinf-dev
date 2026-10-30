@@ -51,6 +51,8 @@ algorithm:
   art_replay_diagnostics: False
   art_reference_source: rollout
   art_parameter_diagnostics: False
+  art_zero_update_diagnostics: False
+  art_repeat_candidates: False
   art_replay_batch_sizes: []
   art_probe_only: False
   art_state_sampler: legacy

@@ -936,3 +936,26 @@ Long 仍保留 520/1040 步预算。根据需要训练的决策状态选择 Spat
 
 实验矩阵沿用 Object、Long 的配对评估种子，以及时间戳在前的日志命名。
 通过 ``num_trajectories`` 核对实际评估预算；Spatial 成功率仍需 GPU 和仿真器验证。
+
+LIBERO 快速数值检查
+------------------------
+
+``quickcheck`` 将更新前参考误差、真实参数位移和续跑回报噪声合并到一个两轮作业。它保留 Long task 0 的 520 步预算、128 个环境、4 个去噪步、actor 参考和 FP32 master 参数，跳过评估、checkpoint 和 ``diagnose`` 的四组对照。在已激活的 OpenPi/LIBERO 环境中执行：
+
+.. code-block:: bash
+
+   set -o pipefail
+   export LONG_MODEL=/path/to/model/RLinf-Pi0-LIBERO-Long-SFT
+   export ART_LOG_ROOT="$PWD/logs/$(date +%Y%m%d_%H%M%S)_long0_quickcheck"
+   mkdir -p "$ART_LOG_ROOT"
+   python -u examples/embodiment/run_art_ablation.py quickcheck \
+     --suite long --checkpoint "$LONG_MODEL" --gpus 0,1,2,3 \
+     --sampler success_mixture --seed 42 --lr 5e-7 --steps 2 \
+     --log-root "$ART_LOG_ROOT" \
+     2>&1 | tee "$ART_LOG_ROOT/$(date +%Y%m%d_%H%M%S)_quickcheck.log"
+
+每轮第一次 optimizer step 之前，``algorithm.art_zero_update_diagnostics=true`` 在第一个更新窗口的所有实际训练 microbatch 上比较参考值。``actor/zero_update/batch_rms`` 比较缓存的 actor 参考与按训练 batch 组合重算的 eval 输出；``train_eval_rms`` 在无 autograd 时隔离 train/eval 模式差异；``train_repeat_rms`` 检查训练模式下重复前向的一致性；``grad_nograd_rms`` 比较真实训练输出与相同 batch、相同模式的无梯度参考。``trainref_score_active`` 和 ``trainref_mask_frac`` 用这个参考重算位移分数和 mask，但不替换训练目标。这些前向检查不更新参数；同一作业随后仍执行正常 optimizer step，供 ``actor/param_u1_*`` 和 ``actor/param_u2_*`` 测量模型参数与 master 参数的真实变化。
+
+``algorithm.art_repeat_candidates=true`` 只在被训练的分叉点，将每个候选的执行 chunk 和缓存去噪轨迹复制到相邻行，后续 chunk 保留独立采样噪声。因此每组实际是 4 个不同候选各续跑两次，不再是 8 个独立候选。先检查 ``actor/repeat/endpoint_max_abs`` 和 ``matched_pairs``，再看 ``reward_disagreement_frac``。``covariance_cosine`` 比较两组各 4 次续跑估计出的协方差方向，分母为 ``both_signal_groups``；分母为 0 时，显示的零余弦表示不可计算，不代表方向正交。回报不一致反映续跑变动，也可能包含仿真非确定性，不能据此断言共同随机数一定降低方差。这组诊断不能充当训练效果基线。
+
+两个新开关均默认关闭，现有 ablation 组保持原行为。精确指标保存在时间戳开头的 ``*_art_diagnostics.jsonl``，作业结束后自动汇总。如果所有组均无 guidance，则不执行更新或零更新检查，应先查看组内成功率分布。

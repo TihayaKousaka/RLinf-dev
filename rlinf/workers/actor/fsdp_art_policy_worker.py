@@ -33,7 +33,11 @@ from rlinf.utils.nested_dict_process import (
     split_dict_to_chunk,
 )
 from rlinf.utils.utils import clear_memory
-from rlinf.workers.actor.art_diagnostics import ARTParameterProbe
+from rlinf.workers.actor.art_diagnostics import (
+    ARTParameterProbe,
+    ARTZeroUpdateProbe,
+    art_repeat_candidate_metrics,
+)
 from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 
 _ART_LOSS_SPACES = ("velocity_linear_sigma", "velocity_uniform")
@@ -104,10 +108,12 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
             preparation_metrics.update(self._art_replay_metrics())
         if not has_guidance:
             clear_memory()
-            return all_reduce_dict(
+            metrics = all_reduce_dict(
                 preparation_metrics,
                 op=torch.distributed.ReduceOp.AVG,
             )
+            self._write_art_diagnostic_metrics(metrics)
+            return metrics
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
         actor_reference = (
@@ -143,6 +149,13 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
             append_to_dict(metrics, {key: value})
 
         for update_index, window_rows in enumerate(windows, start=1):
+            self._art_zero_update_probe = (
+                ARTZeroUpdateProbe(self.device)
+                if update_index == 1
+                and action_trajectories
+                and self.cfg.algorithm.get("art_zero_update_diagnostics", False)
+                else None
+            )
             window_batch = self._index_nested(self.rollout_batch, window_rows)
             window_size = window_rows.numel()
             micro_batch_size = int(self.cfg.actor.micro_batch_size)
@@ -232,6 +245,9 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
                     del loss, scaled_loss, step_metrics
 
             self.torch_platform.empty_cache()
+            if self._art_zero_update_probe is not None:
+                append_to_dict(metrics, self._art_zero_update_probe.metrics())
+                self._art_zero_update_probe = None
             grad_norm, lr_list = self.optimizer_step()
             self.lr_scheduler.step()
             mask_counts += update_mask_counts
@@ -284,7 +300,19 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
             mean_metrics["actor/art_output_restore_cosine"] = inner / math.sqrt(
                 max(guidance_sq * restoration_sq, 1e-30)
             )
+        self._write_art_diagnostic_metrics(mean_metrics)
         return mean_metrics
+
+    def _write_art_diagnostic_metrics(self, metrics: dict[str, float]) -> None:
+        if self._rank == 0 and (
+            self.cfg.algorithm.get("art_zero_update_diagnostics", False)
+            or self.cfg.algorithm.get("art_repeat_candidates", False)
+        ):
+            log_path = Path(self.cfg.runner.logger.log_path)
+            log_path.mkdir(parents=True, exist_ok=True)
+            name = self.cfg.runner.logger.experiment_name
+            with (log_path / f"{name}_art_diagnostics.jsonl").open("a") as stream:
+                stream.write(json.dumps({"round": self.version, **metrics}) + "\n")
 
     def _art_covariance_options(self) -> dict:
         defaults = {
@@ -374,6 +402,17 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
         condition_ids = forward_inputs["art_state_id"][0] if state_sampling else None
         if state_sampling and self.cfg.algorithm.get("art_probe_only", False):
             self._write_art_probe_groups(forward_inputs, episode_returns, group_valid)
+        if self.cfg.algorithm.get("art_repeat_candidates", False):
+            preparation_metrics.update(
+                art_repeat_candidate_metrics(
+                    endpoints[branch_index],
+                    episode_returns,
+                    selected_mask[0],
+                    group_valid,
+                    group_size,
+                    device=self.device,
+                )
+            )
         guidance = _art_trajectory_guidance(
             endpoints[first_decision : first_decision + decisions],
             episode_returns,
@@ -698,6 +737,24 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
             self.device
         )
 
+        zero_probe = getattr(self, "_art_zero_update_probe", None)
+        references = []
+        if zero_probe is not None:
+            was_training = self.model.training
+            try:
+                for training in (False, True, True):
+                    self.model.train(training)
+                    with torch.no_grad(), self.amp_context:
+                        reference = self.model(
+                            forward_type=ForwardType.NFT,
+                            forward_inputs=model_inputs,
+                            nft_inputs={"x_t": states, "timesteps": sigmas},
+                            compute_values=False,
+                        )["v_theta"]
+                    references.append(reference.detach().float().clone())
+            finally:
+                self.model.train(was_training)
+
         with self.amp_context:
             output = self.model(
                 forward_type=ForwardType.NFT,
@@ -715,6 +772,21 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
         output_gradient_stats = coordinate_mask is not None and bool(
             self.cfg.algorithm.get("art_replay_diagnostics", False)
         )
+        loss_options = {
+            "loss_space": self.cfg.algorithm.get(
+                "art_loss_space", "velocity_linear_sigma"
+            ),
+            "mask_metric": self.cfg.algorithm.get("art_mask_metric", "sde_kl"),
+            "mask_threshold": float(self.cfg.algorithm.get("art_mask_threshold", 1e-5)),
+            "reference_noise_level": float(
+                self.cfg.algorithm.get("art_reference_noise_level", 0.8)
+            ),
+            "corrective_mask_enabled": bool(
+                self.cfg.algorithm.get("art_corrective_mask_enabled", True)
+            ),
+            "coordinate_mask": coordinate_mask,
+            "output_gradient_stats": output_gradient_stats,
+        }
         terms = _art_loss(
             velocity,
             old_velocity,
@@ -722,20 +794,27 @@ class EmbodiedARTFSDPPolicy(EmbodiedFSDPActor):
             sigmas_next,
             guidance_direction,
             guidance_magnitude,
-            loss_space=self.cfg.algorithm.get(
-                "art_loss_space", "velocity_linear_sigma"
-            ),
-            mask_metric=self.cfg.algorithm.get("art_mask_metric", "sde_kl"),
-            mask_threshold=float(self.cfg.algorithm.get("art_mask_threshold", 1e-5)),
-            reference_noise_level=float(
-                self.cfg.algorithm.get("art_reference_noise_level", 0.8)
-            ),
-            corrective_mask_enabled=bool(
-                self.cfg.algorithm.get("art_corrective_mask_enabled", True)
-            ),
-            coordinate_mask=coordinate_mask,
-            output_gradient_stats=output_gradient_stats,
+            **loss_options,
         )
+        if zero_probe is not None:
+            references = [reference[:, :chunk, :dims] for reference in references]
+            with torch.no_grad():
+                trainref_terms = _art_loss(
+                    velocity,
+                    references[1],
+                    sigmas,
+                    sigmas_next,
+                    guidance_direction,
+                    guidance_magnitude,
+                    **loss_options,
+                )
+            zero_probe.add(
+                velocity.detach(),
+                old_velocity,
+                references,
+                coordinate_mask,
+                trainref_terms,
+            )
         loss = terms["per_item_loss"].mean()
         active = terms["active"]
         active_count = active.sum().clamp_min(1)
