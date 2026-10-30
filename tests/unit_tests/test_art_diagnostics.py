@@ -597,3 +597,69 @@ def test_zero_signal_quickcheck_saves_diagnostic_outcome(tmp_path, cpu_art_backe
     assert actor.lr_scheduler.last_epoch == 0
     row = json.loads(next(tmp_path.glob("*_art_diagnostics.jsonl")).read_text())
     assert row["actor/skipped_zero_guidance"] == 1
+
+
+def test_repeat_probe_preserves_zero_accelerator_device(monkeypatch):
+    from rlinf.workers.actor.art_diagnostics import art_repeat_candidate_metrics
+
+    # FSDP stores torch.cuda.current_device(), an integer, in self.device.
+    # Emulate only the unavailable CUDA allocation boundary on this CPU host.
+    tensor_to = torch.Tensor.to
+    requested_devices = []
+
+    def allocate(tensor, *args, **kwargs):
+        if "device" in kwargs:
+            requested_devices.append(kwargs["device"])
+            if kwargs["device"] == 0:
+                kwargs["device"] = torch.device("cpu")
+        return tensor_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", allocate)
+    endpoints = torch.arange(4.0).repeat_interleave(2).reshape(8, 1, 1)
+    metrics = art_repeat_candidate_metrics(
+        endpoints,
+        torch.tensor([0, 0, 0, 0, 1, 1, 1, 1.0]),
+        torch.ones(8, 1, dtype=torch.bool),
+        torch.tensor([True]),
+        8,
+        device=0,
+    )
+    assert requested_devices == [0]
+    assert metrics["actor/repeat/matched_pairs"] == 4
+    assert metrics["actor/repeat/covariance_cosine"] == pytest.approx(1)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.distributed.is_nccl_available(),
+    reason="Requires a CUDA GPU and NCCL for accelerator-device-zero coverage.",
+)
+def test_repeat_probe_reduces_cpu_rollouts_on_nccl_device_zero(tmp_path):
+    from rlinf.workers.actor.art_diagnostics import art_repeat_candidate_metrics
+
+    if torch.distributed.is_initialized():
+        pytest.skip("This smoke test requires ownership of the default process group.")
+    previous_device = torch.cuda.current_device()
+    torch.cuda.set_device(0)
+    try:
+        torch.distributed.init_process_group(
+            backend="nccl",
+            init_method=(tmp_path / "nccl_store").as_uri(),
+            rank=0,
+            world_size=1,
+        )
+        endpoints = torch.arange(4.0).repeat_interleave(2).reshape(8, 1, 1)
+        metrics = art_repeat_candidate_metrics(
+            endpoints,
+            torch.tensor([0, 0, 0, 0, 1, 1, 1, 1.0]),
+            torch.ones(8, 1, dtype=torch.bool),
+            torch.tensor([True]),
+            8,
+            device=0,
+        )
+        assert metrics["actor/repeat/matched_pairs"] == 4
+        assert metrics["actor/repeat/endpoint_max_abs"] == 0
+        assert metrics["actor/repeat/covariance_cosine"] == pytest.approx(1)
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        torch.cuda.set_device(previous_device)

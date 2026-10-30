@@ -180,7 +180,7 @@ def art_repeat_candidate_metrics(
             cosine[signal].sum(),
             ((cosine < 0) & signal).sum(),
         ]
-    ).to(device=device or actions.device, dtype=torch.float64)
+    ).to(device=actions.device if device is None else device, dtype=torch.float64)
     maximum = torch.where(valid[:, None], difference, 0.0).max().to(stats.device)
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(stats)
