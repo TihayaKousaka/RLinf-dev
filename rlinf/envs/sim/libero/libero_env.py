@@ -833,7 +833,19 @@ class LiberoEnv(gym.Env):
         if reconfig_env_idx:
             env_fn_params = self.get_env_fn_params(reconfig_env_idx)
             self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
-        self.env.seed(self.seed * len(env_idx))
+        reset_seed = self.seed * len(env_idx)
+        if (
+            self.art_branch_chunk_index is not None
+            and not self.art_state_sampling
+            and not self.is_eval
+        ):
+            # Saved MuJoCo states omit static fixture poses sampled by reset.
+            # Match simulator seeds within each branch group, not policy noise.
+            reset_seed = [
+                reset_seed + (env_id // self.group_size) * self.group_size
+                for env_id in range(self.num_envs)
+            ]
+        self.env.seed(reset_seed)
         self.env.reset(id=env_idx)
         variant = os.environ.get(
             "LIBERO_TYPE",
